@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+*.pyc
+
+# Virtual env
+.env
+.venv/
+venv/
+
+# Test / smoke temp outputs
+test_output.txt
+_smoke_out.txt
+_smoke_stdout.txt
+_smoke_stderr.txt
+_smoke_now.py
+_p1p2_smoke.py
+_selfimp_smoke.py
+_check_server_v2.py
+_hello.txt
+outputs/test/20*/
+outputs/test/_p1p2_policies*.json
+outputs/test/_smoke_policies*.json*
+outputs/test/_smoke_policies_retire_*.json
+outputs/test/_smoke_mem*.json
+outputs/test/_*.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,103 @@
+# Hospital Agent Baseline Example 配置文件
+
+# 输出目录：训练和测试运行产物的输出目录
+output_dir: outputs
+
+# 标准参考数据目录；疾病/检查名称必须与其中 catalog 保持一致
+ref_data_dir: data/ref_data
+
+# 比赛后端安全配置。密钥仍通过环境变量或平台请求传入，不写在这里。
+service:
+  # 如果后端接口不是 /ask_patient，而是 /api/ask_patient，可填 ["/api"]
+  endpoint_prefixes: []
+
+# 训练配置
+train:
+  # 患者选取方式：random / forward / reverse
+  selection: random
+  # 训练患者数量；为空时使用全部患者
+  patient_count: 10
+  # 随机种子（selection: random 时使用）
+  random_seed: 42
+  # 指定训练患者 ID 列表；非空时优先使用，忽略 selection、patient_count 和 random_seed
+  patient_ids: []
+
+# 测试配置
+test:
+  # 患者选取方式：random / forward / reverse
+  selection: forward
+  # 测试患者数量；建议保持较小，便于快速验证
+  patient_count: 5
+  # 随机种子
+  random_seed: 42
+  # 指定测试患者 ID 列表
+  patient_ids: []
+
+# LLM 配置
+llm:
+  # API 基础 URL（兼容 OpenAI Chat Completions API）
+  # 默认使用通义千问 DashScope 兼容接口
+  # 环境变量 MODEL_BASE_URL 优先
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  # 模型名称
+  # 环境变量 MODEL_NAME 优先
+  model_name: qwen-plus
+  # 生成温度（0.0-1.0）
+  temperature: 0.7
+  # 最大生成 token 数
+  max_tokens: 2048
+  # 速率限制重试次数
+  max_retries: 3
+  # 重试基础延迟（秒，指数退避）
+  retry_base_delay: 1.0
+
+# 记忆配置
+memory:
+  # JSON 记忆文件路径
+  json_path: data/memory_data/memory.json
+  # Markdown 记忆文件路径（旧格式，自动迁移）
+  md_path: data/memory_data/memory.md
+  # 最大记忆条目数
+  max_notes: 100
+  # 单条记忆最大字符数
+  max_note_chars: 500
+
+# 结构化记忆系统配置
+memory_system:
+  # 单病例工作记忆保留时间，单位秒
+  working_ttl_seconds: 7200
+  # 同时保留的工作病例数量上限
+  max_working_cases: 32
+  # 每次召回的历史病例经验数量
+  episodic_top_k: 3
+
+# Hybrid RAG 配置：本地混合召回，不依赖外部向量数据库
+rag:
+  # 最终注入 prompt 的 chunk 数量上限
+  top_k: 8
+  # 低于该分数的弱相关 chunk 会被过滤；为空则不过滤
+  score_threshold: 0.15
+  # 启用规则版多查询扩展，例如“胸口闷”扩展为胸闷/胸痛/心悸等
+  enable_mqe: true
+  # 查询扩展强度，数值越大召回越宽
+  mqe_expansions: 2
+  # 先扩大候选池再去重排序，提升疾病画像召回覆盖
+  candidate_pool_multiplier: 4
+  # 是否把 shadow 状态策略补丁注入 RAG；测试阶段建议 false
+  include_policy_shadow: false
+  # 单个 chunk 注入 prompt 的最大字符数
+  max_chunk_chars: 700
+
+# 问诊轮次上限
+max_ask_rounds: 5
+
+# 检查轮次上限
+max_exam_rounds: 3
+
+# 是否记录每次大模型调用的 prompt 和响应（调试用）
+log_llm_prompts: false
+
+# 自迭代配置：训练后把低分原因沉淀为策略补丁
+self_improve_enabled: true
+self_improve_use_llm_attribute: true
+policy_store_path: data/memory_data/policies.json

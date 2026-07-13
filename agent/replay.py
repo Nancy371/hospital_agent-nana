@@ -1,0 +1,339 @@
+"""影子回放:补丁上线前的 A/B 验证。
+
+给定一个候选补丁与若干历史案例, ShadowReplay 会:
+  1) 让 Planner 在**不注入**补丁的条件下生成 baseline 计划
+  2) 让 Planner 在**注入**补丁的条件下生成 candidate 计划
+  3) 用可配置的评分器对两个计划打分,输出 ΔScore
+  4) 汇总多例的成功率/平均 ΔScore, 用于判断该补丁是否值得从 shadow 提权到 active
+
+设计要点:
+- 不依赖真实平台调用 —— 只重放 planner 内部推理链
+- 评分器可插拔:默认使用启发式评分器 heuristic_plan_score(),用户可自定义
+- Planner 侧只需要满足 plan(collected_info, current_plan) -> plan 语义
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------- 默认启发式评分器 ----------------
+
+def heuristic_plan_score(plan: Any) -> float:
+    """对 planner 输出的 plan 做启发式打分,范围 [0,1]。
+
+    维度:
+      - 覆盖度:differential_diagnoses 条数(上限归一)
+      - 深度:是否有 primary_hypothesis
+      - 检查计划完备性:examinations 条数
+      - 治疗合理性:是否有 treatments 且非空
+      - 风险识别:是否含 risks / red_flags 类字段
+    """
+    if plan is None:
+        return 0.0
+    d = _as_dict(plan)
+
+    score = 0.0
+    # 1) 鉴别诊断覆盖度: 每条 +0.08, 上限 0.3
+    diffs = d.get("differential_diagnoses") or d.get("differentials") or []
+    if isinstance(diffs, list):
+        score += min(len(diffs) * 0.08, 0.3)
+
+    # 2) 主假设存在: +0.15
+    if d.get("primary_hypothesis") or d.get("primary_diagnosis"):
+        score += 0.15
+
+    # 3) 检查计划: 每条 +0.05, 上限 0.2
+    exams = d.get("examinations") or d.get("recommended_exams") or []
+    if isinstance(exams, list):
+        score += min(len(exams) * 0.05, 0.2)
+
+    # 4) 治疗方案存在且非空: +0.15
+    treats = d.get("treatments") or d.get("treatment_plan") or []
+    if isinstance(treats, list) and len(treats) > 0:
+        score += 0.15
+    elif isinstance(treats, dict) and treats:
+        score += 0.15
+
+    # 5) 风险识别: +0.1
+    risks = d.get("risks") or d.get("red_flags") or d.get("warnings")
+    if risks:
+        score += 0.1
+
+    # 6) 追问计划: +0.1
+    followups = d.get("follow_up_questions") or d.get("next_questions") or []
+    if isinstance(followups, list) and len(followups) > 0:
+        score += 0.1
+
+    return max(0.0, min(1.0, score))
+
+
+def _as_dict(plan: Any) -> Dict[str, Any]:
+    if isinstance(plan, dict):
+        return plan
+    # 兼容 pydantic / dataclass / 自定义对象
+    for attr in ("model_dump", "dict", "to_dict"):
+        f = getattr(plan, attr, None)
+        if callable(f):
+            try:
+                return f()
+            except Exception:
+                pass
+    if hasattr(plan, "__dict__"):
+        return {k: v for k, v in plan.__dict__.items() if not k.startswith("_")}
+    return {}
+
+
+# ---------------- ShadowReplay 主体 ----------------
+
+class ShadowReplay:
+    """补丁影子回放器。
+
+    使用方式:
+        replay = ShadowReplay(planner, policy_store, score_fn=heuristic_plan_score)
+        result = await replay.replay_patch(case, patch_id)
+        stats  = await replay.batch_evaluate(cases, patch_id)
+        if stats["should_promote"]:
+            policy_store.promote(patch_id)  # 或由 policy_store.audit 处理
+    """
+
+    def __init__(
+        self,
+        planner,
+        policy_store,
+        score_fn: Optional[Callable[[Any], float]] = None,
+    ):
+        self.planner = planner
+        self.policy_store = policy_store
+        self.score_fn = score_fn or heuristic_plan_score
+
+    # ---------- 单例回放 ----------
+
+    async def replay_patch(
+        self,
+        case: Dict[str, Any],
+        patch_id: str,
+    ) -> Dict[str, Any]:
+        """对单个 case 做 A/B 回放。
+
+        case 字段约定:
+          - collected_info: dict
+          - exam_results:   dict，可选
+          - chat_history:   list，可选
+          - relevant_experience: list，可选
+          - current_plan:   dict/obj，可选，用于回放前恢复 planner.current_plan
+          - case_id:        标识(可选)
+        返回:
+          {case_id, patch_id, baseline_score, candidate_score, delta, hit}
+        """
+        patch = self._find_patch(patch_id)
+        if patch is None:
+            raise ValueError(f"patch {patch_id!r} 不存在")
+
+        collected_info = case.get("collected_info") or {}
+        exam_results = case.get("exam_results") or {}
+        chat_history = case.get("chat_history") or []
+        relevant_experience = case.get("relevant_experience") or []
+        current_plan = case.get("current_plan")
+
+        # A: baseline (临时清空 store 中该补丁的匹配)
+        baseline_plan = await self._plan_without_patch(
+            collected_info, exam_results, chat_history, relevant_experience, current_plan, patch_id
+        )
+        baseline_score = self.score_fn(baseline_plan)
+
+        # B: candidate (强制注入该补丁)
+        candidate_plan = await self._plan_with_forced_patch(
+            collected_info, exam_results, chat_history, relevant_experience, current_plan, patch
+        )
+        candidate_score = self.score_fn(candidate_plan)
+
+        delta = candidate_score - baseline_score
+        return {
+            "case_id": case.get("case_id"),
+            "patch_id": patch_id,
+            "baseline_score": round(baseline_score, 4),
+            "candidate_score": round(candidate_score, 4),
+            "delta": round(delta, 4),
+            "hit": delta > 0,
+        }
+
+    # ---------- 批量评估 ----------
+
+    async def batch_evaluate(
+        self,
+        cases: List[Dict[str, Any]],
+        patch_id: str,
+        min_cases: int = 5,
+        min_avg_delta: float = 0.03,
+        min_success_ratio: float = 0.6,
+    ) -> Dict[str, Any]:
+        """批量回放并给出提权建议。
+
+        返回:
+          {n, successes, failures, avg_delta, success_ratio, per_case, should_promote}
+        """
+        per_case: List[Dict[str, Any]] = []
+        for c in cases:
+            try:
+                r = await self.replay_patch(c, patch_id)
+                per_case.append(r)
+            except Exception as e:
+                logger.warning(f"[replay] case {c.get('case_id')} 失败: {e}")
+
+        n = len(per_case)
+        successes = sum(1 for r in per_case if r["delta"] > 0)
+        failures = sum(1 for r in per_case if r["delta"] < 0)
+        avg_delta = sum(r["delta"] for r in per_case) / n if n else 0.0
+        ratio = successes / n if n else 0.0
+
+        should_promote = (
+            n >= min_cases
+            and avg_delta >= min_avg_delta
+            and ratio >= min_success_ratio
+        )
+
+        summary = {
+            "patch_id": patch_id,
+            "n": n,
+            "successes": successes,
+            "failures": failures,
+            "avg_delta": round(avg_delta, 4),
+            "success_ratio": round(ratio, 4),
+            "should_promote": bool(should_promote),
+            "per_case": per_case,
+        }
+        logger.info(
+            f"[replay] patch={patch_id} n={n} avg_delta={summary['avg_delta']} "
+            f"ratio={summary['success_ratio']} promote={summary['should_promote']}"
+        )
+        return summary
+
+    # ---------- 内部:控制补丁注入的双跑 ----------
+
+    async def _plan_without_patch(
+        self,
+        collected_info,
+        exam_results,
+        chat_history,
+        relevant_experience,
+        current_plan,
+        patch_id,
+    ):
+        """临时把该补丁从可匹配集合里屏蔽,再让 planner 正常 plan。"""
+        original = getattr(self.planner, "policy_store", None)
+        original_plan = getattr(self.planner, "current_plan", None)
+        try:
+            if hasattr(self.planner, "current_plan"):
+                self.planner.current_plan = current_plan
+            # 用一个包装:match() 时过滤掉 patch_id
+            self.planner.policy_store = _MaskedStore(self.policy_store, mask_id=patch_id)
+            return await _call_planner_plan(
+                self.planner, collected_info, exam_results, chat_history, relevant_experience
+            )
+        finally:
+            self.planner.policy_store = original
+            if hasattr(self.planner, "current_plan"):
+                self.planner.current_plan = original_plan
+
+    async def _plan_with_forced_patch(
+        self,
+        collected_info,
+        exam_results,
+        chat_history,
+        relevant_experience,
+        current_plan,
+        patch,
+    ):
+        """强制注入该补丁,即使 trigger 未命中也返回它。"""
+        original = getattr(self.planner, "policy_store", None)
+        original_plan = getattr(self.planner, "current_plan", None)
+        try:
+            if hasattr(self.planner, "current_plan"):
+                self.planner.current_plan = current_plan
+            self.planner.policy_store = _ForcedStore(self.policy_store, forced_patch=patch)
+            return await _call_planner_plan(
+                self.planner, collected_info, exam_results, chat_history, relevant_experience
+            )
+        finally:
+            self.planner.policy_store = original
+            if hasattr(self.planner, "current_plan"):
+                self.planner.current_plan = original_plan
+
+    def _find_patch(self, patch_id: str) -> Optional[Dict[str, Any]]:
+        patches = getattr(self.policy_store, "patches", None) or []
+        for p in patches:
+            if p.get("id") == patch_id:
+                return p
+        return None
+
+
+# ---------------- 内部包装器 ----------------
+
+class _MaskedStore:
+    """代理 PolicyStore, 让 match() 过滤指定 patch_id。"""
+    def __init__(self, inner, mask_id):
+        self._inner = inner
+        self._mask_id = mask_id
+
+    def match(self, collected_info, candidate_diseases, include_shadow=False):
+        hits = self._inner.match(collected_info, candidate_diseases, include_shadow)
+        return [h for h in hits if h.get("id") != self._mask_id]
+
+    def render_for_prompt(self, patches):
+        return self._inner.render_for_prompt(patches)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _ForcedStore:
+    """代理 PolicyStore, match() 始终返回指定补丁(与其它命中合并去重)。"""
+    def __init__(self, inner, forced_patch):
+        self._inner = inner
+        self._forced = forced_patch
+
+    def match(self, collected_info, candidate_diseases, include_shadow=False):
+        hits = self._inner.match(collected_info, candidate_diseases, include_shadow)
+        ids = {h.get("id") for h in hits}
+        if self._forced.get("id") not in ids:
+            hits = [self._forced] + hits
+        return hits
+
+    def render_for_prompt(self, patches):
+        return self._inner.render_for_prompt(patches)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def _maybe_await(x):
+    import inspect
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
+async def _call_planner_plan(
+    planner,
+    collected_info,
+    exam_results,
+    chat_history,
+    relevant_experience,
+):
+    """兼容真实 Planner.plan 与测试 MockPlanner.plan。"""
+    import inspect
+
+    sig = inspect.signature(planner.plan)
+    params = list(sig.parameters)
+    if "exam_results" in params or len(params) >= 4:
+        return await _maybe_await(planner.plan(
+            collected_info=collected_info,
+            exam_results=exam_results,
+            chat_history=chat_history,
+            relevant_experience=relevant_experience,
+        ))
+    return await _maybe_await(planner.plan(collected_info, None))

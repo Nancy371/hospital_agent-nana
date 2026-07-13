@@ -1,0 +1,13 @@
+# Hospital Agent Baseline Example 依赖
+
+# YAML 配置文件解析
+pyyaml>=6.0
+
+# 异步 HTTP 客户端（Actions 类依赖）
+httpx>=0.24.0
+
+# 异步 HTTP 服务框架（server.py 依赖）
+aiohttp>=3.8.0
+
+# 其他常用库
+python-dotenv>=1.0.0
