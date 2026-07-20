@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -127,6 +129,7 @@ class HybridRAGRetriever:
         self.knowledge = knowledge
         self.memory = memory
         self.policy_store = policy_store
+        self.allowed_diagnoses = self._load_allowed_diagnoses(config)
 
     def search(
         self,
@@ -205,6 +208,10 @@ class HybridRAGRetriever:
             top_k=top_k,
             score_threshold=score_threshold,
         )
+        return self.render_chunks(chunks)
+
+    def render_chunks(self, chunks: Optional[Sequence[Dict[str, Any]]]) -> str:
+        """Render already-retrieved chunks without performing a second search."""
         if not chunks:
             return ""
 
@@ -288,6 +295,8 @@ class HybridRAGRetriever:
             name = profile.get("name", "")
             if not name:
                 continue
+            if self.allowed_diagnoses and name not in self.allowed_diagnoses:
+                continue
             hit_score = float(profile.get("hit_score", 0.0) or 0.0)
             candidate_bonus = 0.12 if name in candidate_names else 0.0
             score = min(0.98, 0.45 + hit_score * 0.10 + candidate_bonus)
@@ -322,6 +331,8 @@ class HybridRAGRetriever:
         for item in recalls:
             name = item.get("name", "")
             if not name:
+                continue
+            if self.allowed_diagnoses and name not in self.allowed_diagnoses:
                 continue
             hit_count = float(item.get("hit_count", 0.0) or 0.0)
             score = min(0.82, 0.34 + hit_count * 0.08 + (0.08 if name in candidate_names else 0.0))
@@ -502,7 +513,29 @@ class HybridRAGRetriever:
                         names.append(rec["name"])
             except Exception:
                 pass
-        return _dedupe(names)[:top_k]
+        names = _dedupe(names)
+        if self.allowed_diagnoses:
+            names = [name for name in names if name in self.allowed_diagnoses]
+        return names[:top_k]
+
+    @staticmethod
+    def _load_allowed_diagnoses(config: Dict[str, Any]) -> set:
+        ref_dir = str((config or {}).get("ref_data_dir") or "data/ref_data")
+        names = set()
+        for filename, key in (
+            ("diseases_catalog.json", "diseases"),
+            ("submission_diagnosis_extensions.json", "extensions"),
+        ):
+            try:
+                with open(os.path.join(ref_dir, filename), "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                for item in data.get(key, []) or []:
+                    name = str(item.get("name") or "").strip()
+                    if name:
+                        names.add(name)
+            except (OSError, TypeError, ValueError):
+                continue
+        return names
 
     def _candidate_name(self, item: Any) -> Optional[str]:
         if isinstance(item, str):
@@ -562,9 +595,11 @@ class HybridRAGRetriever:
         exams = note.get("ordered_exams") or []
         if exams:
             bits.append(f"已做检查: {exams[:6]}")
-        content = note.get("content") or ""
+        is_failure = note.get("memory_kind") == "failure_lesson" or metrics.get("diagnosis_accuracy", 1) < 0.8
+        content = note.get("lesson") if is_failure else note.get("content")
+        content = content or ""
         if content:
-            bits.append(f"经验: {self._clip(str(content), 420)}")
+            bits.append(f"{'失败教训' if is_failure else '经验'}: {self._clip(str(content), 420)}")
         return "；".join(bits)
 
     def _score_experience(self, collected_info: Dict[str, Any], note: Dict[str, Any]) -> float:
@@ -582,9 +617,9 @@ class HybridRAGRetriever:
         except (TypeError, ValueError):
             q = 0.5
         if q < 0.5:
-            score += 0.12
+            score += 0.01
         elif q >= 0.8:
-            score += 0.08
+            score += 0.10
         return min(0.86, score)
 
     def _augment_collected_info(

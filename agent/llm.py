@@ -57,6 +57,7 @@ class LLMClient:
         self.max_tokens = llm_config.get("max_tokens", 2048)
         self.max_retries = llm_config.get("max_retries", 3)
         self.retry_base_delay = float(llm_config.get("retry_base_delay", 1.0) or 1.0)
+        self.request_timeout = float(llm_config.get("request_timeout", 120.0) or 120.0)
 
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -72,7 +73,7 @@ class LLMClient:
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=120.0,
+                timeout=self.request_timeout,
             )
         return self._client
 

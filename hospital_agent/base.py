@@ -5,6 +5,7 @@ Hospital Agent SDK 基类实现。
 通过 HTTP 调用比赛服务 API 实现问诊、检查、诊疗等能力。
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -12,11 +13,64 @@ import random
 import time
 import uuid
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _mean_training_value(values: List[Any]) -> Optional[float]:
+    numbers: List[float] = []
+    for value in values:
+        try:
+            if value is not None:
+                numbers.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return round(sum(numbers) / len(numbers), 4) if numbers else None
+
+
+def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate per-case training records without exposing credentials."""
+    evaluated = [item for item in results if item.get("status") == "evaluated"]
+
+    def metric(name: str) -> Optional[float]:
+        return _mean_training_value(
+            [(item.get("metrics") or {}).get(name) for item in evaluated]
+        )
+
+    audits = [item.get("audit") or {} for item in results]
+    recall_values = [
+        (item.get("metrics") or {}).get("candidate_recall_at_5")
+        for item in evaluated
+        if (item.get("metrics") or {}).get("candidate_recall_at_5") is not None
+    ]
+    critic_issue_count = sum(1 for audit in audits if audit.get("critic_issues"))
+    critic_llm_count = sum(1 for audit in audits if audit.get("critic_llm_used"))
+    total = len(results)
+    return {
+        "cases": total,
+        "evaluated_cases": len(evaluated),
+        "diagnosis_accuracy": metric("diagnosis_accuracy"),
+        "examination_precision": metric("examination_precision"),
+        "treatment_overall_score": metric("treatment_overall_score"),
+        "treatment_safety": metric("treatment_safety"),
+        "candidate_recall_at_5": _mean_training_value(recall_values),
+        "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,
+        "critic_llm_rate": round(critic_llm_count / total, 4) if total else 0.0,
+        "average_elapsed_seconds": _mean_training_value(
+            [audit.get("elapsed_seconds") for audit in audits]
+        ),
+        "timeout_cases": sum(1 for audit in audits if audit.get("timed_out")),
+        "backend_error_cases": sum(
+            1 for item in results if item.get("evaluation_error")
+        ),
+        "reflection_error_cases": sum(
+            1 for item in results if item.get("reflection_error")
+        ),
+    }
 
 
 class Actions:
@@ -36,6 +90,12 @@ class Actions:
         token: str,
         team_id: str,
         endpoint_prefixes: Optional[List[str]] = None,
+        model_api_key: str = "",
+        use_invoke: bool = True,
+        invoke_path: str = "/invoke",
+        exam_results_path: str = "/exam/results",
+        case_evaluation_path: str = "/evaluate/case",
+        batch_evaluation_path: str = "/evaluate",
     ):
         """初始化 Actions。
 
@@ -48,6 +108,14 @@ class Actions:
         self.token = token
         self.team_id = team_id
         self.endpoint_prefixes = self._normalize_endpoint_prefixes(endpoint_prefixes or [])
+        self.model_api_key = model_api_key
+        self.use_invoke = bool(use_invoke)
+        self.invoke_path = "/" + str(invoke_path or "/invoke").lstrip("/")
+        self.exam_results_path = "/" + str(exam_results_path or "/exam/results").lstrip("/")
+        self.case_evaluation_path = "/" + str(case_evaluation_path or "/evaluate/case").lstrip("/")
+        self.batch_evaluation_path = "/" + str(batch_evaluation_path or "/evaluate").lstrip("/")
+        self._conversation_rounds: Dict[str, int] = {}
+        self._ordered_examinations: Dict[str, List[str]] = {}
         self._client: Optional[httpx.AsyncClient] = None
 
     @staticmethod
@@ -85,7 +153,7 @@ class Actions:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={
-                    "Authorization": f"Bearer {self.token}",
+                    "X-Hospital-Service-Token": self.token,
                     "Content-Type": "application/json",
                     "X-Team-ID": self.team_id,
                 },
@@ -111,9 +179,28 @@ class Actions:
         last_error: Optional[httpx.HTTPStatusError] = None
         candidate_paths = self._candidate_paths(path)
         tried_paths: List[str] = []
+        max_retries = 3
         for candidate_path in candidate_paths:
             tried_paths.append(candidate_path)
-            response = await client.request(method, candidate_path, **kwargs)
+            # 针对 asyncio 事件循环下偶发 DNS/连接抖动加入短延迟指数退避重试
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = await client.request(method, candidate_path, **kwargs)
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as net_err:
+                    if attempt == max_retries - 1:
+                        logger.error(
+                            "[Action] %s %s 网络错误(已重试 %d 次): %s",
+                            method, candidate_path, max_retries, net_err,
+                        )
+                        raise
+                    delay = 0.5 * (2 ** attempt)
+                    logger.warning(
+                        "[Action] %s %s 网络错误(第 %d 次): %s, %.1fs 后重试",
+                        method, candidate_path, attempt + 1, net_err, delay,
+                    )
+                    await asyncio.sleep(delay)
             try:
                 response.raise_for_status()
                 if candidate_path != path:
@@ -149,6 +236,86 @@ class Actions:
             raise last_error
         raise RuntimeError(f"HTTP request failed before sending: {method} {path}")
 
+    async def _invoke_action(
+        self,
+        patient_id: str,
+        action: str,
+        input_data: Dict[str, Any],
+    ) -> Any:
+        """Call the unified /invoke action endpoint used by the current service."""
+        if not self.model_api_key:
+            raise ValueError("MODEL_API_KEY is required when service.use_invoke is enabled")
+        payload = {
+            "team_id": self.team_id,
+            "api_key": self.model_api_key,
+            "patient_id": patient_id,
+            "input": {
+                "action": action,
+                "input_data": input_data,
+            },
+        }
+        return await self._request("POST", self.invoke_path, json=payload)
+
+    async def _invoke_or_direct(
+        self,
+        patient_id: str,
+        action: str,
+        invoke_input: Dict[str, Any],
+        direct_path: str,
+        direct_payload: Dict[str, Any],
+    ) -> Any:
+        """Prefer /invoke, with direct action endpoints as a compatibility fallback."""
+        if self.use_invoke:
+            try:
+                return await self._invoke_action(patient_id, action, invoke_input)
+            except httpx.HTTPStatusError as e:
+                if e.response is None or e.response.status_code != 404:
+                    raise
+                logger.warning(
+                    "[Action] %s %s returned 404, falling back to %s",
+                    "POST",
+                    self.invoke_path,
+                    direct_path,
+                )
+        return await self._request("POST", direct_path, json=direct_payload)
+
+    def _remember_ordered_examinations(
+        self,
+        patient_id: str,
+        response: Dict[str, Any],
+        requested_items: Optional[List[str]] = None,
+    ) -> None:
+        requested = [
+            str(item).strip()
+            for item in (requested_items or [])
+            if str(item).strip()
+        ]
+        results = response.get("results") if isinstance(response, dict) else None
+        ordered = self._ordered_examinations.setdefault(patient_id, [])
+
+        invalid_items = set()
+        response_items: List[str] = []
+        if isinstance(results, dict):
+            for item, detail in results.items():
+                item_name = str(item).strip()
+                if not item_name:
+                    continue
+                status = detail.get("status") if isinstance(detail, dict) else None
+                result_text = detail.get("result") if isinstance(detail, dict) else None
+                if status == "invalid" or result_text == "无效检查":
+                    invalid_items.add(item_name)
+                    continue
+                response_items.append(item_name)
+
+        candidates = [item for item in requested if item not in invalid_items]
+        for item in response_items:
+            if item not in candidates:
+                candidates.append(item)
+
+        for item in candidates:
+            if item not in ordered:
+                ordered.append(item)
+
     async def ask_patient(
         self, patient_id: str, input_data: Dict[str, Any]
     ) -> str:
@@ -163,10 +330,12 @@ class Actions:
         """
         logger.info(f"[Action] ask_patient: patient_id={patient_id}")
         try:
-            result = await self._request(
-                "POST",
-                "/ask_patient",
-                json={
+            result = await self._invoke_or_direct(
+                patient_id=patient_id,
+                action="ask_patient",
+                invoke_input=input_data,
+                direct_path="/ask_patient",
+                direct_payload={
                     "patient_id": patient_id,
                     "input_data": input_data,
                     "team_id": self.team_id,
@@ -175,6 +344,9 @@ class Actions:
             answer = result.get("answer", result.get("response", ""))
             if isinstance(answer, dict):
                 answer = json.dumps(answer, ensure_ascii=False)
+            self._conversation_rounds[patient_id] = (
+                self._conversation_rounds.get(patient_id, 0) + 1
+            )
             return str(answer)
         except Exception as e:
             logger.error(f"[Action] ask_patient 失败: {e}")
@@ -202,7 +374,7 @@ class Actions:
         try:
             result = await self._request(
                 "POST",
-                "/order_examination",
+                self.exam_results_path,
                 json={
                     "patient_id": patient_id,
                     "items": items,
@@ -210,6 +382,7 @@ class Actions:
                     "team_id": self.team_id,
                 },
             )
+            self._remember_ordered_examinations(patient_id, result, items)
             return result
         except Exception as e:
             logger.error(f"[Action] order_examination 失败: {e}")
@@ -236,22 +409,16 @@ class Actions:
         logger.info(
             f"[Action] prescribe_treatment: patient_id={patient_id}, diagnosis={diagnosis}"
         )
-        try:
-            result = await self._request(
-                "POST",
-                "/prescribe_treatment",
-                json={
-                    "patient_id": patient_id,
-                    "diagnosis": diagnosis,
-                    "treatment_plan": treatment_plan,
-                    "reasoning": reasoning,
-                    "team_id": self.team_id,
-                },
-            )
-            return result
-        except Exception as e:
-            logger.error(f"[Action] prescribe_treatment 失败: {e}")
-            raise
+        return {
+            "patient_id": patient_id,
+            "team_id": self.team_id,
+            "diagnosis": diagnosis,
+            "treatment_plan": treatment_plan,
+            "reasoning": reasoning,
+            "ordered_examinations": self._ordered_examinations.get(patient_id, []),
+            "conversation_rounds": self._conversation_rounds.get(patient_id, 0),
+            "finished": True,
+        }
 
     async def evaluation(
         self,
@@ -269,11 +436,14 @@ class Actions:
         """
         logger.info(f"[Action] evaluation: patient_id={patient_id}")
         try:
+            if not self.model_api_key:
+                raise ValueError("MODEL_API_KEY is required for evaluation")
             result = await self._request(
                 "POST",
-                "/evaluation",
+                self.case_evaluation_path,
                 json={
                     "patient_id": patient_id,
+                    "api_key": self.model_api_key,
                     "final_result": final_result,
                     "team_id": self.team_id,
                 },
@@ -293,19 +463,176 @@ class Actions:
             批量评估报告
         """
         logger.info(f"[Action] batch_evaluation: test_dir={test_dir}")
+        final_results = self._load_final_results(test_dir)
+        if not self.model_api_key:
+            raise ValueError("MODEL_API_KEY is required for batch_evaluation")
         try:
             result = await self._request(
                 "POST",
-                "/batch_evaluation",
+                self.batch_evaluation_path,
                 json={
-                    "test_dir": test_dir,
                     "team_id": self.team_id,
+                    "api_key": self.model_api_key,
+                    "final_result": final_results,
                 },
             )
+            self._write_batch_evaluation_report(test_dir, result)
             return result
+        except httpx.HTTPStatusError as e:
+            if e.response is None or e.response.status_code != 404:
+                logger.error(f"[Action] batch_evaluation failed: {e}")
+                raise
+            logger.warning(
+                "[Action] batch_evaluation endpoint %s not found; falling back to per-case evaluation",
+                self.batch_evaluation_path,
+            )
+            return await self._batch_evaluation_via_case_evaluation(test_dir)
         except Exception as e:
-            logger.error(f"[Action] batch_evaluation 失败: {e}")
+            logger.error(f"[Action] batch_evaluation failed: {e}")
             raise
+
+    def _resolve_final_results_file(self, test_dir: str) -> str:
+        path = os.path.abspath(str(test_dir))
+        if os.path.isdir(path):
+            path = os.path.join(path, "final_results.jsonl")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"final_results.jsonl not found: {path}")
+        return path
+
+    @staticmethod
+    def _extract_final_result_entries(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        if isinstance(row.get("final_results"), list):
+            entries.extend(item for item in row["final_results"] if isinstance(item, dict))
+        elif isinstance(row.get("final_result"), dict):
+            entries.append(row["final_result"])
+        elif row.get("diagnosis") is not None or row.get("treatment_plan") is not None:
+            entries.append(row)
+
+        normalized: List[Dict[str, Any]] = []
+        row_patient_id = (
+            row.get("patient_id")
+            or row.get("patientId")
+            or row.get("caseId")
+            or row.get("case_id")
+        )
+        for entry in entries:
+            final_result = dict(entry)
+            patient_id = (
+                final_result.get("patient_id")
+                or final_result.get("patientId")
+                or final_result.get("caseId")
+                or final_result.get("case_id")
+                or row_patient_id
+            )
+            if patient_id:
+                final_result["patient_id"] = str(patient_id)
+                final_result.setdefault("caseId", str(patient_id))
+            normalized.append(final_result)
+        return normalized
+
+    def _load_final_results(self, test_dir: str) -> List[Dict[str, Any]]:
+        results_file = self._resolve_final_results_file(test_dir)
+        final_results: List[Dict[str, Any]] = []
+        with open(results_file, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSONL at line {line_no}: {exc}") from exc
+                if isinstance(row, dict):
+                    final_results.extend(self._extract_final_result_entries(row))
+        return final_results
+
+    def _write_batch_evaluation_report(
+        self, test_dir: str, report: Dict[str, Any]
+    ) -> str:
+        results_file = self._resolve_final_results_file(test_dir)
+        report_path = os.path.join(os.path.dirname(results_file), "final_results_eval_report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        logger.info("[Action] batch_evaluation report saved: %s", report_path)
+        return report_path
+
+    @staticmethod
+    def _avg_case_metric(reports: List[Dict[str, Any]], key: str) -> float:
+        values = []
+        for report in reports:
+            value = report.get(key)
+            try:
+                if value is not None:
+                    values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return round(sum(values) / len(values), 4) if values else 0.0
+
+    async def _batch_evaluation_via_case_evaluation(self, test_dir: str) -> Dict[str, Any]:
+        final_results = self._load_final_results(test_dir)
+        case_reports: List[Dict[str, Any]] = []
+        for final_result in final_results:
+            patient_id = final_result.get("patient_id") or final_result.get("caseId")
+            if not patient_id:
+                case_reports.append({
+                    "status": "failed",
+                    "error": "missing patient_id",
+                    "final_result": final_result,
+                })
+                continue
+            try:
+                case_reports.append(await self.evaluation(str(patient_id), final_result))
+            except Exception as exc:
+                case_reports.append({
+                    "patientId": str(patient_id),
+                    "status": "failed",
+                    "error": str(exc),
+                })
+
+        evaluated = [r for r in case_reports if r.get("status") == "evaluated"]
+        treatment_details = []
+        for report in evaluated:
+            detail = report.get("treatmentDetail") or {}
+            treatment_details.append({
+                "patient_id": report.get("patientId") or report.get("patient_id"),
+                "overall_score": detail.get("overallScore", report.get("treatmentOverallScore")),
+                "safety": detail.get("safety", report.get("treatmentSafety")),
+                "effectiveness_alignment": detail.get(
+                    "effectivenessAlignment",
+                    report.get("treatmentEffectivenessAlignment"),
+                ),
+                "personalization": detail.get(
+                    "personalization",
+                    report.get("treatmentPersonalization"),
+                ),
+                "reasoning": detail.get("reasoning", ""),
+            })
+
+        report = {
+            "diagnosis_accuracy": self._avg_case_metric(evaluated, "diagnosisAccuracy"),
+            "examination_precision": self._avg_case_metric(evaluated, "examinationPrecision"),
+            "treatment_overall_score": self._avg_case_metric(evaluated, "treatmentOverallScore"),
+            "treatment_safety": self._avg_case_metric(evaluated, "treatmentSafety"),
+            "treatment_effectiveness_alignment": self._avg_case_metric(
+                evaluated, "treatmentEffectivenessAlignment"
+            ),
+            "treatment_personalization": self._avg_case_metric(
+                evaluated, "treatmentPersonalization"
+            ),
+            "counts": {
+                "final_results": len(final_results),
+                "evaluated_patients": len(evaluated),
+                "failed_patients": len(case_reports) - len(evaluated),
+            },
+            "treatment_details": treatment_details,
+            "case_reports": case_reports,
+            "submitted_at": datetime.now().astimezone().isoformat(),
+            "fallback": "per_case_evaluation",
+        }
+
+        self._write_batch_evaluation_report(test_dir, report)
+        return report
 
     async def close(self) -> None:
         """关闭 HTTP 客户端。"""
@@ -358,6 +685,25 @@ class BaseDoctorAgent(ABC):
         )
         if isinstance(endpoint_prefixes, str):
             endpoint_prefixes = [endpoint_prefixes]
+        llm_config = config.get("llm", {}) or {}
+        model_api_key = (
+            runtime_service.get("model_api_key")
+            or runtime_service.get("api_key")
+            or os.environ.get("MODEL_API_KEY", "")
+            or llm_config.get("api_key", "")
+            or service_config.get("model_api_key", "")
+        )
+        use_invoke = runtime_service.get("use_invoke", service_config.get("use_invoke", True))
+        invoke_path = runtime_service.get("invoke_path", service_config.get("invoke_path", "/invoke"))
+        exam_results_path = runtime_service.get(
+            "exam_results_path", service_config.get("exam_results_path", "/exam/results")
+        )
+        case_evaluation_path = runtime_service.get(
+            "case_evaluation_path", service_config.get("case_evaluation_path", "/evaluate/case")
+        )
+        batch_evaluation_path = runtime_service.get(
+            "batch_evaluation_path", service_config.get("batch_evaluation_path", "/evaluate")
+        )
 
         # 创建 Actions 实例
         self.actions = Actions(
@@ -365,13 +711,19 @@ class BaseDoctorAgent(ABC):
             token=token,
             team_id=team_id,
             endpoint_prefixes=endpoint_prefixes,
+            model_api_key=model_api_key,
+            use_invoke=use_invoke,
+            invoke_path=invoke_path,
+            exam_results_path=exam_results_path,
+            case_evaluation_path=case_evaluation_path,
+            batch_evaluation_path=batch_evaluation_path,
         )
 
         # 输出目录
         self.output_dir = config.get("output_dir", "outputs")
 
     @abstractmethod
-    async def train(self, patient_id: str) -> None:
+    async def train(self, patient_id: str) -> Optional[Dict[str, Any]]:
         """训练流程：对单个患者进行诊疗。
 
         参赛者必须实现此方法。
@@ -409,11 +761,32 @@ class BaseDoctorAgent(ABC):
                 "/patients",
                 params={"mode": mode, "team_id": self.actions.team_id},
             )
-            patients = result.get("patients", result.get("data", []))
-            return [p.get("patient_id", p) if isinstance(p, dict) else str(p) for p in patients]
+            patients = result.get("patients", result.get("data", result.get("patient_ids", [])))
+            return [
+                pid for pid in (self._normalize_patient_id(p) for p in patients) if pid
+            ]
         except Exception as e:
             logger.warning(f"获取患者列表失败: {e}，使用配置文件中的列表")
             return []
+
+    @staticmethod
+    def _normalize_patient_id(value: Any) -> str:
+        """Extract a stable patient id from service/config values."""
+        if value is None:
+            return ""
+        if isinstance(value, dict):
+            for key in ("patient_id", "patientId", "case_id", "caseId", "id"):
+                item = value.get(key)
+                if item:
+                    return str(item)
+            for key in ("patient", "case", "data"):
+                nested = value.get(key)
+                if isinstance(nested, dict):
+                    found = BaseDoctorAgent._normalize_patient_id(nested)
+                    if found:
+                        return found
+            return ""
+        return str(value)
 
     def _get_patient_ids_from_config(self, mode: str = "train") -> List[str]:
         """从配置文件获取患者 ID 列表。
@@ -428,7 +801,9 @@ class BaseDoctorAgent(ABC):
         patient_ids = mode_config.get("patient_ids", [])
 
         if patient_ids:
-            return patient_ids
+            return [
+                pid for pid in (self._normalize_patient_id(item) for item in patient_ids) if pid
+            ]
 
         # 如果没有指定患者 ID，返回空列表
         # 实际运行时会从服务端获取
@@ -442,7 +817,9 @@ class BaseDoctorAgent(ABC):
         mode_config = self.config.get(mode, {}) or {}
         explicit_ids = mode_config.get("patient_ids", []) or []
         if explicit_ids:
-            return [str(pid) for pid in explicit_ids]
+            return [
+                pid for pid in (self._normalize_patient_id(item) for item in explicit_ids) if pid
+            ]
 
         selection = str(mode_config.get("selection", "forward") or "forward").lower()
         patient_count = mode_config.get("patient_count")
@@ -452,7 +829,9 @@ class BaseDoctorAgent(ABC):
             limit = len(patient_ids)
         limit = max(0, min(limit, len(patient_ids)))
 
-        selected = [str(pid) for pid in patient_ids]
+        selected = [
+            pid for pid in (self._normalize_patient_id(item) for item in patient_ids) if pid
+        ]
         if selection == "random":
             seed = mode_config.get("random_seed", 42)
             rng = random.Random(seed)
@@ -478,7 +857,7 @@ class BaseDoctorAgent(ABC):
             except Exception as e:
                 logger.warning(f"[Cleanup] 关闭 llm 客户端失败: {e}")
 
-    async def run_train(self) -> None:
+    async def run_train(self) -> Dict[str, Any]:
         """训练入口：获取患者列表并逐个训练。
 
         此方法由 train.py 调用。
@@ -502,32 +881,87 @@ class BaseDoctorAgent(ABC):
                 f"请确保 SERVICE_BASE_URL 正确或配置 patient_ids。"
                 f"配置 patient_count={patient_count}"
             )
-            return
+            return {
+                "run_dir": "",
+                "results_file": "",
+                "summary_file": "",
+                "results": [],
+                "summary": summarize_training_results([]),
+            }
 
         logger.info(f"[run_train] 训练患者数: {len(patient_ids)}")
 
         # 创建输出目录
-        train_dir = os.path.join(self.output_dir, "train")
-        os.makedirs(train_dir, exist_ok=True)
+        timestamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        run_dir = os.path.join(self.output_dir, "train", timestamp)
+        os.makedirs(run_dir, exist_ok=True)
 
         # 逐个训练
         success_count = 0
         fail_count = 0
+        results: List[Dict[str, Any]] = []
         for i, patient_id in enumerate(patient_ids):
             logger.info(f"[run_train] 训练进度: {i + 1}/{len(patient_ids)}, patient_id={patient_id}")
             try:
-                await self.train(patient_id)
+                case_result = await self.train(patient_id)
+                if not isinstance(case_result, dict):
+                    case_result = {
+                        "patient_id": patient_id,
+                        "status": "completed",
+                        "metrics": {},
+                        "audit": {},
+                    }
+                results.append(case_result)
                 success_count += 1
             except Exception as e:
                 logger.error(f"[run_train] 训练患者 {patient_id} 失败: {e}")
+                results.append(
+                    {
+                        "patient_id": patient_id,
+                        "status": "failed",
+                        "error": str(e),
+                        "metrics": {},
+                        "audit": {},
+                    }
+                )
                 fail_count += 1
 
         logger.info(
             f"[run_train] 训练完成: 成功={success_count}, 失败={fail_count}"
         )
 
+        results_file = os.path.join(run_dir, "training_results.jsonl")
+        with open(results_file, "w", encoding="utf-8") as handle:
+            for item in results:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+        summary = summarize_training_results(results)
+        summary.update(
+            {
+                "selection": (self.config.get("train", {}) or {}).get("selection"),
+                "random_seed": (self.config.get("train", {}) or {}).get("random_seed"),
+                "requested_patient_count": (self.config.get("train", {}) or {}).get(
+                    "patient_count"
+                ),
+                "success_count": success_count,
+                "fail_count": fail_count,
+            }
+        )
+        summary_file = os.path.join(run_dir, "training_summary.json")
+        with open(summary_file, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        logger.info("[run_train] 训练汇总保存到: %s", summary_file)
+
         # 清理资源
         await self._cleanup()
+        return {
+            "run_dir": run_dir,
+            "results_file": results_file,
+            "summary_file": summary_file,
+            "results": results,
+            "summary": summary,
+        }
 
     async def run_test(self) -> Dict[str, Any]:
         """测试入口：获取患者列表并逐个测试。

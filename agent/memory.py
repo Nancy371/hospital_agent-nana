@@ -37,6 +37,10 @@ class DoctorMemory:
         self.config = config
         memory_config = config.get("memory", {})
         self.json_path = memory_config.get("json_path", "data/memory_data/memory.json")
+        self.replay_path = memory_config.get(
+            "diagnostic_replay_path",
+            "data/memory_data/diagnostic_replay.jsonl",
+        )
         self.max_notes = memory_config.get("max_notes", 200)
         self.max_note_chars = memory_config.get("max_note_chars", 1000)
 
@@ -108,6 +112,9 @@ class DoctorMemory:
         reflection: str,
         collected_info: Dict[str, Any],
         exam_results: Dict[str, Any],
+        evidence: Optional[Dict[str, Any]] = None,
+        diagnosis_decision: Optional[Dict[str, Any]] = None,
+        error_types: Optional[List[str]] = None,
     ) -> None:
         """保存病例经验到记忆。
 
@@ -119,33 +126,63 @@ class DoctorMemory:
             exam_results: 检查结果
         """
         # 提取评估指标
-        diagnosis_accuracy = report.get("diagnosisAccuracy", 0)
-        exam_precision = report.get("examinationPrecision", 0)
-        treatment_score = report.get("treatmentOverallScore", 0)
+        diagnosis_accuracy = _score_value(
+            report.get("diagnosisAccuracy", report.get("diagnosis_accuracy", 0))
+        )
+        exam_precision = _score_value(
+            report.get("examinationPrecision", report.get("examination_precision", 0))
+        )
+        treatment_score = _score_value(
+            report.get("treatmentOverallScore", report.get("treatment_overall_score", 0))
+        )
 
         # 提取诊断详情
         symptoms = collected_info.get("symptoms", [])
-        diagnosis_detail = report.get("diagnosisDetail", {})
-        submitted_diagnosis = diagnosis_detail.get("submitted", [])
-        expected_diagnosis = diagnosis_detail.get("expected", [])
+        diagnosis_detail = report.get("diagnosisDetail") or report.get("diagnosis_detail") or {}
+        if not isinstance(diagnosis_detail, dict):
+            diagnosis_detail = {}
+        submitted_diagnosis = diagnosis_detail.get("submitted") or report.get("diagnosis") or []
+        expected_diagnosis = diagnosis_detail.get("expected") or report.get("finalDiagnosis") or []
+        if isinstance(submitted_diagnosis, str):
+            submitted_diagnosis = [submitted_diagnosis]
+        if isinstance(expected_diagnosis, str):
+            expected_diagnosis = [expected_diagnosis]
 
         # 提取检查详情
-        examination_detail = report.get("examinationDetail", {})
         ordered_exams = list(exam_results.keys()) if exam_results else []
 
         # 计算综合质量评分（0-1）
         quality_score = (diagnosis_accuracy + exam_precision + treatment_score) / 3
+        memory_kind = (
+            "success"
+            if diagnosis_accuracy >= 0.8 and quality_score >= 0.7
+            else "failure_lesson"
+        )
+        error_types = list(dict.fromkeys(error_types or []))
+        if memory_kind == "failure_lesson":
+            lesson = (
+                f"参考诊断：{'、'.join(str(item) for item in expected_diagnosis) or '未提供'}。"
+                f"错误类型：{'、'.join(error_types) or '待归因'}。"
+                "后续相似病例应围绕参考诊断的关键支持证据和反证重新裁决。"
+            )
+        else:
+            lesson = "该病例达到成功范例阈值，可参考其正确诊断和检查路径。"
 
         # 构建结构化经验条目
         note = {
             "title": f"病例经验: {patient_id}",
             "content": reflection[:self.max_note_chars] if len(reflection) > self.max_note_chars else reflection,
+            "memory_kind": memory_kind,
+            "lesson": lesson,
+            "error_types": error_types,
             "created_at": datetime.now().isoformat(),
             "patient_id": patient_id,
             "symptoms": symptoms,
             "submitted_diagnosis": submitted_diagnosis,
             "expected_diagnosis": expected_diagnosis,
             "ordered_exams": ordered_exams,
+            "evidence_summary": evidence or {},
+            "diagnosis_decision": diagnosis_decision or {},
             "metrics": {
                 "diagnosis_accuracy": diagnosis_accuracy,
                 "exam_precision": exam_precision,
@@ -178,6 +215,52 @@ class DoctorMemory:
             f"质量评分={quality_score:.2f}, "
             f"诊断={diagnosis_accuracy}, 检查={exam_precision}, 治疗={treatment_score}"
         )
+
+    def save_diagnostic_replay(
+        self,
+        patient_id: str,
+        collected_info: Dict[str, Any],
+        exam_results: Dict[str, Any],
+        evidence: Dict[str, Any],
+        diagnosis_decision: Dict[str, Any],
+        report: Dict[str, Any],
+        error_types: Optional[List[str]] = None,
+        llm_candidates: Optional[List[str]] = None,
+        rag_chunks: Optional[List[Dict[str, Any]]] = None,
+        case_audit: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append a full diagnosis trace for deterministic offline replay."""
+        detail = report.get("diagnosisDetail") or report.get("diagnosis_detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+        row = {
+            "schema_version": 1,
+            "created_at": datetime.now().isoformat(),
+            "patient_id": patient_id,
+            "collected_info": collected_info or {},
+            "exam_results": exam_results or {},
+            "evidence": evidence or {},
+            "diagnosis_decision": diagnosis_decision or {},
+            "llm_candidates": list(llm_candidates or []),
+            "rag_chunks": list(rag_chunks or []),
+            "submitted": detail.get("submitted") or report.get("diagnosis") or [],
+            "expected": detail.get("expected") or report.get("finalDiagnosis") or [],
+            "evaluation": report or {},
+            "error_types": list(dict.fromkeys(error_types or [])),
+            "case_audit": {
+                "elapsed_seconds": (case_audit or {}).get("elapsed_seconds"),
+                "timed_out": bool((case_audit or {}).get("timed_out", False)),
+                "critic": (case_audit or {}).get("critic") or {},
+            },
+        }
+        directory = os.path.dirname(self.replay_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        try:
+            with open(self.replay_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(f"[Memory] 保存诊断回放失败: {exc}")
 
     def _prune_notes(self) -> None:
         """裁剪记忆，保留最有价值的条目。
@@ -285,18 +368,14 @@ class DoctorMemory:
                 content_score = overlap / total if total > 0 else 0
                 score += content_score * 0.2
 
-            # 3. 经验质量评分（0.3）
-            # 低分病例给更高权重，从失败中学习
+            # 3. 经验质量评分。失败病例只作为教训，不再获得额外召回奖励。
             quality = note.get("metrics", {}).get("quality_score", 0.5)
-            if quality < 0.5:
-                # 低分病例：权重翻倍
-                quality_weight = 0.6
+            if note.get("memory_kind") == "failure_lesson" or quality < 0.5:
+                quality_weight = 0.08
             elif quality >= 0.8:
-                # 高分病例：正常权重
-                quality_weight = 0.4
+                quality_weight = 0.45
             else:
-                # 中等分数：正常权重
-                quality_weight = 0.3
+                quality_weight = 0.25
             score += quality_weight * 0.3
 
             # 4. 时间衰减（近期经验更相关）
@@ -551,12 +630,12 @@ class DoctorMemory:
             if cur_gender and note_gender and cur_gender == note_gender:
                 score += 0.05
 
-            # 6) 质量权重（低分病例优先）
+            # 6) 质量权重：成功范例优先；失败病例由渲染层作为教训展示。
             quality = note.get("metrics", {}).get("quality_score", 0.5)
-            if quality < 0.5:
-                score += 0.10  # 从失败中学习
+            if note.get("memory_kind") == "failure_lesson" or quality < 0.5:
+                score += 0.01
             elif quality >= 0.8:
-                score += 0.05  # 成功范例
+                score += 0.10
 
             # 7) 时间衰减
             created_at = note.get("created_at", "")
@@ -573,3 +652,10 @@ class DoctorMemory:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [n for _, n in scored[:top_k]]
+
+
+def _score_value(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0

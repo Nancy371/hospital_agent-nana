@@ -23,6 +23,8 @@
 import json
 import logging
 import os
+import time
+import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -137,6 +139,32 @@ _DISEASE_EXAM_HINTS: Dict[str, List[str]] = {
 }
 
 
+_SERVICE_EXAM_ALIASES: Dict[str, str] = {
+    "心电图": "心电图（ECG）",
+    "ECG": "心电图（ECG）",
+    "胸部X线": "胸部X线检查（CXR）",
+    "胸片": "胸部X线检查（CXR）",
+    "胸部X线检查": "胸部X线检查（CXR）",
+    "CXR": "胸部X线检查（CXR）",
+    "体格检查": "体格检查",
+    "查体": "体格检查",
+    "超声心动图": "超声心动图",
+    "心脏超声": "超声心动图",
+    "心导管检查": "心导管检查",
+    "心导管": "心导管检查",
+}
+
+_SERVICE_EXAM_NAMES: Set[str] = set(_SERVICE_EXAM_ALIASES.values())
+
+_AMBIGUOUS_EXAM_ALIASES: Set[str] = {
+    "腹部B超",
+    "CT",
+    "MRI",
+    "超声",
+    "培养",
+}
+
+
 _DISEASE_PRIORITY = {
     name: idx for idx, name in enumerate([
         "心肌梗死", "脑出血", "脑梗死", "肺炎", "阑尾炎", "胰腺炎", "肠梗阻",
@@ -150,8 +178,13 @@ _DISEASE_PRIORITY = {
 class KnowledgeBase:
     """静态医学知识库 —— 症状召回 + 检查规范化 + RAG 上下文组装。"""
 
-    def __init__(self, ref_dir: str = "data/ref_data"):
+    def __init__(
+        self,
+        ref_dir: str = "data/ref_data",
+        allow_auto_alias_promotion: bool = False,
+    ):
         self.ref_dir = ref_dir
+        self.allow_auto_alias_promotion = bool(allow_auto_alias_promotion)
         self.diseases: List[Dict[str, Any]] = []
         self.examinations: List[Dict[str, Any]] = []
         self.departments: List[Dict[str, Any]] = []
@@ -162,7 +195,13 @@ class KnowledgeBase:
         self._profile_by_name: Dict[str, Dict[str, Any]] = {}
         self._alias_to_profile_name: Dict[str, str] = {}
         self._symptom_to_diseases: Dict[str, Set[str]] = {}
+        self.exam_aliases_path = os.path.join(self.ref_dir, "exam_aliases.json")
+        self.exam_aliases_auto_path = os.path.join(self.ref_dir, "exam_aliases_auto.json")
+        self.exam_aliases_pending_path = os.path.join(self.ref_dir, "exam_aliases_pending.json")
+        self._service_exam_aliases: Dict[str, str] = dict(_SERVICE_EXAM_ALIASES)
+        self._service_exam_names: Set[str] = set(_SERVICE_EXAM_NAMES)
         self._load()
+        self._load_exam_aliases()
         self._build_indices()
 
     # ---------- 加载 ----------
@@ -182,12 +221,18 @@ class KnowledgeBase:
                 # 字典根字段名与属性名一致
                 setattr(self, attr, data.get(attr, []))
             self.disease_profiles = []
-            for profiles_file in ("disease_profiles.json", "disease_profiles_extra.json"):
+            profile_files = []
+            if os.path.isdir(self.ref_dir):
+                profile_files = [
+                    filename
+                    for filename in sorted(os.listdir(self.ref_dir))
+                    if filename.startswith("disease_profiles") and filename.endswith(".json")
+                ]
+            for profiles_file in profile_files:
                 profiles_path = os.path.join(self.ref_dir, profiles_file)
-                if os.path.exists(profiles_path):
-                    with open(profiles_path, "r", encoding="utf-8") as f:
-                        profiles_data = json.load(f)
-                    self.disease_profiles.extend(profiles_data.get("profiles", []))
+                with open(profiles_path, "r", encoding="utf-8") as f:
+                    profiles_data = json.load(f)
+                self.disease_profiles.extend(profiles_data.get("profiles", []))
             logger.info(
                 f"[Knowledge] 加载完成: 疾病={len(self.diseases)}, "
                 f"检查={len(self.examinations)}, 科室={len(self.departments)}, "
@@ -195,6 +240,69 @@ class KnowledgeBase:
             )
         except Exception as e:
             logger.warning(f"[Knowledge] 加载失败: {e}")
+
+    def _load_exam_aliases(self) -> None:
+        """加载内置、自动晋级、人工确认的检查名映射。"""
+        self._service_exam_aliases = dict(_SERVICE_EXAM_ALIASES)
+        self._service_exam_aliases.update(self._read_alias_file(self.exam_aliases_auto_path))
+        self._service_exam_aliases.update(self._read_alias_file(self.exam_aliases_path))
+        self._service_exam_names = set(self._service_exam_aliases.values())
+
+    @staticmethod
+    def _clean_aliases(raw_aliases: Any) -> Dict[str, str]:
+        aliases: Dict[str, str] = {}
+        if not isinstance(raw_aliases, dict):
+            return aliases
+        for alias, standard in raw_aliases.items():
+            alias_text = str(alias).strip()
+            standard_text = str(standard).strip()
+            if alias_text and standard_text:
+                aliases[alias_text] = standard_text
+        return aliases
+
+    def _read_alias_file(self, path: str) -> Dict[str, str]:
+        data = self._read_json_file(path, {})
+        if isinstance(data, dict) and isinstance(data.get("aliases"), dict):
+            return self._clean_aliases(data.get("aliases"))
+        return self._clean_aliases(data)
+
+    @staticmethod
+    def _read_json_file(path: str, default: Any) -> Any:
+        if not os.path.exists(path):
+            return default
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning("[Knowledge] 加载 JSON 失败: %s, %s", path, exc)
+            return default
+
+    @staticmethod
+    def _write_json_file(path: str, data: Any) -> None:
+        target_dir = os.path.dirname(path) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        tmp_path = os.path.join(
+            target_dir,
+            f".{os.path.basename(path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp",
+        )
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+    @staticmethod
+    def _now_iso() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%S")
 
     def _build_indices(self) -> None:
         """构建症状→疾病倒排索引与名称索引。"""
@@ -403,6 +511,322 @@ class KnowledgeBase:
         normalized, _ = self.normalize_examinations(items)
         return list(dict.fromkeys(normalized))
 
+    @staticmethod
+    def _as_text_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, dict):
+            values = []
+            for key in ("name", "item", "exam", "examination"):
+                if value.get(key):
+                    values.append(str(value[key]).strip())
+            return [item for item in values if item]
+        if isinstance(value, list):
+            result: List[str] = []
+            for item in value:
+                result.extend(KnowledgeBase._as_text_list(item))
+            return list(dict.fromkeys(item for item in result if item))
+        return [str(value).strip()] if str(value).strip() else []
+
+    @staticmethod
+    def _metric_value(report: Dict[str, Any], *keys: str) -> float:
+        for key in keys:
+            value = report.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    @staticmethod
+    def _is_high_score_case(
+        diagnosis_accuracy: float,
+        examination_precision: float,
+        treatment_score: float,
+    ) -> bool:
+        return (
+            diagnosis_accuracy >= 0.8
+            and examination_precision >= 0.8
+            and treatment_score >= 0.8
+        )
+
+    @staticmethod
+    def _is_ambiguous_exam_alias(alias: str) -> bool:
+        text = str(alias or "").strip()
+        if not text:
+            return True
+        return text in _AMBIGUOUS_EXAM_ALIASES
+
+    @staticmethod
+    def _standard_matches_alias(alias: str, standard: str) -> bool:
+        alias_text = str(alias or "").strip()
+        standard_text = str(standard or "").strip()
+        if not alias_text or not standard_text:
+            return False
+        if alias_text in standard_text or standard_text in alias_text:
+            return True
+        alias_upper = alias_text.upper().replace(" ", "")
+        standard_upper = standard_text.upper().replace(" ", "")
+        return (
+            f"({alias_upper})" in standard_upper
+            or f"（{alias_upper}）" in standard_upper
+        )
+
+    def _infer_exam_alias_standard(
+        self,
+        alias: str,
+        expected_items: List[str],
+        submitted_items: List[str],
+    ) -> Optional[str]:
+        alias_text = str(alias or "").strip()
+        if not alias_text:
+            return None
+
+        mapped = self._service_exam_aliases.get(alias_text)
+        if mapped and (not expected_items or mapped in expected_items):
+            return mapped
+
+        for standard in expected_items:
+            if self._standard_matches_alias(alias_text, standard):
+                return standard
+
+        if (
+            len(expected_items) == 1
+            and len(submitted_items) == 1
+            and not self._is_ambiguous_exam_alias(alias_text)
+        ):
+            return expected_items[0]
+        return None
+
+    @staticmethod
+    def _candidate_key(alias: str, standard: str) -> str:
+        return f"{alias} => {standard}"
+
+    @staticmethod
+    def _evidence_key(evidence: Dict[str, Any]) -> Tuple[str, str]:
+        evidence_id = evidence.get("evidence_id")
+        if evidence_id:
+            return (str(evidence_id), "")
+        return (
+            str(evidence.get("patient_id") or ""),
+            str(evidence.get("created_at") or ""),
+        )
+
+    def _normalize_pending_data(self, data: Any) -> Dict[str, Any]:
+        if isinstance(data, dict):
+            candidates = data.get("candidates")
+            if isinstance(candidates, list):
+                return data
+        return {"candidates": []}
+
+    def _upsert_pending_candidate(
+        self,
+        pending_data: Dict[str, Any],
+        alias: str,
+        standard: str,
+        evidence: Dict[str, Any],
+        invalid_seen: bool,
+    ) -> None:
+        candidates = pending_data.setdefault("candidates", [])
+        key = self._candidate_key(alias, standard)
+        candidate = None
+        for item in candidates:
+            if item.get("key") == key:
+                candidate = item
+                break
+
+        now = self._now_iso()
+        if candidate is None:
+            candidate = {
+                "key": key,
+                "alias": alias,
+                "standard": standard,
+                "status": "pending",
+                "ambiguous": self._is_ambiguous_exam_alias(alias),
+                "invalid_seen": False,
+                "conflict": False,
+                "evidence": [],
+                "created_at": now,
+                "updated_at": now,
+            }
+            candidates.append(candidate)
+
+        candidate["updated_at"] = now
+        candidate["ambiguous"] = self._is_ambiguous_exam_alias(alias)
+        candidate["invalid_seen"] = bool(candidate.get("invalid_seen")) or invalid_seen
+
+        evidence_list = candidate.setdefault("evidence", [])
+        evidence_keys = {self._evidence_key(item) for item in evidence_list}
+        if self._evidence_key(evidence) not in evidence_keys:
+            evidence_list.append(evidence)
+
+    def _promote_pending_exam_aliases(self, pending_data: Dict[str, Any]) -> int:
+        candidates = pending_data.setdefault("candidates", [])
+        alias_to_standards: Dict[str, Set[str]] = {}
+        for candidate in candidates:
+            alias = str(candidate.get("alias") or "").strip()
+            standard = str(candidate.get("standard") or "").strip()
+            if alias and standard and candidate.get("status") != "blocked":
+                alias_to_standards.setdefault(alias, set()).add(standard)
+
+        for candidate in candidates:
+            alias = str(candidate.get("alias") or "").strip()
+            candidate["conflict"] = len(alias_to_standards.get(alias, set())) > 1
+
+        manual_aliases = self._read_alias_file(self.exam_aliases_path)
+        auto_data = self._read_json_file(
+            self.exam_aliases_auto_path,
+            {"aliases": {}, "evidence": {}},
+        )
+        if not isinstance(auto_data, dict):
+            auto_data = {"aliases": {}, "evidence": {}}
+        auto_aliases = self._clean_aliases(auto_data.get("aliases", {}))
+        auto_evidence = auto_data.get("evidence")
+        if not isinstance(auto_evidence, dict):
+            auto_evidence = {}
+
+        promoted = 0
+        for candidate in candidates:
+            alias = str(candidate.get("alias") or "").strip()
+            standard = str(candidate.get("standard") or "").strip()
+            if not alias or not standard:
+                continue
+            if candidate.get("status") == "promoted":
+                continue
+            if alias in manual_aliases:
+                continue
+            if candidate.get("ambiguous") or candidate.get("invalid_seen") or candidate.get("conflict"):
+                continue
+
+            high_evidence = [
+                item
+                for item in candidate.get("evidence", [])
+                if item.get("high_score") is True
+            ]
+            if len(high_evidence) < 2:
+                continue
+
+            auto_aliases[alias] = standard
+            auto_evidence[alias] = {
+                "standard": standard,
+                "promoted_at": self._now_iso(),
+                "evidence": high_evidence,
+            }
+            candidate["status"] = "promoted"
+            candidate["promoted_at"] = auto_evidence[alias]["promoted_at"]
+            promoted += 1
+
+        if promoted:
+            self._write_json_file(
+                self.exam_aliases_auto_path,
+                {"aliases": auto_aliases, "evidence": auto_evidence},
+            )
+            self._load_exam_aliases()
+        return promoted
+
+    def record_exam_alias_feedback(
+        self,
+        patient_id: str,
+        report: Dict[str, Any],
+        submitted_items: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        """记录训练反馈中的检查名候选映射，并按高分证据自动晋级。"""
+        if not isinstance(report, dict):
+            return {"pending": 0, "promoted": 0}
+
+        detail = report.get("examinationDetail") or report.get("examination_detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+
+        expected_items = self._as_text_list(
+            detail.get("expected")
+            or detail.get("expected_examinations")
+            or detail.get("expectedExaminations")
+        )
+        submitted_from_report = self._as_text_list(
+            detail.get("ordered")
+            or detail.get("submitted")
+            or detail.get("submitted_examinations")
+            or detail.get("submittedExaminations")
+        )
+        invalid_items = self._as_text_list(
+            detail.get("invalid")
+            or detail.get("invalid_items")
+            or detail.get("invalidItems")
+        )
+        submitted = list(dict.fromkeys(
+            submitted_from_report + self._as_text_list(submitted_items or []) + invalid_items
+        ))
+
+        if not expected_items or not submitted:
+            return {"pending": 0, "promoted": 0}
+
+        diagnosis_accuracy = self._metric_value(report, "diagnosisAccuracy", "diagnosis_accuracy")
+        examination_precision = self._metric_value(
+            report,
+            "examinationPrecision",
+            "examination_precision",
+        )
+        treatment_score = self._metric_value(
+            report,
+            "treatmentOverallScore",
+            "treatment_overall_score",
+        )
+        high_score = self._is_high_score_case(
+            diagnosis_accuracy,
+            examination_precision,
+            treatment_score,
+        )
+
+        pending_data = self._normalize_pending_data(
+            self._read_json_file(self.exam_aliases_pending_path, {"candidates": []})
+        )
+
+        created_at = self._now_iso()
+        pending_count = 0
+        for alias in submitted:
+            if alias in self._service_exam_names:
+                continue
+            standard = self._infer_exam_alias_standard(alias, expected_items, submitted)
+            if not standard or standard == alias:
+                continue
+            invalid_seen = alias in invalid_items
+            evidence = {
+                "evidence_id": uuid.uuid4().hex,
+                "patient_id": patient_id,
+                "submitted": submitted,
+                "expected": expected_items,
+                "invalid_items": invalid_items,
+                "diagnosis_accuracy": diagnosis_accuracy,
+                "examination_precision": examination_precision,
+                "treatment_score": treatment_score,
+                "high_score": high_score,
+                "created_at": created_at,
+            }
+            self._upsert_pending_candidate(
+                pending_data=pending_data,
+                alias=alias,
+                standard=standard,
+                evidence=evidence,
+                invalid_seen=invalid_seen,
+            )
+            pending_count += 1
+
+        if not pending_count:
+            return {"pending": 0, "promoted": 0}
+
+        promoted = (
+            self._promote_pending_exam_aliases(pending_data)
+            if self.allow_auto_alias_promotion
+            else 0
+        )
+        self._write_json_file(self.exam_aliases_pending_path, pending_data)
+        return {"pending": pending_count, "promoted": promoted}
+
     def build_clinical_context(
         self,
         symptoms: List[str],
@@ -429,6 +853,8 @@ class KnowledgeBase:
                 lines.append(f"   关键问诊: {', '.join(profile['key_questions'][:5])}")
             if profile.get("required_exams"):
                 lines.append(f"   必查检查: {', '.join(profile['required_exams'])}")
+            if profile.get("strong_verification_exams"):
+                lines.append(f"   强验证检查: {', '.join(profile['strong_verification_exams'])}")
             if profile.get("differential_diagnoses"):
                 lines.append(f"   重点鉴别: {', '.join(profile['differential_diagnoses'][:6])}")
             if profile.get("avoid_mistakes"):
@@ -450,14 +876,26 @@ class KnowledgeBase:
             name = str(raw).strip()
             if not name:
                 continue
-            if name in self._exam_by_name:
+            if name in self._service_exam_aliases:
+                valid.append(self._service_exam_aliases[name])
+                continue
+            if name in self._service_exam_names:
                 valid.append(name)
+                continue
+            if name in self._exam_by_name:
+                valid.append(self._service_exam_aliases.get(name, name))
                 continue
             # 子串匹配（"胸片" ↔ "胸部X线"）
             matched = None
+            for alias, standard in self._service_exam_aliases.items():
+                if alias in name or name in alias or standard in name or name in standard:
+                    matched = standard
+                    break
             for cname in catalog_names:
+                if matched:
+                    break
                 if cname in name or name in cname:
-                    matched = cname
+                    matched = self._service_exam_aliases.get(cname, cname)
                     break
             if matched:
                 valid.append(matched)
@@ -598,7 +1036,11 @@ class KnowledgeBase:
         return list(dict.fromkeys(suggestions))[:top_k]
 
     def is_valid_examination(self, name: str) -> bool:
-        return name in self._exam_by_name
+        return name in self._exam_by_name or name in self._service_exam_names
 
     def get_examination_catalog_names(self) -> List[str]:
-        return list(self._exam_by_name.keys())
+        names = list(self._exam_by_name.keys())
+        for item in self._service_exam_names:
+            if item not in names:
+                names.append(item)
+        return names

@@ -11,9 +11,11 @@ Planner 作为中枢，通过 Reflection/Criticism 机制将宏观目标分解�
 LLM 进行深度推理后决策下一步操作（tool call）。
 """
 
+import asyncio
 import json
 import logging
 import os
+import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +31,13 @@ from .exam_strategy import ExamStrategyAgent
 from .inquiry_strategy import InquiryStrategyAgent
 from .qc import QualityAgent
 from .treatment_strategy import TreatmentStrategyAgent
+from .structural_diagnosis import StructuralDiagnosisAgent
+from .evidence_engine import EvidenceDiagnosisEngine
+from .clinical_evidence import ClinicalEvidenceNormalizer, EvidenceAgent, EvidenceBundle
+from .diagnosis_engine import DiagnosisDecisionEngine
+from .diagnosis_critic import DiagnosisCritic
+from .diagnostic_learning import DiagnosticLearningStore
+from .treatment_safety import TreatmentSafetyGate
 
 logger = logging.getLogger(__name__)
 
@@ -614,14 +623,104 @@ class MyDoctorAgent(BaseDoctorAgent):
         self.max_ask_rounds = config.get("max_ask_rounds", 5)
         self.max_exam_rounds = config.get("max_exam_rounds", 3)
         self.log_llm_prompts = config.get("log_llm_prompts", False)
+        execution_config = config.get("execution", {}) or {}
+        self.fast_mode = bool(execution_config.get("fast_mode", False))
+        self.case_timeout_seconds = float(execution_config.get("case_timeout_seconds", 0) or 0)
+        self.fallback_reserve_seconds = float(
+            execution_config.get("fallback_reserve_seconds", 20) or 20
+        )
+        self.train_post_submit_reserve_seconds = float(
+            execution_config.get("train_post_submit_reserve_seconds", 40) or 40
+        )
+        self.train_evaluation_timeout_seconds = float(
+            execution_config.get("train_evaluation_timeout_seconds", 12) or 12
+        )
+        self.train_reflection_timeout_seconds = float(
+            execution_config.get("train_reflection_timeout_seconds", 24) or 24
+        )
+        self.max_llm_calls_per_case = int(execution_config.get("max_llm_calls_per_case", 0) or 0)
+        self.skip_train_reflection = bool(
+            execution_config.get("skip_train_reflection", self.fast_mode)
+        )
+        self.planner_criticism_max_calls = int(
+            execution_config.get("planner_criticism_max_calls", 0 if self.fast_mode else 2)
+        )
+        self.planner_max_total_actions = int(
+            execution_config.get("planner_max_total_actions", 6 if self.fast_mode else 15)
+        )
+        self.fast_initial_question = execution_config.get(
+            "fast_initial_question",
+            "请描述这次最主要的不适、开始时间、伴随症状、既往病史、用药史和过敏史。",
+        )
+        self.fast_exam_items = execution_config.get("fast_exam_items") or [
+            "体格检查",
+            "超声心动图",
+            "心电图（ECG）",
+            "胸部X线检查（CXR）",
+            "心导管检查",
+            "血常规",
+            "C反应蛋白",
+            "胸部CT",
+            "尿常规",
+            "腹部B超",
+            "甲状腺功能",
+        ]
+        self.fast_max_exam_items = int(execution_config.get("fast_max_exam_items", 10) or 10)
+
+        learning_config = config.get("learning", {}) or {}
+        self.freeze_active_learning = bool(
+            learning_config.get("freeze_active_knowledge", True)
+        )
 
         # 静态医学知识库（症状倒排 + 检查规范化 + RAG）
         ref_dir = config.get("ref_data_dir", "data/ref_data")
-        self.knowledge = KnowledgeBase(ref_dir=ref_dir)
+        self.knowledge = KnowledgeBase(
+            ref_dir=ref_dir,
+            allow_auto_alias_promotion=bool(
+                learning_config.get("auto_promote_exam_aliases", False)
+            )
+            and not self.freeze_active_learning,
+        )
+        self.diagnosis_chain_enabled = bool(
+            (config.get("diagnosis", {}) or {}).get("enabled", True)
+        )
+        self.legacy_candidate_submission = bool(
+            (config.get("diagnosis", {}) or {}).get("legacy_candidate_submission", True)
+        )
+        self.clinical_normalizer = ClinicalEvidenceNormalizer(ref_dir=ref_dir)
+        self.evidence_agent = EvidenceAgent(ref_dir=ref_dir, normalizer=self.clinical_normalizer)
+        self.diagnosis_engine = DiagnosisDecisionEngine(config=config, ref_dir=ref_dir)
         self.exam_agent = ExamStrategyAgent(self.knowledge)
         self.inquiry_agent = InquiryStrategyAgent(self.knowledge)
-        self.quality_agent = QualityAgent(self.knowledge)
-        self.treatment_agent = TreatmentStrategyAgent(self.knowledge)
+        self.quality_agent = QualityAgent(
+            self.knowledge,
+            allowed_diagnoses=self.diagnosis_engine.knowledge.allowed_names,
+        )
+        self.treatment_agent = TreatmentStrategyAgent(
+            self.knowledge,
+            diagnostic_knowledge=self.diagnosis_engine.knowledge,
+        )
+        self.treatment_safety = TreatmentSafetyGate(self.diagnosis_engine.knowledge)
+        self.diagnosis_critic = DiagnosisCritic(
+            config=config,
+            knowledge=self.diagnosis_engine.knowledge,
+            resolver=self.diagnosis_engine.resolver,
+            llm_chat_json=self._llm_chat_json,
+        )
+        self.structural_agent = StructuralDiagnosisAgent()
+        self.evidence_engine = EvidenceDiagnosisEngine(ref_dir=ref_dir)
+        diagnosis_config = config.get("diagnosis", {}) or {}
+        self.diagnostic_learning = DiagnosticLearningStore(
+            path=diagnosis_config.get(
+                "learning_path",
+                os.path.join(ref_dir, "pending_diagnostic_rules.json"),
+            )
+        )
+        self._case_started_at = 0.0
+        self._case_deadline = 0.0
+        self._case_clinical_deadline = 0.0
+        self._case_post_submit_reserve_seconds = 0.0
+        self._last_diagnosis_audit: Dict[str, Any] = {}
 
         # 规划器（延迟初始化，因为需要绑定异步方法）
         self._planner: Optional[Planner] = None
@@ -652,9 +751,11 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "policy_store_path", "data/memory_data/policies.json"
                 )
                 self.policy_store = PolicyStore(store_path=policy_path)
+                sanitation = self.policy_store.sanitize_shadow_patches()
                 logger.info(
                     f"[自迭代] 已启用 detector + policy_store "
-                    f"(现有补丁 {len(self.policy_store.patches)} 项)"
+                    f"(现有补丁 {len(self.policy_store.patches)} 项, "
+                    f"清退不可执行 shadow {sanitation['retired']} 项)"
                 )
             except Exception as _e:
                 logger.warning(f"[自迭代] 初始化失败，降级为无自迭代模式: {_e}")
@@ -719,6 +820,19 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._llm_call_by_kind = {}
         self._exp_cache = {}
 
+    def _can_call_llm(self, kind: str) -> bool:
+        """Return False when the per-case LLM budget has been exhausted."""
+        if self.max_llm_calls_per_case <= 0:
+            return True
+        if self._llm_call_count < self.max_llm_calls_per_case:
+            return True
+        logger.warning(
+            "[LLM] skip %s call: per-case budget reached (%s)",
+            kind,
+            self.max_llm_calls_per_case,
+        )
+        return False
+
     def _get_planner(self) -> Planner:
         """获取或初始化规划器。"""
         if self._planner is None:
@@ -730,10 +844,268 @@ class MyDoctorAgent(BaseDoctorAgent):
             )
             self._planner.max_inquiry_rounds = self.max_ask_rounds
             self._planner.max_exam_rounds = self.max_exam_rounds
+            self._planner.criticism_max_calls = max(0, self.planner_criticism_max_calls)
+            self._planner.max_total_actions = max(1, self.planner_max_total_actions)
             # 注入策略补丁库（若 agent 已启用）
             if getattr(self, "policy_store", None) is not None:
                 self._planner.policy_store = self.policy_store
         return self._planner
+
+    async def _run_case_pipeline(
+        self,
+        patient_id: str,
+        post_submit_reserve_seconds: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Run one case with an optional fast path and hard timeout guard."""
+        self._case_started_at = time.monotonic()
+        post_submit_reserve_seconds = max(0.0, float(post_submit_reserve_seconds or 0))
+        if self.case_timeout_seconds > 0:
+            maximum_post_reserve = max(
+                0.0,
+                self.case_timeout_seconds - self.fallback_reserve_seconds - 1.0,
+            )
+            post_submit_reserve_seconds = min(
+                post_submit_reserve_seconds,
+                maximum_post_reserve,
+            )
+        self._case_post_submit_reserve_seconds = post_submit_reserve_seconds
+        self._case_deadline = (
+            self._case_started_at + self.case_timeout_seconds
+            if self.case_timeout_seconds > 0
+            else 0.0
+        )
+        self._case_clinical_deadline = (
+            self._case_deadline - post_submit_reserve_seconds
+            if self._case_deadline > 0
+            else 0.0
+        )
+        self._last_diagnosis_audit = {}
+        runner = (
+            self._execute_fast_path(patient_id)
+            if self.fast_mode
+            else self._execute_with_planner(patient_id)
+        )
+        if self.case_timeout_seconds <= 0:
+            return await runner
+        main_timeout = max(
+            1.0,
+            self.case_timeout_seconds
+            - post_submit_reserve_seconds
+            - max(0.0, self.fallback_reserve_seconds),
+        )
+        try:
+            return await asyncio.wait_for(runner, timeout=main_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[CaseTimeout] patient=%s clinical path exceeded %.1fs; "
+                "using %.1fs reserve for fallback submission",
+                patient_id,
+                main_timeout,
+                max(0.0, self._remaining_case_seconds()),
+            )
+            return await self._build_timeout_final_result(
+                patient_id,
+                "临床诊疗链路超过 "
+                f"{self.case_timeout_seconds - post_submit_reserve_seconds:.0f} 秒预算，"
+                "已触发保底提交。",
+            )
+
+    def _remaining_case_seconds(self) -> float:
+        deadline = self._case_clinical_deadline or self._case_deadline
+        if deadline <= 0:
+            return 10_000.0
+        return max(0.0, deadline - time.monotonic())
+
+    def _remaining_total_case_seconds(self) -> float:
+        if self._case_deadline <= 0:
+            return 10_000.0
+        return max(0.0, self._case_deadline - time.monotonic())
+
+    async def _build_timeout_final_result(self, patient_id: str, reason: str) -> Dict[str, Any]:
+        """Submit a safe final result when the main execution path is interrupted."""
+        collected_info = getattr(self, "_last_collected_info", {}) or {}
+        exam_results = getattr(self, "_last_exam_results", {}) or {}
+        planner = self._get_planner()
+        conversation_rounds = len(
+            [a for a in planner.action_history if a.get("type") == "ask_patient"]
+        )
+        fallback = self.quality_agent.default_final_result(reason)
+        if self.diagnosis_chain_enabled:
+            evidence_graph = self.evidence_agent.build_graph(collected_info, exam_results)
+            evidence = evidence_graph.bundle
+            decision = self.diagnosis_engine.decide(fallback, [], evidence)
+            fallback = self.diagnosis_engine.apply_to_result(fallback, decision, evidence)
+        else:
+            fallback = self.evidence_engine.review(
+                fallback,
+                collected_info=collected_info,
+                exam_results=exam_results,
+            )
+            if not fallback.get("_trusted_diagnoses"):
+                fallback = self.structural_agent.review(
+                    fallback,
+                    collected_info=collected_info,
+                    exam_results=exam_results,
+                )
+        fallback = self.quality_agent.review_final_result(
+            fallback,
+            collected_info=collected_info,
+            exam_results=exam_results,
+            conversation_rounds=conversation_rounds,
+        )
+        fallback = self.treatment_agent.review(
+            fallback,
+            collected_info=collected_info,
+            exam_results=exam_results,
+        )
+        fallback = self.treatment_safety.review(
+            fallback,
+            collected_info=collected_info,
+            exam_results=exam_results,
+        )
+        try:
+            remaining = self._remaining_case_seconds()
+            if remaining <= 0.5:
+                raise asyncio.TimeoutError("no fallback submission budget remaining")
+            submit_result = await asyncio.wait_for(
+                self.actions.prescribe_treatment(
+                    patient_id=patient_id,
+                    diagnosis=fallback.get("diagnosis", []),
+                    treatment_plan=fallback.get("treatment_plan", ""),
+                    reasoning=fallback.get("reasoning", ""),
+                ),
+                timeout=max(0.5, remaining - 0.25),
+            )
+            if isinstance(submit_result, dict):
+                fallback.update({k: v for k, v in submit_result.items() if v not in (None, "")})
+        except (Exception, asyncio.TimeoutError) as exc:
+            logger.warning("[CaseTimeout] fallback submit failed for %s: %s", patient_id, exc)
+            fallback.update(
+                {
+                    "patient_id": patient_id,
+                    "caseId": patient_id,
+                    "ordered_examinations": list(exam_results.keys()),
+                    "finished": True,
+                }
+            )
+        reviewed = self.quality_agent.review_final_result(
+            fallback,
+            collected_info=collected_info,
+            exam_results=exam_results,
+            conversation_rounds=conversation_rounds,
+        )
+        reviewed["_case_elapsed_seconds"] = round(
+            max(0.0, time.monotonic() - self._case_started_at), 3
+        )
+        reviewed["_case_timed_out"] = True
+        if self._last_diagnosis_audit:
+            self._last_diagnosis_audit["elapsed_seconds"] = reviewed[
+                "_case_elapsed_seconds"
+            ]
+            self._last_diagnosis_audit["timed_out"] = True
+        return reviewed
+
+    async def _execute_fast_path(self, patient_id: str) -> Dict[str, Any]:
+        """A bounded case path for local training/testing speed and reliability."""
+        planner = self._get_planner()
+        working_memory = self.memory_manager.start_case(patient_id)
+        chat_history: List[Dict[str, str]] = working_memory.chat_history
+        collected_info: Dict[str, Any] = working_memory.collected_info
+        exam_results: Dict[str, Any] = working_memory.exam_results
+        self._last_collected_info = {}
+        self._last_exam_results = {}
+
+        logger.info("[FastPath] start patient=%s", patient_id)
+
+        question = str(self.fast_initial_question)
+        try:
+            answer = await self.actions.ask_patient(
+                patient_id=patient_id,
+                input_data={"question": question, "chat_history": chat_history},
+            )
+        except Exception as exc:
+            logger.warning("[FastPath] ask_patient failed for %s: %s", patient_id, exc)
+            answer = ""
+
+        chat_history.append({"from": "doctor", "text": question})
+        chat_history.append({"from": "patient", "text": str(answer)})
+        planner.current_phase = Phase.INQUIRY
+        planner._record_action("ask_patient", "fast_initial_inquiry", str(answer)[:120])
+        planner.inquiry_rounds = 1
+
+        collected_info = self._fallback_parse_patient_response(str(answer), collected_info)
+        if answer and not collected_info.get("chief_complaint"):
+            collected_info["chief_complaint"] = str(answer)[:180]
+        self.memory_manager.update_collected_info(patient_id, collected_info)
+        self._last_collected_info = dict(collected_info)
+
+        symptoms = collected_info.get("symptoms", []) or []
+        disease_hits = self.knowledge.recall_diseases_by_symptoms(symptoms, top_k=5) if symptoms else []
+        candidate_names = [item.get("name") for item in disease_hits if item.get("name")]
+        self.memory_manager.update_candidates(patient_id, candidate_names)
+
+        proposed_items = list(self._fallback_generate_examination_items(collected_info))
+        for item in self.fast_exam_items:
+            if item and item not in proposed_items:
+                proposed_items.append(item)
+        strategy = self.exam_agent.recommend(
+            collected_info=collected_info,
+            candidate_diseases=candidate_names,
+            proposed_items=proposed_items,
+            existing_results=exam_results,
+        )
+        normalized_fast_items, _ = self.knowledge.normalize_examinations(self.fast_exam_items)
+        raw_exam_items = []
+        for item in list(self.fast_exam_items) + normalized_fast_items + strategy.get("items", []):
+            if item and item not in raw_exam_items:
+                raw_exam_items.append(item)
+        exam_items = self.exam_agent.prepare_order_items(
+            raw_exam_items,
+            collected_info=collected_info,
+            candidate_diseases=candidate_names,
+            existing_results=exam_results,
+            max_items=self.fast_max_exam_items,
+        )
+
+        if exam_items:
+            try:
+                response = await self.actions.order_examination(
+                    patient_id=patient_id,
+                    items=exam_items,
+                    reason="快速路径：基于主诉、症状召回和疾病画像补齐关键检查。",
+                )
+                new_results = {}
+                if response and "results" in response:
+                    for exam_name, exam_data in response["results"].items():
+                        if isinstance(exam_data, dict) and exam_data.get("status") != "invalid":
+                            new_results[exam_name] = exam_data
+                if new_results:
+                    exam_results.update(new_results)
+                    self.memory_manager.update_exam_results(patient_id, new_results)
+                    planner._record_action(
+                        "order_examination",
+                        ",".join(new_results.keys()),
+                        "fast_exam_batch",
+                    )
+                    planner.exam_rounds += 1
+            except Exception as exc:
+                logger.warning("[FastPath] order_examination failed for %s: %s", patient_id, exc)
+        self._last_exam_results = dict(exam_results)
+
+        planner.current_phase = Phase.TREATMENT
+        final_result = await self._prescribe(
+            patient_id,
+            collected_info,
+            exam_results,
+            chat_history,
+            self._get_cached_experience(collected_info),
+        )
+        planner._record_action("prescribe_treatment", "fast_final_submit", "")
+        planner.current_phase = Phase.COMPLETED
+        self._last_collected_info = dict(collected_info)
+        self._last_exam_results = dict(exam_results)
+        self.memory_manager.finish_case(patient_id)
+        return final_result
 
     # ============ 规划驱动执行循环 ============
 
@@ -780,6 +1152,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             patient_id, chat_history, relevant_experience
         )
         self.memory_manager.update_collected_info(patient_id, collected_info)
+        self._last_collected_info = dict(collected_info)
         planner._record_action("ask_patient", "初始问诊-主诉", str(collected_info.get("chief_complaint", ""))[:100])
         planner.inquiry_rounds = 1
 
@@ -816,6 +1189,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 if result_info:
                     collected_info = result_info
                     self.memory_manager.update_collected_info(patient_id, collected_info)
+                    self._last_collected_info = dict(collected_info)
                     planner._record_action("ask_patient", target, reason)
                     planner.inquiry_rounds += 1
                 else:
@@ -840,6 +1214,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 if result_exams:
                     exam_results.update(result_exams)
                     self.memory_manager.update_exam_results(patient_id, result_exams)
+                    self._last_exam_results = dict(exam_results)
                     planner._record_action("order_examination", target, reason)
                     planner.exam_rounds += 1
                 else:
@@ -1100,11 +1475,24 @@ class MyDoctorAgent(BaseDoctorAgent):
             proposed_items=exam_items,
             existing_results=exam_results,
         )
+        if strategy.get("strong_verification_items"):
+            logger.info(f"[检查策略] 强验证检查: {strategy['strong_verification_items']}")
+        if strategy.get("red_flag_items"):
+            logger.info(f"[检查策略] 红旗补查检查: {strategy['red_flag_items']}")
+        if strategy.get("evidence_driven_items"):
+            logger.info(f"[检查策略] 证据驱动补查检查: {strategy['evidence_driven_items']}")
         if strategy.get("added_required"):
             logger.info(f"[检查策略] 补齐必查检查: {strategy['added_required']}")
         if strategy.get("invalid_items"):
             logger.info(f"[检查策略] 过滤无效检查项: {strategy['invalid_items']}")
-        exam_items = strategy.get("items", [])
+        exam_items = self.exam_agent.prepare_order_items(
+            strategy.get("items", []),
+            collected_info=collected_info,
+            candidate_diseases=_cands if isinstance(_cands, list) else None,
+            existing_results=exam_results,
+            max_items=self.exam_agent.max_new_items,
+            add_strong_verification=False,
+        )
         if not exam_items:
             logger.info("[检查] 无检查项目需要申请")
             return None
@@ -1135,7 +1523,7 @@ class MyDoctorAgent(BaseDoctorAgent):
 
     # ============ 训练流程（规划驱动） ============
 
-    async def train(self, patient_id: str) -> None:
+    async def train(self, patient_id: str) -> Dict[str, Any]:
         """训练流程：使用规划器驱动诊疗，并在结束后评估反思。
 
         Args:
@@ -1148,26 +1536,106 @@ class MyDoctorAgent(BaseDoctorAgent):
             self._planner.soft_reset(keep_lessons=True)
 
         # 规划器驱动诊疗
-        final_result = await self._execute_with_planner(patient_id)
+        final_result = await self._run_case_pipeline(
+            patient_id,
+            post_submit_reserve_seconds=self.train_post_submit_reserve_seconds,
+        )
 
-        # 训练阶段：获取评估报告并反思
+        # 训练阶段：先独立获取评估，再执行反思。反思失败不能伪装成评估失败。
+        report: Dict[str, Any] = {}
+        evaluation_error = ""
+        reflection_error = ""
         try:
-            report = await self.actions.evaluation(
+            evaluation_call = self.actions.evaluation(
                 patient_id=patient_id, final_result=final_result
             )
+            if self.case_timeout_seconds > 0:
+                available = (
+                    self._remaining_total_case_seconds()
+                    - self.train_reflection_timeout_seconds
+                    - 1.0
+                )
+                evaluation_budget = min(
+                    self.train_evaluation_timeout_seconds,
+                    max(0.0, available),
+                )
+                if evaluation_budget < 0.5:
+                    evaluation_call.close()
+                    raise asyncio.TimeoutError("no evaluation budget remaining")
+                raw_report = await asyncio.wait_for(
+                    evaluation_call,
+                    timeout=evaluation_budget,
+                )
+            else:
+                raw_report = await evaluation_call
+            if not isinstance(raw_report, dict):
+                raise TypeError("evaluation response must be a JSON object")
+            report = raw_report
             logger.info(
                 f"[Train] 患者 {patient_id} 评估报告: "
                 f"{json.dumps(report, ensure_ascii=False, indent=2)}"
             )
-
-            # 反思并保存经验
-            await self._reflect_and_save(
-                patient_id, report,
-                self._last_collected_info,
-                self._last_exam_results,
+        except asyncio.TimeoutError:
+            evaluation_error = (
+                f"evaluation exceeded {self.train_evaluation_timeout_seconds:.0f}s budget"
             )
-        except Exception as e:
-            logger.warning(f"[Train] 获取评估报告失败: {e}")
+            logger.warning(f"[Train] {evaluation_error}")
+        except Exception as exc:
+            evaluation_error = str(exc)
+            logger.warning(f"[Train] 获取评估报告失败: {exc}")
+
+        if report:
+            notes_before_reflection = len(getattr(self.memory, "notes", []) or [])
+            try:
+                if self.skip_train_reflection:
+                    self._save_fast_reflection(
+                        patient_id,
+                        report,
+                        self._last_collected_info,
+                        self._last_exam_results,
+                    )
+                else:
+                    reflection_call = self._reflect_and_save(
+                        patient_id, report,
+                        self._last_collected_info,
+                        self._last_exam_results,
+                    )
+                    if self.case_timeout_seconds > 0:
+                        reflection_budget = min(
+                            self.train_reflection_timeout_seconds,
+                            max(0.0, self._remaining_total_case_seconds() - 1.0),
+                        )
+                        if reflection_budget < 0.5:
+                            reflection_call.close()
+                            raise asyncio.TimeoutError("no reflection budget remaining")
+                        await asyncio.wait_for(
+                            reflection_call,
+                            timeout=reflection_budget,
+                        )
+                    else:
+                        await reflection_call
+            except asyncio.TimeoutError:
+                reflection_error = (
+                    f"reflection exceeded {self.train_reflection_timeout_seconds:.0f}s budget"
+                )
+                logger.warning(f"[Train] {reflection_error}; using deterministic reflection")
+                if len(getattr(self.memory, "notes", []) or []) == notes_before_reflection:
+                    try:
+                        self._save_fast_reflection(
+                            patient_id,
+                            report,
+                            self._last_collected_info,
+                            self._last_exam_results,
+                        )
+                    except Exception as fallback_exc:
+                        reflection_error += f"; fallback failed: {fallback_exc}"
+            except Exception as exc:
+                reflection_error = str(exc)
+                logger.warning(f"[Train] 反思或记忆保存失败: {exc}")
+
+        training_elapsed = round(max(0.0, time.monotonic() - self._case_started_at), 3)
+        if self._last_diagnosis_audit:
+            self._last_diagnosis_audit["training_elapsed_seconds"] = training_elapsed
 
         # 输出记忆统计
         stats = self.memory.get_statistics()
@@ -1176,7 +1644,126 @@ class MyDoctorAgent(BaseDoctorAgent):
             f"[Train] LLM 调用统计: 总{self._llm_call_count}次, "
             f"明细={json.dumps(self._llm_call_by_kind, ensure_ascii=False)}"
         )
+        train_result = self._build_training_result(
+            patient_id=patient_id,
+            final_result=final_result,
+            report=report,
+            evaluation_error=evaluation_error,
+            reflection_error=reflection_error,
+        )
+        self._last_train_result = train_result
         logger.info(f"[Train] 完成训练患者: {patient_id}")
+        return train_result
+
+    def _build_training_result(
+        self,
+        patient_id: str,
+        final_result: Dict[str, Any],
+        report: Dict[str, Any],
+        evaluation_error: str = "",
+        reflection_error: str = "",
+    ) -> Dict[str, Any]:
+        """Build a compact, secret-free record for batch training reports."""
+        detail = report.get("diagnosisDetail") or report.get("diagnosis_detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+
+        def _names(value: Any) -> List[str]:
+            if isinstance(value, str):
+                value = [value]
+            return list(
+                dict.fromkeys(
+                    str(item).strip() for item in (value or []) if str(item).strip()
+                )
+            )
+
+        def _metric(*keys: str) -> Optional[float]:
+            for key in keys:
+                value = report.get(key)
+                try:
+                    if value is not None:
+                        return float(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        audit = self._last_diagnosis_audit or {}
+        decision = audit.get("diagnosis_decision") or {}
+        candidates = decision.get("candidates") or []
+        top_five = [
+            str(item.get("diagnosis"))
+            for item in candidates[:5]
+            if isinstance(item, dict) and item.get("diagnosis")
+        ]
+        expected = _names(detail.get("expected") or report.get("finalDiagnosis"))
+        submitted = _names(
+            detail.get("submitted")
+            or report.get("diagnosis")
+            or final_result.get("diagnosis")
+        )
+        recall_at_five = all(name in top_five for name in expected) if expected else None
+        critic = audit.get("critic") or {}
+        elapsed = audit.get(
+            "training_elapsed_seconds",
+            audit.get("elapsed_seconds", final_result.get("_case_elapsed_seconds")),
+        )
+        try:
+            elapsed = float(elapsed) if elapsed is not None else None
+        except (TypeError, ValueError):
+            elapsed = None
+
+        public_final = {
+            key: final_result.get(key)
+            for key in (
+                "patient_id",
+                "caseId",
+                "diagnosis",
+                "treatment_plan",
+                "reasoning",
+                "ordered_examinations",
+                "conversation_rounds",
+                "finished",
+            )
+            if key in final_result
+        }
+        return {
+            "patient_id": patient_id,
+            "status": "evaluated" if report else "evaluation_failed",
+            "final_result": public_final,
+            "expected_diagnoses": expected,
+            "submitted_diagnoses": submitted,
+            "error_types": self._classify_diagnosis_errors(report) if report else [],
+            "metrics": {
+                "diagnosis_accuracy": _metric("diagnosisAccuracy", "diagnosis_accuracy"),
+                "examination_precision": _metric(
+                    "examinationPrecision", "examination_precision"
+                ),
+                "treatment_overall_score": _metric(
+                    "treatmentOverallScore", "treatment_overall_score"
+                ),
+                "treatment_safety": _metric("treatmentSafety", "treatment_safety"),
+                "candidate_recall_at_5": recall_at_five,
+            },
+            "audit": {
+                "elapsed_seconds": elapsed,
+                "timed_out": bool(
+                    audit.get("timed_out", final_result.get("_case_timed_out", False))
+                    or "exceeded" in evaluation_error
+                    or "exceeded" in reflection_error
+                    or (
+                        self.case_timeout_seconds > 0
+                        and elapsed is not None
+                        and elapsed >= self.case_timeout_seconds
+                    )
+                ),
+                "critic_issues": list(critic.get("issues") or []),
+                "critic_llm_used": bool(critic.get("llm_used", False)),
+                "llm_calls": self._llm_call_count,
+                "llm_calls_by_kind": dict(self._llm_call_by_kind),
+            },
+            "evaluation_error": evaluation_error,
+            "reflection_error": reflection_error,
+        }
 
     # ============ 测试流程（规划驱动） ============
 
@@ -1193,11 +1780,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             self._planner.soft_reset(keep_lessons=True)
 
         # 规划器驱动诊疗
-        final_result = await self._execute_with_planner(patient_id)
+        final_result = await self._run_case_pipeline(patient_id)
 
         # 保存测试结果供 run_test 收集
         planner = self._get_planner()
-        _rounds = len([a for a in planner.action_history if a["type"] == "ask_patient"])
+        _rounds = int(
+            final_result.get("conversation_rounds")
+            or len([a for a in planner.action_history if a["type"] == "ask_patient"])
+        )
         final_result = self.quality_agent.review_final_result(
             final_result,
             collected_info=getattr(self, "_last_collected_info", {}),
@@ -1477,11 +2067,24 @@ class MyDoctorAgent(BaseDoctorAgent):
                 proposed_items=exam_items,
                 existing_results=exam_results,
             )
+            if strategy.get("strong_verification_items"):
+                logger.info(f"[检查策略] 强验证检查: {strategy['strong_verification_items']}")
+            if strategy.get("red_flag_items"):
+                logger.info(f"[检查策略] 红旗补查检查: {strategy['red_flag_items']}")
+            if strategy.get("evidence_driven_items"):
+                logger.info(f"[检查策略] 证据驱动补查检查: {strategy['evidence_driven_items']}")
             if strategy.get("added_required"):
                 logger.info(f"[检查策略] 补齐必查检查: {strategy['added_required']}")
             if strategy.get("invalid_items"):
                 logger.info(f"[检查策略] 过滤无效检查项: {strategy['invalid_items']}")
-            exam_items = strategy.get("items", [])
+            exam_items = self.exam_agent.prepare_order_items(
+                strategy.get("items", []),
+                collected_info=collected_info,
+                candidate_diseases=_cands2 if isinstance(_cands2, list) else None,
+                existing_results=exam_results,
+                max_items=self.exam_agent.max_new_items,
+                add_strong_verification=False,
+            )
 
             if not exam_items:
                 logger.info(f"[检查] 无更多检查需要申请")
@@ -1532,27 +2135,171 @@ class MyDoctorAgent(BaseDoctorAgent):
         Returns:
             最终诊疗结果
         """
-        # 基于症状检索相关经验
-        symptoms = collected_info.get("symptoms", [])
-        if symptoms:
-            relevant_experience = self.memory.search_relevant_experience(symptoms, top_k=3)
-
-        # 构建诊断 prompt
-        diagnosis_prompt = self.prompt.build_diagnosis_prompt(
-            collected_info=collected_info,
-            exam_results=exam_results,
-            chat_history=chat_history,
-            relevant_experience=relevant_experience,
-            standard_diseases=self.knowledge.get_disease_catalog_names(),
-        )
-        messages = [
-            {"role": "system", "content": diagnosis_prompt},
-            {"role": "user", "content": "请做出诊断并制定治疗方案，以 JSON 格式输出。"},
-        ]
-
-        # 使用 LLM 生成诊断和治疗方案
-        diagnosis_result = await self._llm_generate_diagnosis(messages)
         conversation_rounds = len([m for m in chat_history if m.get("from") == "doctor"])
+        relevant_experience = self._get_cached_experience(collected_info)
+        decision = None
+        evidence = None
+
+        if self.diagnosis_chain_enabled:
+            evidence_graph = self.evidence_agent.build_graph(collected_info, exam_results)
+            evidence = evidence_graph.bundle
+            planner_candidates = self._planner_candidate_names()
+            rag_query = evidence.to_query()
+            if planner_candidates:
+                rag_query += " 当前鉴别诊断 " + " ".join(planner_candidates)
+            rag_chunks = self.memory_manager.search_rag(
+                collected_info=collected_info,
+                query=rag_query,
+                candidate_diseases=planner_candidates or None,
+            )
+            rag_context = self.memory_manager.render_rag_chunks(rag_chunks)
+            preview = self.diagnosis_engine.decide({}, rag_chunks, evidence)
+            candidate_table = self.diagnosis_engine.render_candidate_table(preview)
+            diagnosis_prompt = self.prompt.build_diagnosis_prompt(
+                collected_info=collected_info,
+                exam_results=exam_results,
+                chat_history=chat_history,
+                relevant_experience=relevant_experience,
+                standard_diseases=self.diagnosis_engine.knowledge.allowed_names,
+                rag_context=rag_context,
+                evidence_summary=evidence.render_summary(),
+                candidate_table=candidate_table,
+            )
+            messages = [
+                {"role": "system", "content": diagnosis_prompt},
+                {"role": "user", "content": "请做出诊断并制定治疗方案，以 JSON 格式输出。"},
+            ]
+            diagnosis_result = await self._llm_generate_diagnosis(messages)
+            llm_resolutions = self.diagnosis_engine.resolve_open_candidates(diagnosis_result)
+            llm_candidates = []
+            for item in llm_resolutions:
+                if item.raw_name:
+                    llm_candidates.append(item.raw_name)
+                if item.canonical_name:
+                    llm_candidates.append(item.canonical_name)
+            llm_candidates = list(dict.fromkeys(llm_candidates))
+            final_candidates = list(
+                dict.fromkeys(planner_candidates + llm_candidates)
+            )
+            final_query = evidence.to_query()
+            if final_candidates:
+                final_query += " 当前鉴别诊断 " + " ".join(final_candidates)
+            final_rag_chunks = self.memory_manager.search_rag(
+                collected_info=collected_info,
+                query=final_query,
+                candidate_diseases=final_candidates or None,
+            )
+            if final_rag_chunks:
+                rag_chunks = final_rag_chunks
+            decision = self.diagnosis_engine.decide(diagnosis_result, rag_chunks, evidence)
+            critic = await self.diagnosis_critic.review(
+                decision,
+                evidence,
+                remaining_seconds=self._remaining_case_seconds(),
+                allow_llm=True,
+            )
+            self._apply_critic_selection(decision, critic.selected_diagnoses, critic.reason)
+            self._restore_legacy_candidate_submission(decision, diagnosis_result, critic)
+
+            evidence_gap_exams = self._recommend_evidence_gap_exams(
+                decision=decision,
+                collected_info=collected_info,
+                exam_results=exam_results,
+            )
+            recommended_exams = list(
+                dict.fromkeys(evidence_gap_exams + list(critic.recommended_exams or []))
+            )
+            corrective_targets = self._evidence_gap_target_diagnoses(decision) or list(
+                decision.final_diagnoses or []
+            )
+            corrective_results = await self._maybe_order_critic_exams(
+                patient_id=patient_id,
+                recommended_exams=recommended_exams,
+                exam_results=exam_results,
+                collected_info=collected_info,
+                candidate_diseases=corrective_targets,
+            )
+            if corrective_results:
+                exam_results.update(corrective_results)
+                self.memory_manager.update_exam_results(patient_id, corrective_results)
+                self._last_exam_results = dict(exam_results)
+                evidence_graph = self.evidence_agent.build_graph(collected_info, exam_results)
+                evidence = evidence_graph.bundle
+                rag_chunks = self.memory_manager.search_rag(
+                    collected_info=collected_info,
+                    query=(
+                        evidence.to_query()
+                        + " 当前鉴别诊断 "
+                        + " ".join(decision.final_diagnoses)
+                    ),
+                    candidate_diseases=decision.final_diagnoses or None,
+                )
+                decision = self.diagnosis_engine.decide(diagnosis_result, rag_chunks, evidence)
+                final_critic = await self.diagnosis_critic.review(
+                    decision,
+                    evidence,
+                    remaining_seconds=self._remaining_case_seconds(),
+                    allow_llm=False,
+                )
+                self._apply_critic_selection(
+                    decision,
+                    final_critic.selected_diagnoses,
+                    final_critic.reason,
+                )
+                self._restore_legacy_candidate_submission(decision, diagnosis_result, final_critic)
+                critic.issues = list(dict.fromkeys(critic.issues + final_critic.issues))
+
+            diagnosis_result = self.diagnosis_engine.apply_to_result(
+                diagnosis_result,
+                decision,
+                evidence,
+            )
+            diagnosis_result["_critic_review"] = critic.to_dict()
+            diagnosis_result["_rag_chunks"] = [
+                {
+                    "id": item.get("id"),
+                    "type": item.get("type"),
+                    "title": item.get("title"),
+                    "score": item.get("score"),
+                }
+                for item in rag_chunks
+            ]
+            self._last_diagnosis_audit = {
+                "evidence": evidence.to_dict(),
+                "evidence_graph": evidence_graph.to_dict(),
+                "diagnosis_decision": decision.to_dict(),
+                "critic": critic.to_dict(),
+                "rag_chunks": diagnosis_result["_rag_chunks"],
+                "llm_candidates": llm_candidates,
+                "diagnosis_name_resolution": [
+                    item.to_dict() for item in llm_resolutions
+                ],
+            }
+        else:
+            diagnosis_prompt = self.prompt.build_diagnosis_prompt(
+                collected_info=collected_info,
+                exam_results=exam_results,
+                chat_history=chat_history,
+                relevant_experience=relevant_experience,
+                standard_diseases=self.knowledge.get_disease_catalog_names(),
+            )
+            messages = [
+                {"role": "system", "content": diagnosis_prompt},
+                {"role": "user", "content": "请做出诊断并制定治疗方案，以 JSON 格式输出。"},
+            ]
+            diagnosis_result = await self._llm_generate_diagnosis(messages)
+            diagnosis_result = self.evidence_engine.review(
+                diagnosis_result,
+                collected_info=collected_info,
+                exam_results=exam_results,
+            )
+            if not diagnosis_result.get("_trusted_diagnoses"):
+                diagnosis_result = self.structural_agent.review(
+                    diagnosis_result,
+                    collected_info=collected_info,
+                    exam_results=exam_results,
+                )
+
         diagnosis_result = self.quality_agent.review_final_result(
             diagnosis_result,
             collected_info=collected_info,
@@ -1564,12 +2311,32 @@ class MyDoctorAgent(BaseDoctorAgent):
             collected_info=collected_info,
             exam_results=exam_results,
         )
+        diagnosis_result = self.treatment_safety.review(
+            diagnosis_result,
+            collected_info=collected_info,
+            exam_results=exam_results,
+        )
         diagnosis_result = self.quality_agent.review_final_result(
             diagnosis_result,
             collected_info=collected_info,
             exam_results=exam_results,
             conversation_rounds=conversation_rounds,
         )
+        if (
+            decision is not None
+            and evidence is not None
+            and not self.legacy_candidate_submission
+        ):
+            diagnosis_result = self._refilter_diagnosis_result(
+                diagnosis_result,
+                decision,
+                evidence,
+            )
+        filtered_names = self._remove_suppressed_diagnosis_names(
+            self._diagnosis_names_from_result(diagnosis_result)
+        )
+        if filtered_names:
+            diagnosis_result["diagnosis"] = filtered_names
         if diagnosis_result.get("_qc_issues"):
             logger.info(f"[质控] 诊疗方案修复/提示: {diagnosis_result['_qc_issues']}")
 
@@ -1577,10 +2344,16 @@ class MyDoctorAgent(BaseDoctorAgent):
             f"[诊断] 诊断结果: {json.dumps(diagnosis_result, ensure_ascii=False, indent=2)}"
         )
 
+        submission_diagnoses = self._remove_suppressed_diagnosis_names(
+            self._diagnosis_names_from_result(diagnosis_result)
+        )
+        if submission_diagnoses:
+            diagnosis_result["diagnosis"] = submission_diagnoses
+
         # 提交诊疗方案
         submit_result = await self.actions.prescribe_treatment(
             patient_id=patient_id,
-            diagnosis=diagnosis_result.get("diagnosis", []),
+            diagnosis=submission_diagnoses or diagnosis_result.get("diagnosis", []),
             treatment_plan=diagnosis_result.get("treatment_plan", ""),
             reasoning=diagnosis_result.get("reasoning", ""),
         )
@@ -1590,14 +2363,670 @@ class MyDoctorAgent(BaseDoctorAgent):
             for key, value in submit_result.items():
                 if value is not None and value != "":
                     final_result[key] = value
-        return self.quality_agent.review_final_result(
+        reviewed = self.quality_agent.review_final_result(
             final_result,
             collected_info=collected_info,
             exam_results=exam_results,
             conversation_rounds=conversation_rounds,
         )
+        if submission_diagnoses:
+            reviewed["diagnosis"] = submission_diagnoses
+        elapsed = round(max(0.0, time.monotonic() - self._case_started_at), 3)
+        reviewed["_case_elapsed_seconds"] = elapsed
+        reviewed["_case_timed_out"] = False
+        if self._last_diagnosis_audit:
+            self._last_diagnosis_audit["elapsed_seconds"] = elapsed
+            self._last_diagnosis_audit["timed_out"] = False
+        return reviewed
+
+    def _planner_candidate_names(self) -> List[str]:
+        plan = getattr(self._planner, "current_plan", None) or {}
+        names: List[str] = []
+        primary = plan.get("primary_hypothesis") or plan.get("primary_diagnosis")
+        if primary:
+            names.append(str(primary))
+        for item in plan.get("differential_diagnoses", []) or []:
+            if isinstance(item, str):
+                value = item
+            elif isinstance(item, dict):
+                value = item.get("disease") or item.get("diagnosis") or item.get("name")
+            else:
+                value = None
+            if value:
+                names.append(str(value))
+        return list(dict.fromkeys(names))[:8]
+
+    @staticmethod
+    def _diagnosis_names_from_result(result: Any) -> List[str]:
+        if not isinstance(result, dict):
+            return []
+        values = result.get("diagnosis") or result.get("diagnoses") or []
+        if isinstance(values, str):
+            values = [values]
+        return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+    def _refilter_diagnosis_result(self, result: Dict[str, Any], decision, evidence) -> Dict[str, Any]:
+        original_names = self._diagnosis_names_from_result(result)
+        names = self._remove_suppressed_diagnosis_names(original_names)
+        if not names:
+            return result
+        filtered = self.diagnosis_engine.filter_final_diagnoses(names, decision.candidates)
+        if not filtered:
+            return result
+        filtered_names = [item.diagnosis for item in filtered]
+        if filtered_names == original_names:
+            return result
+        score_by_name = {item.diagnosis: item for item in decision.candidates}
+        decision.final_diagnoses = filtered_names
+        decision.trusted_diagnoses = [
+            name for name in filtered_names
+            if score_by_name.get(name)
+            and score_by_name[name].score >= self.diagnosis_engine.trusted_threshold
+        ]
+        if filtered_names and filtered_names[0] in score_by_name:
+            decision.confidence = score_by_name[filtered_names[0]].score
+        return self.diagnosis_engine.apply_to_result(result, decision, evidence)
+
+    def _remove_suppressed_diagnosis_names(self, names: List[str]) -> List[str]:
+        ordered = list(dict.fromkeys(names or []))
+        selected = set(ordered)
+        suppressed = set()
+        for name in ordered:
+            entry = self.diagnosis_engine.knowledge.get(name)
+            suppressed.update(str(item) for item in entry.get("suppress_diagnoses", []) or [])
+            parent = str(entry.get("parent_diagnosis") or "")
+            if parent and parent in selected:
+                suppressed.add(parent)
+        return [name for name in ordered if name not in suppressed]
+
+    def _apply_critic_selection(
+        self,
+        decision,
+        selected_diagnoses: List[str],
+        reason: str,
+    ) -> None:
+        if not selected_diagnoses:
+            return
+        score_by_name = {item.diagnosis: item for item in decision.candidates}
+        validated = [
+            name for name in selected_diagnoses
+            if name in score_by_name
+            and not score_by_name[name].hard_contradiction
+            and score_by_name[name].trusted
+        ]
+        if not validated:
+            return
+        strong_evidence = [
+            item.diagnosis for item in decision.candidates
+            if item.diagnosis in decision.trusted_diagnoses
+            and item.support_score >= 0.8
+            and not item.hard_contradiction
+        ]
+        selected_best = max(
+            (score_by_name[name].score for name in validated if name in score_by_name),
+            default=0.0,
+        )
+        protected_causal = [
+            item.diagnosis for item in decision.candidates[:5]
+            if item.trusted
+            and self._is_etiology_priority_candidate(item)
+            and item.score >= self.diagnosis_engine.trusted_threshold
+            and item.score >= selected_best - self.diagnosis_engine.margin_threshold
+        ]
+        # LLM Critic may reorder ambiguous candidates, but cannot discard a
+        # diagnosis already established by strong deterministic evidence.
+        filtered = self.diagnosis_engine.filter_final_diagnoses(
+            list(dict.fromkeys(protected_causal + strong_evidence + validated)),
+            decision.candidates,
+        )
+        if not filtered:
+            return
+        decision.final_diagnoses = [item.diagnosis for item in filtered]
+        decision.trusted_diagnoses = [
+            name for name in decision.final_diagnoses
+            if score_by_name[name].score >= self.diagnosis_engine.trusted_threshold
+        ]
+        decision.confidence = score_by_name[decision.final_diagnoses[0]].score
+        decision.differential_only_diagnoses = self.diagnosis_engine.differential_only_details(
+            decision.candidates
+        )
+        if reason:
+            extra = self.diagnosis_engine.differential_only_reasoning(decision.candidates)
+            suffix = "。提交前审查：" + str(reason).rstrip("。") + "。"
+            if extra:
+                suffix += extra
+            decision.evidence_reasoning = decision.evidence_reasoning.rstrip("。") + suffix
+
+    def _restore_legacy_candidate_submission(
+        self,
+        decision,
+        llm_result: Dict[str, Any],
+        critic,
+    ) -> None:
+        """Restore the earlier broad-submission behavior for evidence-backed candidates.
+
+        This keeps the Evidence-first ranking, but lets an LLM primary diagnosis or
+        Critic-supported candidate re-enter the final submission when it is already
+        represented in the scored candidate table and has no hard contradiction.
+        """
+        if not self.legacy_candidate_submission or not decision:
+            return
+        score_by_name = {item.diagnosis: item for item in decision.candidates}
+        primary_names = self._resolved_llm_primary_names(llm_result)
+        supporting_names = self._resolved_llm_candidate_names(llm_result)
+        supporting_names.extend(self._resolved_critic_names(critic))
+
+        primary_eligible = [
+            name for name in primary_names
+            if self._legacy_submission_eligible(score_by_name.get(name))
+        ]
+        support_eligible = [
+            name for name in supporting_names
+            if self._legacy_submission_eligible(score_by_name.get(name))
+        ]
+
+        if primary_eligible and self._should_prefer_legacy_primary(primary_eligible, score_by_name):
+            names = list(primary_eligible)
+        else:
+            names = list(decision.final_diagnoses or [])
+
+        for name in support_eligible:
+            if name not in names:
+                names.append(name)
+            if len(names) >= self.diagnosis_engine.max_final_diagnoses:
+                break
+
+        if not names:
+            return
+        names = self._remove_suppressed_diagnosis_names(names)
+        filtered = [
+            score_by_name[name] for name in names
+            if name in score_by_name
+            and self._legacy_submission_eligible(score_by_name[name])
+        ][: self.diagnosis_engine.max_final_diagnoses]
+        if not filtered:
+            return
+        filtered_names = [item.diagnosis for item in filtered]
+        if filtered_names == list(decision.final_diagnoses or []):
+            return
+        decision.final_diagnoses = filtered_names
+        decision.trusted_diagnoses = [
+            item.diagnosis for item in filtered
+            if item.score >= self.diagnosis_engine.trusted_threshold
+        ]
+        decision.confidence = filtered[0].score
+        suffix = (
+            "。提交前审查：已恢复旧版宽松候选提交逻辑；"
+            "LLM/Critic 已提出且证据候选中无硬反证的标准诊断被保留。"
+        )
+        if suffix not in decision.evidence_reasoning:
+            decision.evidence_reasoning = decision.evidence_reasoning.rstrip("。") + suffix
+
+    def _resolved_llm_primary_names(self, result: Dict[str, Any]) -> List[str]:
+        if not isinstance(result, dict):
+            return []
+        values = result.get("diagnosis") or result.get("diagnoses") or []
+        if isinstance(values, str):
+            values = [values]
+        return self._resolve_diagnosis_values(values)
+
+    def _resolved_llm_candidate_names(self, result: Dict[str, Any]) -> List[str]:
+        if not isinstance(result, dict):
+            return []
+        values: List[Any] = []
+        for key in (
+            "diagnosis_candidates",
+            "open_diagnosis_candidates",
+            "candidate_diagnoses",
+            "differential_diagnoses",
+        ):
+            current = result.get(key)
+            if current:
+                values.extend(current if isinstance(current, list) else [current])
+        return self._resolve_diagnosis_values(values)
+
+    def _resolved_critic_names(self, critic) -> List[str]:
+        values: List[Any] = []
+        values.extend(list(getattr(critic, "selected_diagnoses", []) or []))
+        values.extend(self._extract_allowed_diagnoses_from_text(getattr(critic, "reason", "") or ""))
+        return self._resolve_diagnosis_values(values)
+
+    def _resolve_diagnosis_values(self, values: List[Any]) -> List[str]:
+        names: List[str] = []
+        for value in values or []:
+            confidence = 1.0
+            if isinstance(value, dict):
+                raw = value.get("name") or value.get("diagnosis") or value.get("disease")
+                try:
+                    confidence = float(value.get("confidence", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    confidence = 1.0
+            else:
+                raw = value
+            if confidence < 0.45:
+                continue
+            resolved = self.diagnosis_engine.resolver.resolve(raw, model_confidence=confidence)
+            if resolved.canonical_name and resolved.canonical_name not in names:
+                names.append(resolved.canonical_name)
+        return names
+
+    def _extract_allowed_diagnoses_from_text(self, text: str) -> List[str]:
+        if not text:
+            return []
+        names: List[str] = []
+        for name in sorted(self.diagnosis_engine.knowledge.allowed_names, key=len, reverse=True):
+            if name not in text:
+                continue
+            if self._diagnosis_mention_is_negated(text, name):
+                continue
+            if name not in names:
+                names.append(name)
+        return names[: self.diagnosis_engine.max_final_diagnoses * 2]
+
+    @staticmethod
+    def _diagnosis_mention_is_negated(text: str, name: str) -> bool:
+        index = text.find(name)
+        if index < 0:
+            return False
+        window = text[max(0, index - 18): index + len(name) + 28]
+        negators = (
+            "不支持", "排除", "不选", "未选", "缺乏", "无", "不能解释",
+            "证据极弱", "可能性低", "不符合", "否定",
+        )
+        return any(token in window for token in negators)
+
+    def _legacy_submission_eligible(self, candidate) -> bool:
+        if candidate is None:
+            return False
+        return (
+            candidate.trusted
+            and bool(candidate.matched_evidence)
+            and not candidate.hard_contradiction
+            and candidate.score >= self.diagnosis_engine.differential_threshold
+        )
+
+    def _should_prefer_legacy_primary(
+        self,
+        primary_names: List[str],
+        score_by_name: Dict[str, Any],
+    ) -> bool:
+        for name in primary_names:
+            candidate = score_by_name.get(name)
+            if not candidate:
+                continue
+            dtype = str(getattr(candidate, "diagnosis_type", "") or "").lower()
+            if dtype in {"etiology", "metabolic", "structural"}:
+                return True
+            if float(getattr(candidate, "specificity", 0.0) or 0.0) >= 0.85:
+                return True
+        return False
+
+    def _recommend_evidence_gap_exams(
+        self,
+        decision,
+        collected_info: Dict[str, Any],
+        exam_results: Dict[str, Any],
+    ) -> List[str]:
+        if not decision:
+            return []
+        targets = self._evidence_gap_target_diagnoses(decision)
+        if not targets:
+            return []
+
+        proposed: List[str] = []
+        for name in targets:
+            entry = self.diagnosis_engine.knowledge.get(name)
+            for exam in entry.get("discriminating_exams", []) or []:
+                text = str(exam).strip()
+                if text and text not in proposed:
+                    proposed.append(text)
+
+        strategy = self.exam_agent.recommend(
+            collected_info=collected_info,
+            candidate_diseases=targets,
+            proposed_items=proposed,
+            existing_results=exam_results,
+        )
+        ordered_items = list(dict.fromkeys(proposed + list(strategy.get("items", []) or [])))
+        return self.exam_agent.prepare_order_items(
+            ordered_items,
+            collected_info=collected_info,
+            candidate_diseases=targets,
+            existing_results=exam_results,
+            max_items=self.diagnosis_critic.max_corrective_exam_items,
+            add_strong_verification=False,
+        )
+
+    def _evidence_gap_target_diagnoses(self, decision) -> List[str]:
+        by_name = {item.diagnosis: item for item in decision.candidates}
+        targets: List[str] = []
+
+        close_margin = getattr(self.diagnosis_engine, "etiology_close_margin", 0.12)
+        coverage_threshold = getattr(
+            self.diagnosis_engine,
+            "evidence_gap_coverage_threshold",
+            0.32,
+        )
+        residual_threshold = getattr(
+            self.diagnosis_engine,
+            "evidence_gap_residual_threshold",
+            0.72,
+        )
+        selected = by_name.get((decision.final_diagnoses or [""])[0])
+        gap_candidates = []
+        for item in decision.candidates:
+            if (
+                item.required_gaps
+                and item.matched_evidence
+                and not item.hard_contradiction
+                and self._is_etiology_priority_candidate(item)
+                and (
+                    getattr(item, "coverage_score", 0.0) >= coverage_threshold
+                    or getattr(item, "residual_score", 1.0) <= residual_threshold
+                    or item.source_prior >= 0.45
+                    or (
+                        selected is not None
+                        and item.score >= max(0.0, selected.score - close_margin)
+                    )
+                )
+            ):
+                gap_candidates.append(item)
+        gap_candidates.sort(
+            key=lambda item: (
+                getattr(item, "coverage_score", 0.0),
+                1.0 - getattr(item, "residual_score", 1.0),
+                item.score,
+                item.specificity,
+            ),
+            reverse=True,
+        )
+
+        has_gap = bool(
+            decision.low_confidence
+            or decision.unexplained_evidence
+            or gap_candidates
+            or self._has_close_etiology_candidate(decision)
+        )
+        if not has_gap:
+            return []
+
+        for item in gap_candidates:
+            if item.diagnosis not in targets:
+                targets.append(item.diagnosis)
+
+        for name in (decision.final_diagnoses or [])[:1]:
+            if name in by_name and name not in targets:
+                targets.append(name)
+
+        priority_candidates = [
+            item
+            for item in decision.candidates
+            if item.matched_evidence
+            and not item.hard_contradiction
+            and self._is_etiology_priority_candidate(item)
+        ]
+        priority_candidates.sort(
+            key=lambda item: (
+                getattr(item, "coverage_score", 0.0),
+                1.0 - getattr(item, "residual_score", 1.0),
+                item.score,
+            ),
+            reverse=True,
+        )
+        if priority_candidates and priority_candidates[0].diagnosis not in targets:
+            targets.append(priority_candidates[0].diagnosis)
+
+        unexplained = set(decision.unexplained_evidence or [])
+        if unexplained:
+            for item in decision.candidates:
+                if item.hard_contradiction:
+                    continue
+                if unexplained & set(item.matched_evidence or []):
+                    if item.diagnosis not in targets:
+                        targets.append(item.diagnosis)
+                    break
+
+        limit = getattr(self.diagnosis_engine, "max_evidence_gap_targets", 2)
+        return targets[: max(1, int(limit or 2))]
+
+    def _has_close_etiology_candidate(self, decision) -> bool:
+        if not decision.candidates or not decision.final_diagnoses:
+            return False
+        by_name = {item.diagnosis: item for item in decision.candidates}
+        selected = by_name.get(decision.final_diagnoses[0])
+        if not selected:
+            return False
+        close_margin = getattr(self.diagnosis_engine, "etiology_close_margin", 0.12)
+        coverage_threshold = getattr(
+            self.diagnosis_engine,
+            "evidence_gap_coverage_threshold",
+            0.32,
+        )
+        residual_threshold = getattr(
+            self.diagnosis_engine,
+            "evidence_gap_residual_threshold",
+            0.72,
+        )
+        for item in decision.candidates:
+            if item.diagnosis == selected.diagnosis:
+                continue
+            if (
+                item.matched_evidence
+                and not item.hard_contradiction
+                and self._is_etiology_priority_candidate(item)
+                and (
+                    item.required_gaps
+                    or item.source_prior >= 0.45
+                    or getattr(item, "coverage_score", 0.0) >= coverage_threshold
+                    or getattr(item, "residual_score", 1.0) <= residual_threshold
+                    or item.score >= max(0.0, selected.score - close_margin)
+                )
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _is_etiology_priority_candidate(candidate) -> bool:
+        dtype = str(getattr(candidate, "diagnosis_type", "") or "").lower()
+        specificity = float(getattr(candidate, "specificity", 0.0) or 0.0)
+        return dtype in {"etiology", "metabolic", "structural"} or specificity >= 0.85
+
+    async def _maybe_order_critic_exams(
+        self,
+        patient_id: str,
+        recommended_exams: List[str],
+        exam_results: Dict[str, Any],
+        collected_info: Optional[Dict[str, Any]] = None,
+        candidate_diseases: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        if (
+            not recommended_exams
+            or self._remaining_case_seconds() < self.diagnosis_critic.corrective_exam_min_seconds
+        ):
+            return {}
+        planner = self._get_planner()
+        if planner.exam_rounds >= self.max_exam_rounds:
+            return {}
+        items = self.exam_agent.prepare_order_items(
+            recommended_exams,
+            collected_info=collected_info or {},
+            candidate_diseases=candidate_diseases,
+            existing_results=exam_results,
+            max_items=self.diagnosis_critic.max_corrective_exam_items,
+        )
+        if not items:
+            return {}
+        try:
+            response = await self.actions.order_examination(
+                patient_id=patient_id,
+                items=items,
+                reason="提交前诊断审查发现低置信或未解释证据，补充最具鉴别价值的检查。",
+            )
+        except Exception as exc:
+            logger.warning("[DiagnosisCritic] corrective examination failed: %s", exc)
+            return {}
+        new_results: Dict[str, Any] = {}
+        for exam_name, exam_data in (response or {}).get("results", {}).items():
+            if isinstance(exam_data, dict) and exam_data.get("status") != "invalid":
+                new_results[exam_name] = exam_data
+        if new_results:
+            planner.exam_rounds += 1
+            planner._record_action(
+                "order_examination",
+                ",".join(new_results.keys()),
+                "diagnosis_critic_corrective_exam",
+            )
+        return new_results
 
     # ============ 反思并保存经验 ============
+
+    def _save_fast_reflection(
+        self,
+        patient_id: str,
+        report: Dict[str, Any],
+        collected_info: Dict[str, Any],
+        exam_results: Dict[str, Any],
+    ) -> None:
+        """Save a lightweight training note without an extra reflection LLM call."""
+        diagnosis_accuracy = report.get("diagnosisAccuracy", report.get("diagnosis_accuracy", 0))
+        exam_precision = report.get("examinationPrecision", report.get("examination_precision", 0))
+        treatment_score = report.get("treatmentOverallScore", report.get("treatment_overall_score", 0))
+        reflection = (
+            "快速训练反思："
+            f"诊断准确率={diagnosis_accuracy}，"
+            f"检查精确率={exam_precision}，"
+            f"治疗评分={treatment_score}。"
+            "本轮为快速路径，已保留问诊、检查和评估结果供后续检索。"
+        )
+        error_types = self._classify_diagnosis_errors(report)
+        audit = self._last_diagnosis_audit or {}
+        self.memory.save_case_experience(
+            patient_id=patient_id,
+            report=report,
+            reflection=reflection,
+            collected_info=collected_info,
+            exam_results=exam_results,
+            evidence=audit.get("evidence"),
+            diagnosis_decision=audit.get("diagnosis_decision"),
+            error_types=error_types,
+        )
+        self.memory.save_diagnostic_replay(
+            patient_id=patient_id,
+            collected_info=collected_info,
+            exam_results=exam_results,
+            evidence=audit.get("evidence") or {},
+            diagnosis_decision=audit.get("diagnosis_decision") or {},
+            report=report,
+            error_types=error_types,
+            llm_candidates=audit.get("llm_candidates") or [],
+            rag_chunks=audit.get("rag_chunks") or [],
+            case_audit=audit,
+        )
+        self._record_exam_alias_feedback(patient_id, report, exam_results)
+        self._record_diagnostic_rule_feedback(patient_id, report, collected_info, exam_results)
+        logger.info("[Reflection] fast reflection saved for %s", patient_id)
+
+    def _classify_diagnosis_errors(self, report: Dict[str, Any]) -> List[str]:
+        """Classify evaluation failures into actionable diagnosis subsystems."""
+        errors: List[str] = []
+        detail = report.get("diagnosisDetail") or report.get("diagnosis_detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+        expected = detail.get("expected") or report.get("finalDiagnosis") or []
+        submitted = detail.get("submitted") or report.get("diagnosis") or []
+        if isinstance(expected, str):
+            expected = [expected]
+        if isinstance(submitted, str):
+            submitted = [submitted]
+        audit = self._last_diagnosis_audit or {}
+        decision = audit.get("diagnosis_decision") or {}
+        candidates = decision.get("candidates") or []
+        candidate_names = [str(item.get("diagnosis")) for item in candidates if isinstance(item, dict)]
+        final_names = [str(item) for item in decision.get("final_diagnoses", []) or []]
+        for name in expected:
+            name = str(name)
+            if not self.diagnosis_engine.knowledge.is_allowed(name):
+                errors.append("namespace_error")
+            elif name not in candidate_names[:5]:
+                errors.append("candidate_recall_error")
+            elif name not in final_names:
+                errors.append("candidate_ranking_error")
+            matched = next(
+                (
+                    item.get("matched_evidence") or []
+                    for item in candidates
+                    if isinstance(item, dict) and item.get("diagnosis") == name
+                ),
+                [],
+            )
+            if not matched:
+                errors.append("evidence_extraction_failure")
+        if any(not self.diagnosis_engine.knowledge.is_allowed(item) for item in submitted):
+            errors.append("namespace_error")
+        examination_detail = report.get("examinationDetail") or report.get("examination_detail") or {}
+        try:
+            if float(examination_detail.get("coverage", 1.0)) < 0.5:
+                errors.append("insufficient_examination")
+        except (TypeError, ValueError):
+            pass
+        treatment_detail = report.get("treatmentDetail") or report.get("treatment_detail") or {}
+        try:
+            if float(treatment_detail.get("safety", 1.0)) < 0.8:
+                errors.append("treatment_safety_failure")
+        except (TypeError, ValueError):
+            pass
+        return list(dict.fromkeys(errors))
+
+    def _record_exam_alias_feedback(
+        self,
+        patient_id: str,
+        report: Dict[str, Any],
+        exam_results: Dict[str, Any],
+    ) -> None:
+        """Collect exam alias evidence from training feedback without breaking training."""
+        try:
+            if not hasattr(self.knowledge, "record_exam_alias_feedback"):
+                return
+            submitted_items = list((exam_results or {}).keys())
+            stats = self.knowledge.record_exam_alias_feedback(
+                patient_id=patient_id,
+                report=report,
+                submitted_items=submitted_items,
+            )
+            if stats.get("pending") or stats.get("promoted"):
+                logger.info(
+                    "[ExamAlias] feedback recorded: pending=%s, promoted=%s",
+                    stats.get("pending", 0),
+                    stats.get("promoted", 0),
+                )
+        except Exception as exc:
+            logger.warning("[ExamAlias] feedback collection failed: %s", exc)
+
+    def _record_diagnostic_rule_feedback(
+        self,
+        patient_id: str,
+        report: Dict[str, Any],
+        collected_info: Dict[str, Any],
+        exam_results: Dict[str, Any],
+    ) -> None:
+        """Collect evaluation feedback as shadow evidence for replay validation."""
+        try:
+            audit = self._last_diagnosis_audit or {}
+            stats = self.diagnostic_learning.record_feedback(
+                patient_id=patient_id,
+                report=report,
+                evidence=audit.get("evidence") or {},
+                diagnosis_decision=audit.get("diagnosis_decision") or {},
+                error_types=self._classify_diagnosis_errors(report),
+            )
+            if stats.get("pending") or stats.get("updated"):
+                logger.info(
+                    "[EvidenceRules] shadow candidates added=%s updated=%s",
+                    stats.get("pending", 0),
+                    stats.get("updated", 0),
+                )
+        except Exception as exc:
+            logger.warning("[EvidenceRules] feedback collection failed: %s", exc)
 
     async def _reflect_and_save(
         self,
@@ -1675,14 +3104,33 @@ class MyDoctorAgent(BaseDoctorAgent):
             if treatment_score < 0.8:
                 reflection += " 需要改进治疗方案，提高个性化和有效性。"
 
-        # 保存到记忆
+        # 保存到记忆。失败病例仅作为纠错教训渲染，并单独保留完整诊断回放。
+        error_types = self._classify_diagnosis_errors(report)
+        audit = self._last_diagnosis_audit or {}
         self.memory.save_case_experience(
             patient_id=patient_id,
             report=report,
             reflection=reflection,
             collected_info=collected_info,
             exam_results=exam_results,
+            evidence=audit.get("evidence"),
+            diagnosis_decision=audit.get("diagnosis_decision"),
+            error_types=error_types,
         )
+        self.memory.save_diagnostic_replay(
+            patient_id=patient_id,
+            collected_info=collected_info,
+            exam_results=exam_results,
+            evidence=audit.get("evidence") or {},
+            diagnosis_decision=audit.get("diagnosis_decision") or {},
+            report=report,
+            error_types=error_types,
+            llm_candidates=audit.get("llm_candidates") or [],
+            rag_chunks=audit.get("rag_chunks") or [],
+            case_audit=audit,
+        )
+        self._record_exam_alias_feedback(patient_id, report, exam_results)
+        self._record_diagnostic_rule_feedback(patient_id, report, collected_info, exam_results)
 
         # ============ 自迭代闭环 ============
         # 1) 缺陷检测 → 2) 编译为策略补丁 → 3) 反馈本例 ΔScore
@@ -1721,7 +3169,11 @@ class MyDoctorAgent(BaseDoctorAgent):
                     )
                 # 步骤4：每 5 例做一次 audit（元迭代）
                 _n_cases = len(getattr(self.memory, "notes", []) or [])
-                if _n_cases > 0 and _n_cases % 5 == 0:
+                if (
+                    not self.freeze_active_learning
+                    and _n_cases > 0
+                    and _n_cases % 5 == 0
+                ):
                     self.policy_store.audit()
 
                 if _defects:
@@ -1822,6 +3274,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         Returns:
             LLM 响应文本
         """
+        if not self._can_call_llm("chat"):
+            return ""
         try:
             if self.log_llm_prompts:
                 logger.debug(f"[LLM] Prompt: {json.dumps(messages, ensure_ascii=False)[:500]}...")
@@ -1850,6 +3304,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         Returns:
             解析后的 JSON 字典
         """
+        if not self._can_call_llm("json"):
+            return {}
         try:
             result = await self.llm.chat_json(messages, temperature=temperature)
             self._bump_llm_counter("json")
@@ -1944,6 +3400,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             "头痛", "头晕", "心悸", "胸闷", "气短", "恶心",
             "呕吐", "乏力", "食欲不振", "失眠", "水肿",
         ]
+        symptom_keywords.extend([
+            "呼吸困难", "呼吸急促", "气促", "喘息", "喘不上气", "发绀",
+            "胸口闷", "出汗", "畏寒", "寒战", "便秘", "停经", "月经异常",
+            "多饮", "多尿", "尿频", "尿急", "尿痛", "关节痛", "皮疹",
+        ])
         for keyword in symptom_keywords:
             if keyword in response and keyword not in symptoms:
                 symptoms.append(keyword)

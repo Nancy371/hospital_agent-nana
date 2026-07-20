@@ -246,11 +246,20 @@ class DefectDetector:
             fix = item.get("suggested_fix") or {}
             if not isinstance(fix, dict) or "type" not in fix or "action" not in fix:
                 continue
+            trigger = fix.get("trigger", {"always": True})
+            if not isinstance(trigger, dict):
+                trigger_text = str(trigger).strip()
+                trigger = {"signal": trigger_text} if trigger_text else {"always": True}
+            fix["trigger"] = trigger
+            items = fix.get("items", [])
+            if isinstance(items, str):
+                items = [items]
+            elif not isinstance(items, list):
+                items = []
             item.setdefault("subsystem", "reasoning")
             item.setdefault("severity", "medium")
             item.setdefault("evidence", {})
-            fix.setdefault("trigger", {"always": True})
-            fix.setdefault("items", [])
+            fix["items"] = items
             item["source_channel"] = "llm"
             out.append(item)
             covered.add(sig)

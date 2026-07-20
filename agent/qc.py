@@ -1,6 +1,6 @@
 """提交前质控 Agent：保证 final_result 可评估且尽量符合标准目录。"""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .knowledge import KnowledgeBase
 
@@ -8,13 +8,27 @@ from .knowledge import KnowledgeBase
 class QualityAgent:
     """本地规则质控角色。"""
 
-    def __init__(self, knowledge: KnowledgeBase):
+    def __init__(
+        self,
+        knowledge: KnowledgeBase,
+        allowed_diagnoses: Optional[Iterable[str]] = None,
+    ):
         self.knowledge = knowledge
+        self.allowed_diagnoses: Set[str] = {
+            str(item).strip() for item in (allowed_diagnoses or []) if str(item).strip()
+        }
+        if not self.allowed_diagnoses:
+            self.allowed_diagnoses.update(knowledge.get_disease_catalog_names())
+
+    def set_allowed_diagnoses(self, values: Iterable[str]) -> None:
+        self.allowed_diagnoses = {
+            str(item).strip() for item in values or [] if str(item).strip()
+        }
 
     @staticmethod
     def default_final_result(reason: str = "") -> Dict[str, Any]:
         return {
-            "diagnosis": ["待明确诊断"],
+            "diagnosis": [],
             "treatment_plan": "当前信息不足，建议进一步问诊并完善必要检查后制定治疗方案。",
             "reasoning": reason or "质控兜底：诊疗结果字段不完整。",
             "conversation_rounds": 0,
@@ -24,6 +38,7 @@ class QualityAgent:
         self,
         diagnosis: Any,
         collected_info: Optional[Dict[str, Any]] = None,
+        trusted_diagnoses: Optional[List[str]] = None,
     ) -> List[str]:
         if isinstance(diagnosis, str):
             raw_items = [diagnosis]
@@ -34,12 +49,23 @@ class QualityAgent:
 
         normalized: List[str] = []
         invalid: List[str] = []
+        trusted = [
+            str(item).strip()
+            for item in (trusted_diagnoses or [])
+            if str(item).strip() in self.allowed_diagnoses
+        ]
         for item in raw_items:
+            if item in self.allowed_diagnoses:
+                normalized.append(item)
+                continue
             standard = self.knowledge.normalize_diagnosis(item)
-            if standard and self.knowledge.is_valid_diagnosis(standard):
+            if standard and standard in self.allowed_diagnoses:
                 normalized.append(standard)
             else:
                 invalid.append(item)
+        for item in trusted:
+            if item not in normalized:
+                normalized.append(item)
 
         if not normalized:
             suggestions = self.knowledge.suggest_diagnoses(
@@ -48,10 +74,6 @@ class QualityAgent:
                 top_k=1,
             )
             normalized.extend(suggestions)
-
-        if not normalized:
-            # 最后兜底也使用标准目录内疾病名，避免非标准诊断影响评测解析。
-            normalized.append("上呼吸道感染")
 
         return list(dict.fromkeys(normalized))
 
@@ -70,13 +92,30 @@ class QualityAgent:
 
         fixed = dict(result)
         raw_diagnosis = fixed.get("diagnosis") or fixed.get("diagnoses")
-        diagnosis = self.normalize_diagnoses(raw_diagnosis, collected_info=collected_info)
+        trusted_diagnoses = [
+            str(item).strip()
+            for item in (fixed.get("_trusted_diagnoses") or [])
+            if str(item).strip()
+        ]
+        diagnosis = self.normalize_diagnoses(
+            raw_diagnosis,
+            collected_info=collected_info,
+            trusted_diagnoses=trusted_diagnoses,
+        )
         raw_items = raw_diagnosis if isinstance(raw_diagnosis, list) else [raw_diagnosis]
         for item in raw_items:
-            if item and not self.knowledge.normalize_diagnosis(str(item)):
+            item_text = str(item) if item else ""
+            if (
+                item_text
+                and item_text not in self.allowed_diagnoses
+                and item_text not in trusted_diagnoses
+                and (
+                    not self.knowledge.normalize_diagnosis(item_text)
+                    or self.knowledge.normalize_diagnosis(item_text) not in self.allowed_diagnoses
+                )
+            ):
                 issues.append(f"nonstandard_diagnosis:{item}")
         if not diagnosis:
-            diagnosis = ["上呼吸道感染"]
             issues.append("empty_diagnosis")
         fixed["diagnosis"] = diagnosis
 

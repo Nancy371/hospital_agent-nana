@@ -14,8 +14,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import os
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+from .clinical_evidence import ClinicalEvidenceNormalizer, EvidenceBundle
+from .diagnosis_engine import DiagnosisDecisionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +274,155 @@ class ShadowReplay:
             if p.get("id") == patch_id:
                 return p
         return None
+
+
+class DiagnosticReplay:
+    """Deterministically replay diagnosis traces without calling an LLM/service."""
+
+    def __init__(
+        self,
+        decision_engine: DiagnosisDecisionEngine,
+        normalizer: Optional[ClinicalEvidenceNormalizer] = None,
+    ):
+        self.decision_engine = decision_engine
+        self.normalizer = normalizer or ClinicalEvidenceNormalizer(
+            ref_dir=decision_engine.knowledge.ref_dir
+        )
+
+    def evaluate(
+        self,
+        source: Union[str, Iterable[Dict[str, Any]]],
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
+        rows = self._load_rows(source)
+        per_case: List[Dict[str, Any]] = []
+        recall_hits = 0
+        top1_hits = 0
+        exact_hits = 0
+        legal_results = 0
+        negative_checks = 0
+        negative_false_positives = 0
+
+        for row in rows:
+            expected = self._normalize_expected(row.get("expected"))
+            if not expected:
+                continue
+            evidence = EvidenceBundle.from_dict(row.get("evidence") or {})
+            if not evidence.observations:
+                evidence = self.normalizer.normalize(
+                    row.get("collected_info") or {},
+                    row.get("exam_results") or {},
+                )
+
+            prior_names = row.get("llm_candidates") or []
+            if not prior_names:
+                old_decision = row.get("diagnosis_decision") or {}
+                prior_names = old_decision.get("llm_candidates") or []
+            rag_chunks = row.get("rag_chunks") or []
+            decision = self.decision_engine.decide(
+                {"diagnosis": prior_names},
+                rag_chunks,
+                evidence,
+            )
+            ranked = [item.diagnosis for item in decision.candidates]
+            final = list(decision.final_diagnoses)
+            negative_diagnoses = self._normalize_expected(
+                row.get("negative_diagnoses") or row.get("forbidden_diagnoses")
+            )
+            recall = any(name in ranked[:top_k] for name in expected)
+            top1 = bool(ranked and ranked[0] in expected)
+            exact = set(final) == set(expected)
+            legal = bool(final) and all(
+                self.decision_engine.knowledge.is_allowed(name) for name in final
+            )
+            recall_hits += int(recall)
+            top1_hits += int(top1)
+            exact_hits += int(exact)
+            legal_results += int(legal)
+            negative_checks += len(negative_diagnoses)
+            false_positive_names = [name for name in negative_diagnoses if name in final]
+            negative_false_positives += len(false_positive_names)
+            per_case.append(
+                {
+                    "patient_id": row.get("patient_id") or row.get("case_id"),
+                    "expected": expected,
+                    "final": final,
+                    "top5": ranked[:top_k],
+                    "recall_at_5": recall,
+                    "top1_hit": top1,
+                    "exact_match": exact,
+                    "namespace_legal": legal,
+                    "negative_diagnoses": negative_diagnoses,
+                    "negative_false_positives": false_positive_names,
+                    "confidence": decision.confidence,
+                    "error_types": list(row.get("error_types") or []),
+                }
+            )
+
+        n = len(per_case)
+        return {
+            "cases": n,
+            "candidate_recall_at_5": round(recall_hits / n, 4) if n else 0.0,
+            "top1_accuracy": round(top1_hits / n, 4) if n else 0.0,
+            "exact_match_rate": round(exact_hits / n, 4) if n else 0.0,
+            "namespace_legal_rate": round(legal_results / n, 4) if n else 0.0,
+            "negation_false_positive_rate": (
+                round(negative_false_positives / negative_checks, 4)
+                if negative_checks else 0.0
+            ),
+            "negation_false_positive_count": negative_false_positives,
+            "targets": {
+                "candidate_recall_at_5": 0.9,
+                "top1_accuracy": 0.7,
+                "namespace_legal_rate": 1.0,
+            },
+            "maximum_targets": {"negation_false_positive_rate": 0.0},
+            "per_case": per_case,
+        }
+
+    @staticmethod
+    def promotion_summary(gains_by_case: Dict[str, float]) -> Dict[str, Any]:
+        """Apply the shadow-to-active gate from independently keyed replays."""
+        gains = [float(value) for value in gains_by_case.values()]
+        count = len(gains)
+        successes = sum(1 for value in gains if value > 0)
+        ratio = successes / count if count else 0.0
+        average = sum(gains) / count if count else 0.0
+        return {
+            "independent_cases": count,
+            "success_ratio": round(ratio, 4),
+            "avg_diagnosis_gain": round(average, 4),
+            "should_promote": bool(count >= 3 and ratio >= 0.6 and average >= 0.1),
+        }
+
+    @staticmethod
+    def _normalize_expected(value: Any) -> List[str]:
+        if isinstance(value, str):
+            value = [value]
+        return list(dict.fromkeys(str(item).strip() for item in (value or []) if str(item).strip()))
+
+    @staticmethod
+    def _load_rows(
+        source: Union[str, Iterable[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(source, (str, os.PathLike)):
+            return [dict(item) for item in source if isinstance(item, dict)]
+        rows: List[Dict[str, Any]] = []
+        try:
+            with open(source, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(item, dict):
+                        rows.append(item)
+        except OSError as exc:
+            logger.warning("[diagnostic-replay] unable to load %s: %s", source, exc)
+        return rows
 
 
 # ---------------- 内部包装器 ----------------

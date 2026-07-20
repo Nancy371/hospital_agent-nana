@@ -321,6 +321,9 @@ class DoctorAgentMemory:
             score_threshold=score_threshold,
         )
 
+    def render_rag_chunks(self, chunks: Optional[List[Dict[str, Any]]]) -> str:
+        return self.hybrid_rag.render_chunks(chunks)
+
     def match_policy(
         self,
         collected_info: Dict[str, Any],

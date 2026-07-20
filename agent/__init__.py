@@ -12,6 +12,25 @@ __all__ = [
     "InquiryStrategyAgent",
     "QualityAgent",
     "TreatmentStrategyAgent",
+    "StructuralDiagnosisAgent",
+    "EvidenceDiagnosisEngine",
+    "ClinicalEvidenceNormalizer",
+    "EvidenceAgent",
+    "EvidenceGraph",
+    "EvidenceBundle",
+    "Observation",
+    "CandidateGenerator",
+    "CandidatePool",
+    "CandidateSource",
+    "DiagnosisDecisionEngine",
+    "DiagnosticKnowledgeBase",
+    "DiagnosisDecision",
+    "OpenWorldDiagnosisResolver",
+    "DiagnosisResolution",
+    "DiagnosisCritic",
+    "CriticDecision",
+    "TreatmentSafetyGate",
+    "DiagnosticLearningStore",
     "DoctorAgentMemory",
     "WorkingCaseMemory",
     "MemoryItem",
@@ -20,6 +39,7 @@ __all__ = [
     "HybridRAGConfig",
     "RagChunk",
     "ShadowReplay",
+    "DiagnosticReplay",
     "heuristic_plan_score",
 ]
 
@@ -47,13 +67,40 @@ def __getattr__(name: str):
     if name == "TreatmentStrategyAgent":
         from .treatment_strategy import TreatmentStrategyAgent
         return TreatmentStrategyAgent
+    if name == "StructuralDiagnosisAgent":
+        from .structural_diagnosis import StructuralDiagnosisAgent
+        return StructuralDiagnosisAgent
+    if name == "EvidenceDiagnosisEngine":
+        from .evidence_engine import EvidenceDiagnosisEngine
+        return EvidenceDiagnosisEngine
+    if name in ("ClinicalEvidenceNormalizer", "EvidenceAgent", "EvidenceGraph", "EvidenceBundle", "Observation"):
+        from . import clinical_evidence as _clinical_evidence
+        return getattr(_clinical_evidence, name)
+    if name in ("CandidateGenerator", "CandidatePool", "CandidateSource"):
+        from . import candidate_generator as _candidate_generator
+        return getattr(_candidate_generator, name)
+    if name in ("DiagnosisDecisionEngine", "DiagnosticKnowledgeBase", "DiagnosisDecision"):
+        from . import diagnosis_engine as _diagnosis_engine
+        return getattr(_diagnosis_engine, name)
+    if name in ("OpenWorldDiagnosisResolver", "DiagnosisResolution"):
+        from . import diagnosis_resolver as _diagnosis_resolver
+        return getattr(_diagnosis_resolver, name)
+    if name in ("DiagnosisCritic", "CriticDecision"):
+        from . import diagnosis_critic as _diagnosis_critic
+        return getattr(_diagnosis_critic, name)
+    if name == "TreatmentSafetyGate":
+        from .treatment_safety import TreatmentSafetyGate
+        return TreatmentSafetyGate
+    if name == "DiagnosticLearningStore":
+        from .diagnostic_learning import DiagnosticLearningStore
+        return DiagnosticLearningStore
     if name in ("DoctorAgentMemory", "WorkingCaseMemory", "MemoryItem", "MemoryConfig"):
         from . import memory_system as _memory_system
         return getattr(_memory_system, name)
     if name in ("HybridRAGRetriever", "HybridRAGConfig", "RagChunk"):
         from . import rag_retriever as _rag_retriever
         return getattr(_rag_retriever, name)
-    if name in ("ShadowReplay", "heuristic_plan_score"):
+    if name in ("ShadowReplay", "DiagnosticReplay", "heuristic_plan_score"):
         from . import replay as _replay
         return getattr(_replay, name)
     raise AttributeError(f"module 'agent' has no attribute {name!r}")

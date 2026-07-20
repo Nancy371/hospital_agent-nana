@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.tmp
 *.pyc
+.pytest_cache/
 
 # Virtual env
 .env
@@ -11,6 +12,9 @@ __pycache__/
 venv/
 
 # Test / smoke temp outputs
+outputs/
+*.log
+*.pid
 test_output.txt
 _smoke_out.txt
 _smoke_stdout.txt
@@ -19,6 +23,9 @@ _smoke_now.py
 _p1p2_smoke.py
 _selfimp_smoke.py
 _check_server_v2.py
+_dbg.py
+_dns_test.py
+_probe_endpoints.py
 _hello.txt
 outputs/test/20*/
 outputs/test/_p1p2_policies*.json

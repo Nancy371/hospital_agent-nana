@@ -9,17 +9,29 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
+import warnings
 
 import yaml
+
+# Windows 下 Python 3.14 默认 ProactorEventLoop 存在偶发 getaddrinfo failed 问题，
+# 使用 SelectorEventLoopPolicy 以获得更稳定的 DNS 解析行为
+if sys.platform == "win32":
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from agent import MyDoctorAgent
 
 
 def setup_logging():
     """配置日志。"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -70,8 +82,13 @@ async def main():
     # 运行训练
     logger.info("开始训练...")
     try:
-        await agent.run_train()
-        logger.info("训练完成！")
+        result = await agent.run_train()
+        logger.info(
+            "训练完成: summary=%s",
+            json.dumps(result.get("summary", {}), ensure_ascii=False),
+        )
+        if result.get("summary_file"):
+            logger.info("训练报告: %s", result["summary_file"])
     except Exception as e:
         logger.error(f"训练失败: {e}")
         raise

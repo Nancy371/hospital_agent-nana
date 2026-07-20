@@ -210,7 +210,7 @@ class DoctorPrompt:
         "priority_actions_revised": [
             {{"action": "ask|examine|diagnose|treat", "target": "具体目标", "reason": "修订原因"}}
         ],
-        "phase_change": {{"from": "当前阶段", "to": "建议阶段", "reason": "转换原因"}}},
+        "phase_change": {{"from": "当前阶段", "to": "建议阶段", "reason": "转换原因"}},
         "new_risks": ["新发现的风险"],
         "missing_info": ["被忽略的关键信息"]
     }},
@@ -279,23 +279,35 @@ class DoctorPrompt:
 
 {experience_section}
 
+{rag_context}
+
+{evidence_summary}
+
+{candidate_table}
+
+{critic_feedback}
+
 {catalog_section}
 
 请综合分析以上信息，做出诊断并制定治疗方案。
 
 输出格式（JSON）：
 {{
-    "diagnosis": ["疾病名称1", "疾病名称2"],
+    "diagnosis": ["最可能的具体临床疾病名称"],
+    "diagnosis_candidates": [
+        {{"name": "候选疾病名称", "confidence": 0.0, "supporting_evidence": ["证据"]}}
+    ],
     "treatment_plan": "治疗方案描述",
     "reasoning": "诊断和治疗依据"
 }}
 
 注意：
-1. 诊断名称必须使用标准疾病目录中的 name 字段，不要输出目录外诊断、缩写或"待确诊"
+1. 候选诊断可以使用比目录更具体的规范临床病名；不要为了迁就目录把明确病因泛化成症状或综合征
 2. 如果有多个可能的诊断，按可能性从高到低排列
-3. 治疗方案应具体、可执行，包含药物名称和剂量建议
-4. 推理过程应清晰、有逻辑，包含鉴别诊断分析
-5. 只输出 JSON，不要输出其他内容"""
+3. 必须说明支持证据和关键反证；不得把阴性结果、正常参考范围或括号中的示例当成阳性证据
+4. 治疗方案应具体、可执行，并服从年龄、过敏史和禁忌证
+5. 你的输出只是开放候选；系统会进行别名、上下位和相似名称标准化，再由证据评分与提交前审查决定最终提交名
+6. 只输出 JSON，不要输出其他内容"""
 
     # ============ 反思 Prompt ============
 
@@ -437,13 +449,17 @@ class DoctorPrompt:
 
         lines = ["以下是类似病例的历史经验，请参考但不要照搬："]
         for i, exp in enumerate(relevant_experience[:3], 1):
-            content = exp.get("content", "")
+            is_failure = exp.get("memory_kind") == "failure_lesson" or (
+                (exp.get("metrics") or {}).get("diagnosis_accuracy", 1) < 0.8
+            )
+            content = exp.get("lesson", "") if is_failure else exp.get("content", "")
             metrics = exp.get("metrics", {})
             if metrics:
                 da = metrics.get("diagnosis_accuracy", "?")
                 ep = metrics.get("exam_precision", "?")
                 ts = metrics.get("treatment_score", "?")
-                lines.append(f"\n经验{i}（诊断准确率={da}, 检查精确率={ep}, 治疗评分={ts}）：")
+                label = "失败教训" if is_failure else "成功经验"
+                lines.append(f"\n{label}{i}（诊断准确率={da}, 检查精确率={ep}, 治疗评分={ts}）：")
             else:
                 lines.append(f"\n经验{i}：")
             lines.append(content)
@@ -637,6 +653,10 @@ class DoctorPrompt:
         chat_history: List[Dict[str, str]],
         relevant_experience: Optional[List[Dict[str, Any]]] = None,
         standard_diseases: Optional[List[str]] = None,
+        rag_context: str = "",
+        evidence_summary: str = "",
+        candidate_table: str = "",
+        critic_feedback: str = "",
     ) -> str:
         """构建诊断 prompt。
 
@@ -658,18 +678,24 @@ class DoctorPrompt:
         )
         experience_section = self._build_experience_section(relevant_experience or [])
         catalog_section = (
-            "【标准疾病名称约束】\n"
-            "最终 diagnosis 只能使用 data/ref_data/diseases_catalog.json 中存在的疾病名称。"
-            "若模型不确定，也必须从标准目录中选择最符合当前证据的疾病名称。"
+            "【开放候选与标准化】\n"
+            "你可以提出目录外但医学上规范、具体且有证据支持的疾病候选，"
+            "不要输出缩写、待确诊或自造名称。系统不会直接提交你的原始名称；"
+            "它会映射到官方 catalog 或 evaluation 已确认的受控细分名称，"
+            "无法可靠映射的候选只进入审计和后续学习。"
         )
         if standard_diseases:
-            catalog_section += "\n标准疾病目录：" + "、".join(standard_diseases)
+            catalog_section += "\n优先标准化目标名称：" + "、".join(standard_diseases)
 
         return self.SYSTEM_ROLE + "\n\n" + self.DIAGNOSIS_TEMPLATE.format(
             collected_info=info_str,
             exam_results=exam_str,
             chat_history=history_str,
             experience_section=experience_section,
+            rag_context=rag_context or "【Hybrid RAG】未召回到可靠上下文。",
+            evidence_summary=evidence_summary or "【结构化临床证据】暂无。",
+            candidate_table=candidate_table or "【证据评分候选】暂无。",
+            critic_feedback=critic_feedback or "",
             catalog_section=catalog_section,
         )
 

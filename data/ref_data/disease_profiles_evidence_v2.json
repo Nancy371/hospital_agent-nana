@@ -1,0 +1,87 @@
+{
+  "profiles": [
+    {
+      "name": "低镁血症",
+      "department": "内分泌科",
+      "aliases": ["血镁降低", "hypomagnesemia"],
+      "common_symptoms": ["手足抽筋", "肌肉痉挛", "乏力", "心悸", "头晕"],
+      "red_flags": ["心律失常", "手足搐搦", "惊厥"],
+      "key_questions": ["近期是否腹泻呕吐", "是否使用利尿剂或抑酸药", "有无饮酒或营养不良"],
+      "required_exams": ["电解质", "心电图", "肾功能"],
+      "strong_verification_exams": ["综合代谢面板（CMP）", "24小时尿电解质检测", "镁负荷试验", "心电图（ECG）"],
+      "optional_exams": ["血气分析"],
+      "differential_diagnoses": ["焦虑症", "心律失常", "甲状腺功能亢进"],
+      "treatment_principles": ["按症状严重度和肾功能补镁", "同步纠正钾钙异常并处理病因"],
+      "avoid_mistakes": ["抽筋伴心悸不能只归因于焦虑或胃肠炎", "补镁前后应监测肾功能和心电图"]
+    },
+    {
+      "name": "维生素D缺乏性佝偻病",
+      "department": "儿科",
+      "aliases": ["营养性佝偻病"],
+      "common_symptoms": ["腿痛", "跛行", "活动后下肢功能障碍", "乏力", "骨骼畸形"],
+      "red_flags": ["步态异常", "低钙抽搐", "生长发育迟缓"],
+      "key_questions": ["饮食中钙和维生素D摄入", "日照情况", "生长发育和骨骼畸形"],
+      "required_exams": ["电解质", "骨密度", "肝功能"],
+      "strong_verification_exams": ["维生素D检测", "血清电解质", "甲状旁腺激素检测（PTH）", "肝功能检查（LFTs）", "骨转换标志物（BTMs）", "X线检查"],
+      "optional_exams": ["肾功能"],
+      "differential_diagnoses": ["骨关节炎", "骨折", "白血病"],
+      "treatment_principles": ["儿科指导下补充维生素D和钙", "复查生化指标和骨骼发育"],
+      "avoid_mistakes": ["儿童跛行和腿痛不能直接套用成人退行性骨病"]
+    },
+    {
+      "name": "显微镜下多血管炎",
+      "department": "风湿免疫科",
+      "aliases": ["MPA", "microscopic polyangiitis"],
+      "common_symptoms": ["血尿", "蛋白尿", "咯血", "呼吸困难", "低热", "关节痛", "乏力"],
+      "red_flags": ["肺泡出血", "快速进展性肾损伤", "低氧血症"],
+      "key_questions": ["尿色和尿量变化", "咯血及呼吸困难进展", "近期感染和药物使用"],
+      "required_exams": ["尿常规", "肾功能", "胸部CT", "抗核抗体"],
+      "strong_verification_exams": ["尿液分析（UA）", "肾功能", "胸部CT扫描（Chest CT）", "抗核抗体", "全血细胞计数（CBC）", "C反应蛋白（CRP）"],
+      "optional_exams": ["血常规", "C反应蛋白"],
+      "differential_diagnoses": ["系统性红斑狼疮", "肺炎", "肾结石"],
+      "treatment_principles": ["肺肾综合征按器官威胁程度住院处理", "排除感染后由风湿免疫科和肾内科联合制定免疫治疗"],
+      "avoid_mistakes": ["咯血加血尿不能只提交系统性红斑狼疮或肺炎"]
+    },
+    {
+      "name": "二尖瓣反流",
+      "department": "心内科",
+      "aliases": ["二尖瓣返流", "MR"],
+      "common_symptoms": ["活动后气短", "夜间阵发性呼吸困难", "不能平卧", "下肢水肿", "心悸"],
+      "red_flags": ["重度二尖瓣反流", "左心室扩大", "肺动脉高压"],
+      "key_questions": ["呼吸困难与体位关系", "既往瓣膜病和风湿热", "房颤或栓塞史"],
+      "required_exams": ["超声心动图", "心电图", "胸部X线"],
+      "optional_exams": ["动态心电图", "心肌酶谱"],
+      "differential_diagnoses": ["心力衰竭", "冠心病", "心律失常"],
+      "treatment_principles": ["依据反流严重度和心室功能评估瓣膜干预", "容量超负荷时谨慎利尿并监测肾功能电解质"],
+      "avoid_mistakes": ["超声直接显示瓣膜反流时应提交结构性病因而非只提交心力衰竭"]
+    },
+    {
+      "name": "肺不张",
+      "department": "呼吸内科",
+      "aliases": ["肺叶不张", "肺段不张"],
+      "common_symptoms": ["咳嗽", "呼吸困难", "低氧", "呛咳", "胸痛"],
+      "red_flags": ["大面积肺不张", "持续低氧", "异物或黏液栓阻塞"],
+      "key_questions": ["是否进食或吸入异物后发病", "有无吞咽困难", "术后卧床和排痰能力"],
+      "required_exams": ["胸部X线", "胸部CT", "支气管镜"],
+      "strong_verification_exams": ["胸部X线检查（CXR）", "胸部CT扫描（Chest CT）", "支气管镜检查", "动脉血气（ABG）"],
+      "optional_exams": ["血气分析", "血常规"],
+      "differential_diagnoses": ["肺炎", "支气管炎", "肺癌"],
+      "treatment_principles": ["氧疗和气道廓清", "处理误吸、黏液栓或异物等病因并复查影像"],
+      "avoid_mistakes": ["呛咳后呼吸困难需优先排除肺不张和误吸"]
+    },
+    {
+      "name": "支气管肺炎",
+      "department": "呼吸内科",
+      "aliases": ["小叶性肺炎"],
+      "common_symptoms": ["发热", "咳嗽", "呼吸困难", "低氧", "咳痰"],
+      "red_flags": ["持续低氧", "呼吸窘迫", "脓毒症", "呛咳后发病"],
+      "key_questions": ["发热和呼吸困难进展", "痰液性状", "呛咳或吞咽困难", "疫苗和近期抗生素"],
+      "required_exams": ["体格检查", "血常规", "C反应蛋白", "降钙素原", "胸部X线"],
+      "strong_verification_exams": ["体格检查", "脉搏血氧饱和度监测（SpO2）", "胸部X线检查（CXR）", "全血细胞计数（CBC）", "C反应蛋白（CRP）", "降钙素原（PCT）", "痰培养", "抗菌药物敏感性试验（AST）"],
+      "optional_exams": ["血培养", "胸部CT", "支气管镜"],
+      "differential_diagnoses": ["肺炎", "支气管炎", "肺不张"],
+      "treatment_principles": ["结合严重度和培养结果选择抗感染治疗", "低氧时给予呼吸支持并评估误吸和并发症"],
+      "avoid_mistakes": ["急性发热咳嗽伴低氧不能被无阳性结构证据的先心病解释"]
+    }
+  ]
+}

@@ -59,9 +59,41 @@ class PolicyStore:
                 self.patches = data["patches"]
             else:
                 self.patches = []
+            self.patches = [p for p in self.patches if isinstance(p, dict)]
+            if self._normalize_loaded_patches():
+                self._save()
+                logger.info("[policy] 已迁移历史补丁 trigger 为标准字典结构")
         except Exception as e:
             logger.warning(f"[policy] 加载补丁库失败: {e}, 使用空库")
             self.patches = []
+
+    def _normalize_loaded_patches(self) -> bool:
+        """Normalize legacy patch shapes loaded from disk."""
+        changed = False
+        for patch in self.patches:
+            old_trigger = patch.get("trigger")
+            new_trigger = _normalize_trigger(old_trigger)
+            if old_trigger != new_trigger:
+                patch["trigger"] = new_trigger
+                changed = True
+            if not isinstance(patch.get("items"), list):
+                item = patch.get("items")
+                patch["items"] = [item] if isinstance(item, str) and item else []
+                changed = True
+            if not isinstance(patch.get("stats"), dict):
+                patch["stats"] = {
+                    "hits": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "created_at": _now_iso(),
+                    "last_used_at": None,
+                    "status": "shadow",
+                }
+                changed = True
+            if not isinstance(patch.get("source"), dict):
+                patch["source"] = {"signal": str(patch.get("source") or ""), "severity": "low"}
+                changed = True
+        return changed
 
     def _save(self) -> None:
         tmp_path = ""
@@ -91,6 +123,65 @@ class PolicyStore:
                     pass
             logger.warning(f"[policy] 保存补丁库失败: {e}")
 
+    def sanitize_shadow_patches(self) -> Dict[str, int]:
+        """Retire zero-hit shadow patches that cannot be matched safely.
+
+        Historical LLM attribution sometimes emitted free-form ``signal``
+        triggers or empty ``final_dx`` values. They are retained for audit, but
+        must not be promoted or injected until converted to executable fields.
+        """
+        retired = 0
+        normalized_count = 0
+        for patch in self.patches:
+            stats = patch.setdefault("stats", {})
+            if stats.get("status", "shadow") != "shadow":
+                continue
+            if int(stats.get("hits", 0) or 0) > 0:
+                continue
+
+            trigger = _normalize_trigger(patch.get("trigger"))
+            executable: Dict[str, Any] = {}
+            if trigger.get("always") is True:
+                executable["always"] = True
+            symptoms = [str(item).strip() for item in _as_list(trigger.get("symptoms_any")) if str(item).strip()]
+            if symptoms:
+                executable["symptoms_any"] = symptoms
+            final_dx = str(trigger.get("final_dx") or "").strip()
+            if final_dx:
+                executable["final_dx"] = final_dx
+            for key in ("age_min", "age_max"):
+                try:
+                    if trigger.get(key) not in (None, ""):
+                        executable[key] = int(float(trigger[key]))
+                except (TypeError, ValueError):
+                    pass
+            gender = str(trigger.get("gender") or "").strip()
+            if gender:
+                executable["gender"] = gender
+
+            if executable != trigger:
+                source = patch.setdefault("source", {})
+                source.setdefault("legacy_trigger", trigger)
+                patch["trigger"] = executable
+                normalized_count += 1
+            usable = bool(executable)
+            if usable:
+                continue
+
+            stats["status"] = "retired"
+            source = patch.setdefault("source", {})
+            source["retired_reason"] = "unexecutable_zero_hit_shadow_trigger"
+            retired += 1
+
+        if retired or normalized_count:
+            self._save()
+            logger.info(
+                "[policy] sanitized zero-hit shadow patches: normalized=%s retired=%s",
+                normalized_count,
+                retired,
+            )
+        return {"retired": retired, "normalized": normalized_count}
+
     # ---------------- emit / dedup ----------------
 
     def emit_from_defects(
@@ -110,15 +201,22 @@ class PolicyStore:
         touched: List[Dict[str, Any]] = []
         now = _now_iso()
         for d in defects or []:
-            fix = d.get("suggested_fix") or {}
-            if not fix or not fix.get("type"):
+            if not isinstance(d, dict):
                 continue
+            fix = d.get("suggested_fix") or {}
+            if not isinstance(fix, dict) or not fix.get("type"):
+                continue
+            items = fix.get("items") or []
+            if isinstance(items, str):
+                items = [items]
+            elif not isinstance(items, list):
+                items = []
             candidate = {
                 "id": _mk_id(),
                 "type": fix.get("type"),
-                "trigger": fix.get("trigger") or {},
+                "trigger": _normalize_trigger(fix.get("trigger", {"always": True})) or {"always": True},
                 "action": fix.get("action") or "",
-                "items": fix.get("items") or [],
+                "items": items,
                 "stats": {
                     "hits": 0,
                     "successes": 0,
@@ -135,7 +233,7 @@ class PolicyStore:
             existing = self._find_similar(candidate)
             if existing is not None:
                 # 合并 items（去重），提升严重度到较高者
-                merged_items = list({*existing.get("items", []), *candidate["items"]})
+                merged_items = list({*_as_list(existing.get("items")), *candidate["items"]})
                 existing["items"] = merged_items
                 existing["action"] = existing.get("action") or candidate["action"]
                 # 严重度取更高：high > medium > low
@@ -227,24 +325,71 @@ class PolicyStore:
                     stats["failures"] = int(stats.get("failures", 0)) + 1
         self._save()
 
-    def audit(self, min_hits: int = 5, min_success_ratio: float = 0.5) -> Dict[str, int]:
-        """元迭代：把命中过 min_hits 次且成率<阈值 的补丁 retire；shadow→active 需要正收益。"""
+    def record_diagnostic_replay(
+        self,
+        patch_id: str,
+        gains_by_case: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Persist independent replay evidence used by the promotion gate."""
+        unique = {
+            str(case_id): float(gain)
+            for case_id, gain in (gains_by_case or {}).items()
+            if str(case_id).strip()
+        }
+        count = len(unique)
+        successes = sum(1 for gain in unique.values() if gain > 0)
+        summary = {
+            "independent_cases": count,
+            "success_ratio": round(successes / count, 4) if count else 0.0,
+            "avg_diagnosis_gain": round(sum(unique.values()) / count, 4) if count else 0.0,
+            "case_gains": unique,
+            "updated_at": _now_iso(),
+        }
+        for patch in self.patches:
+            if patch.get("id") == patch_id:
+                patch.setdefault("stats", {})["diagnostic_replay"] = summary
+                self._save()
+                return summary
+        raise ValueError(f"patch {patch_id!r} does not exist")
+
+    def audit(
+        self,
+        min_hits: int = 5,
+        min_success_ratio: float = 0.6,
+        min_replay_cases: int = 3,
+        min_avg_delta: float = 0.1,
+    ) -> Dict[str, int]:
+        """Audit patches; shadow promotion requires explicit replay evidence.
+
+        Runtime hits may retire a harmful patch but cannot promote it. A shadow
+        patch additionally needs independent diagnostic replay evidence.
+        """
         promoted, retired = 0, 0
         for p in self.patches:
             stats = p.get("stats") or {}
             hits = int(stats.get("hits", 0))
             succ = int(stats.get("successes", 0))
             fail = int(stats.get("failures", 0))
+            status = stats.get("status", "shadow")
+            replay = stats.get("diagnostic_replay") or {}
+            replay_cases = int(replay.get("independent_cases", 0) or 0)
+            replay_ratio = float(replay.get("success_ratio", 0.0) or 0.0)
+            replay_delta = float(replay.get("avg_diagnosis_gain", 0.0) or 0.0)
+            if (
+                status == "shadow"
+                and replay_cases >= min_replay_cases
+                and replay_ratio >= min_success_ratio
+                and replay_delta >= min_avg_delta
+            ):
+                stats["status"] = "active"
+                promoted += 1
+                continue
             if hits < min_hits:
                 continue
             ratio = succ / max(hits, 1)
-            status = stats.get("status", "shadow")
             if ratio < min_success_ratio and fail >= succ:
                 stats["status"] = "retired"
                 retired += 1
-            elif status == "shadow" and ratio >= min_success_ratio and succ >= 2:
-                stats["status"] = "active"
-                promoted += 1
         if promoted or retired:
             self._save()
             logger.info(f"[policy] audit 完成: promoted={promoted}, retired={retired}")
@@ -265,8 +410,34 @@ def _sev_rank(s: str) -> int:
     return {"low": 1, "medium": 2, "high": 3}.get(s or "low", 1)
 
 
-def _trigger_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+def _normalize_trigger(trigger: Any) -> Dict[str, Any]:
+    """Convert legacy or malformed trigger values into a safe dict shape."""
+    if isinstance(trigger, dict):
+        return trigger
+    if trigger is None:
+        return {}
+    text = str(trigger).strip()
+    if not text:
+        return {}
+    # LLM-generated string triggers are kept for provenance/dedup, but are not
+    # executable match conditions unless later promoted into a structured rule.
+    return {"signal": text}
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [value] if value else []
+    return [value]
+
+
+def _trigger_equal(a: Any, b: Any) -> bool:
     """判定两个 trigger 是否语义相同（键集合一致 + 关键字段一致）。"""
+    a = _normalize_trigger(a)
+    b = _normalize_trigger(b)
     if set(a.keys()) != set(b.keys()):
         return False
     for k in a.keys():
@@ -281,21 +452,25 @@ def _trigger_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 
 
 def _trigger_hit(
-    trigger: Dict[str, Any],
+    trigger: Any,
     symptoms: List[str],
     candidate_diseases: List[str],
     age: Any,
     gender: Any,
 ) -> bool:
     """判定单个补丁的 trigger 是否命中当前上下文。"""
+    trigger = _normalize_trigger(trigger)
     if not trigger:
         return False
     if trigger.get("always"):
         return True
 
+    has_condition = False
+
     # symptoms_any: 任一命中即可
     syms_any = trigger.get("symptoms_any") or []
     if syms_any:
+        has_condition = True
         joined = " ".join(symptoms)
         if not any(str(x) and str(x) in joined for x in syms_any):
             return False
@@ -303,6 +478,7 @@ def _trigger_hit(
     # final_dx: 目标疾病与候选之一匹配（子串）
     final_dx = trigger.get("final_dx")
     if final_dx:
+        has_condition = True
         fd = str(final_dx)
         joined_cands = " ".join(candidate_diseases)
         if fd not in joined_cands:
@@ -312,6 +488,7 @@ def _trigger_hit(
     from_age = trigger.get("age_min")
     to_age = trigger.get("age_max")
     if from_age is not None or to_age is not None:
+        has_condition = True
         age_num = _age_to_int(age)
         if age_num is None:
             return False
@@ -322,10 +499,12 @@ def _trigger_hit(
 
     # 性别
     g = trigger.get("gender")
-    if g and str(gender or "").upper() != str(g).upper():
-        return False
+    if g:
+        has_condition = True
+        if str(gender or "").upper() != str(g).upper():
+            return False
 
-    return True
+    return has_condition
 
 
 def _age_to_int(v) -> Optional[int]:
