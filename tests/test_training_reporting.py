@@ -7,6 +7,7 @@ import yaml
 
 from agent.agent import MyDoctorAgent
 from agent.knowledge import KnowledgeBase
+from agent.qc import QualityAgent
 from hospital_agent.base import summarize_training_results
 
 
@@ -20,7 +21,40 @@ class TrainingReportingTests(unittest.TestCase):
                     "examination_precision": 0.8,
                     "treatment_overall_score": 0.7,
                     "treatment_safety": 1.0,
+                    "candidate_recall_at_20": True,
                     "candidate_recall_at_5": True,
+                    "ranking_accuracy": True,
+                    "submission_alignment": True,
+                    "submission_override_count": 0,
+                    "etiology_preference": True,
+                    "decision_override_rate": False,
+                    "judge_gap_authorization_rate": True,
+                    "judge_primary_accuracy": True,
+                    "differential_exam_precision": 0.5,
+                    "discriminating_gap_closed_rate": 0.25,
+                    "dynamic_rerank_changed_primary": True,
+                    "pairwise_judge_accuracy": 1.0,
+                    "unauthorized_exam_count": 2,
+                    "required_evidence_coverage": 0.75,
+                    "soft_contradiction_count": 1,
+                    "hard_contradiction_count": 0,
+                    "required_gap_authorized_count": 1,
+                    "explanatory_coverage": 0.82,
+                    "core_explanatory_coverage": 0.76,
+                    "residual_evidence_score": 0.18,
+                    "residual_core_evidence_count": 1,
+                    "discriminating_exam_recall": 0.5,
+                    "exam_information_gain": 0.45,
+                    "gap_closure_rate": 0.25,
+                    "explanation_score_changed_ranking_rate": True,
+                    "primary_unlock_rate": True,
+                    "legacy_exam_package_contribution_rate": 0.2,
+                    "differential_exam_contribution_rate": 0.8,
+                    "gap_state_satisfied_count": 2,
+                    "gap_state_actionable_count": 1,
+                    "gap_state_nonblocking_count": 1,
+                    "gap_state_unsupported_count": 3,
+                    "gap_state_hard_blocked_count": 0,
                 },
                 "audit": {
                     "elapsed_seconds": 100,
@@ -46,7 +80,40 @@ class TrainingReportingTests(unittest.TestCase):
         ]
         summary = summarize_training_results(rows)
         self.assertEqual(summary["diagnosis_accuracy"], 1.0)
+        self.assertEqual(summary["candidate_recall_at_20"], 1.0)
         self.assertEqual(summary["candidate_recall_at_5"], 1.0)
+        self.assertEqual(summary["ranking_accuracy"], 1.0)
+        self.assertEqual(summary["submission_alignment"], 1.0)
+        self.assertEqual(summary["submission_override_count"], 0.0)
+        self.assertEqual(summary["etiology_preference"], 1.0)
+        self.assertEqual(summary["decision_override_rate"], 0.0)
+        self.assertEqual(summary["judge_gap_authorization_rate"], 1.0)
+        self.assertEqual(summary["judge_primary_accuracy"], 1.0)
+        self.assertEqual(summary["differential_exam_precision"], 0.5)
+        self.assertEqual(summary["discriminating_gap_closed_rate"], 0.25)
+        self.assertEqual(summary["dynamic_rerank_changed_primary"], 1.0)
+        self.assertEqual(summary["pairwise_judge_accuracy"], 1.0)
+        self.assertEqual(summary["unauthorized_exam_count"], 2.0)
+        self.assertEqual(summary["required_evidence_coverage"], 0.75)
+        self.assertEqual(summary["soft_contradiction_count"], 1.0)
+        self.assertEqual(summary["hard_contradiction_count"], 0.0)
+        self.assertEqual(summary["required_gap_authorized_count"], 1.0)
+        self.assertEqual(summary["explanatory_coverage"], 0.82)
+        self.assertEqual(summary["core_explanatory_coverage"], 0.76)
+        self.assertEqual(summary["residual_evidence_score"], 0.18)
+        self.assertEqual(summary["residual_core_evidence_count"], 1.0)
+        self.assertEqual(summary["discriminating_exam_recall"], 0.5)
+        self.assertEqual(summary["exam_information_gain"], 0.45)
+        self.assertEqual(summary["gap_closure_rate"], 0.25)
+        self.assertEqual(summary["explanation_score_changed_ranking_rate"], 1.0)
+        self.assertEqual(summary["primary_unlock_rate"], 1.0)
+        self.assertEqual(summary["legacy_exam_package_contribution_rate"], 0.2)
+        self.assertEqual(summary["differential_exam_contribution_rate"], 0.8)
+        self.assertEqual(summary["gap_state_satisfied_count"], 2.0)
+        self.assertEqual(summary["gap_state_actionable_count"], 1.0)
+        self.assertEqual(summary["gap_state_nonblocking_count"], 1.0)
+        self.assertEqual(summary["gap_state_unsupported_count"], 3.0)
+        self.assertEqual(summary["gap_state_hard_blocked_count"], 0.0)
         self.assertEqual(summary["critic_issue_rate"], 0.5)
         self.assertEqual(summary["critic_llm_rate"], 0.5)
         self.assertEqual(summary["timeout_cases"], 1)
@@ -87,14 +154,63 @@ class TrainingReportingTests(unittest.TestCase):
         agent._last_diagnosis_audit = {
             "diagnosis_decision": {
                 "candidates": [
-                    {"diagnosis": "低镁血症"},
+                    {
+                        "diagnosis": "低镁血症",
+                        "required_met": True,
+                        "matched_evidence": ["low_magnesium"],
+                        "required_gaps": [],
+                        "soft_contradicted_evidence": ["urine_culture_no_growth"],
+                        "hard_contradicted_evidence": [],
+                    },
                     {"diagnosis": "心律失常"},
+                ],
+                "retriever_top1": "心律失常",
+                "judge_primary": "低镁血症",
+                "submitter_final": ["低镁血症"],
+                "decision_override": True,
+                "required_gap_authorized_diagnoses": [],
+                "judge_decision": {
+                    "pairwise_comparisons": [
+                        {
+                            "left": "低镁血症",
+                            "right": "心律失常",
+                            "preferred": "低镁血症",
+                        }
+                    ],
+                    "discriminating_exams": ["综合代谢面板（CMP）"],
+                    "discriminating_findings": ["low_magnesium"],
+                    "dynamic_rerank_changed_primary": True,
+                    "explanatory_coverage": 0.84,
+                    "core_explanatory_coverage": 0.8,
+                    "residual_evidence_score": 0.16,
+                    "residual_core_evidence_count": 0,
+                    "high_value_gap_candidates": [],
+                },
+            },
+            "evidence": {
+                "observations": [
+                    {
+                        "finding": "low_magnesium",
+                        "polarity": "positive",
+                        "source": "电解质",
+                    },
+                    {
+                        "finding": "field:血镁",
+                        "polarity": "positive",
+                        "source": "电解质",
+                    },
                 ]
             },
             "critic": {"issues": [], "llm_used": False},
             "elapsed_seconds": 88.5,
             "timed_out": False,
         }
+        agent._last_exam_authorization = [
+            {
+                "strict_diagnosis_driven": True,
+                "blocked_items": ["心脏MRI（CMR）"],
+            }
+        ]
         report = {
             "diagnosisAccuracy": 1.0,
             "examinationPrecision": 0.9,
@@ -117,8 +233,53 @@ class TrainingReportingTests(unittest.TestCase):
             report,
         )
         self.assertTrue(result["metrics"]["candidate_recall_at_5"])
+        self.assertTrue(result["metrics"]["candidate_recall_at_20"])
+        self.assertTrue(result["metrics"]["ranking_accuracy"])
         self.assertEqual(result["audit"]["elapsed_seconds"], 88.5)
+        self.assertEqual(result["metrics"]["required_evidence_coverage"], 1.0)
+        self.assertEqual(result["metrics"]["soft_contradiction_count"], 1)
+        self.assertEqual(result["metrics"]["hard_contradiction_count"], 0)
+        self.assertEqual(result["retriever_top1"], "心律失常")
+        self.assertEqual(result["judge_primary"], "低镁血症")
+        self.assertEqual(result["submitter_final"], ["低镁血症"])
+        self.assertTrue(result["metrics"]["decision_override_rate"])
+        self.assertTrue(result["metrics"]["judge_primary_accuracy"])
+        self.assertEqual(result["metrics"]["pairwise_judge_accuracy"], 1.0)
+        self.assertTrue(result["metrics"]["dynamic_rerank_changed_primary"])
+        self.assertEqual(result["metrics"]["explanatory_coverage"], 0.84)
+        self.assertEqual(result["metrics"]["core_explanatory_coverage"], 0.8)
+        self.assertEqual(result["metrics"]["residual_evidence_score"], 0.16)
+        self.assertEqual(result["metrics"]["residual_core_evidence_count"], 0)
+        self.assertIsNone(result["metrics"]["discriminating_exam_recall"])
+        self.assertIsNone(result["metrics"]["exam_information_gain"])
+        self.assertEqual(result["metrics"]["gap_closure_rate"], 1.0)
+        self.assertEqual(
+            result["audit"]["exam_authorization_mode"],
+            "strict_diagnosis_driven",
+        )
+        self.assertIn(
+            "low_magnesium",
+            result["audit"]["finding_extraction_summary"]["diagnostic_findings"],
+        )
         self.assertNotIn("_private", result["final_result"])
+
+    def test_quality_review_respects_authorization_lock(self):
+        knowledge = KnowledgeBase("data/ref_data")
+        quality = QualityAgent(
+            knowledge,
+            allowed_diagnoses=["克里格勒-纳贾尔综合征", "肺炎"],
+        )
+        fixed = quality.review_final_result(
+            {
+                "diagnosis": ["肺炎"],
+                "_trusted_diagnoses": ["肺炎"],
+                "_authorized_diagnoses": ["克里格勒-纳贾尔综合征"],
+                "_authorization_locked": True,
+                "treatment_plan": "按授权诊断制定治疗。",
+                "reasoning": "授权诊断已确定。",
+            }
+        )
+        self.assertEqual(fixed["diagnosis"], ["克里格勒-纳贾尔综合征"])
 
 
 class TrainingBudgetTests(unittest.IsolatedAsyncioTestCase):

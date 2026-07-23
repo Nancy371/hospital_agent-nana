@@ -41,6 +41,22 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
         self.assertEqual(hits[0].direction, "low")
         self.assertAlmostEqual(hits[0].value, 0.45)
 
+    def test_weakness_is_not_treated_as_negation(self):
+        bundle = self.normalizer.normalize(
+            {"symptoms": ["全身无力", "手足抽筋", "心悸"]},
+            {},
+        )
+        positives = {
+            item.finding for item in bundle.observations if item.polarity == "positive"
+        }
+        negatives = {
+            item.finding for item in bundle.observations if item.polarity == "negative"
+        }
+        self.assertIn("weakness", positives)
+        self.assertIn("muscle_cramp", positives)
+        self.assertIn("palpitation", positives)
+        self.assertNotIn("weakness", negatives)
+
     def test_urine_magnesium_uses_leaf_value_not_field_number(self):
         bundle = self.normalizer.normalize(
             {},
@@ -145,6 +161,199 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
         findings = bundle.findings("positive")
         self.assertIn("pneumonia_infiltrate", findings)
         self.assertIn("bronchopneumonia", findings)
+
+    def test_ugt1a1_gene_result_becomes_standard_finding(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "基因检测": {
+                    "status": "abnormal",
+                    "result": {"结论": "UGT1A1 双等位致病变异"},
+                }
+            },
+        )
+        findings = bundle.findings("positive")
+        self.assertIn("ugt1a1_positive", findings)
+        self.assertIn("genetic_suspicion", findings)
+
+    def test_nasopharyngeal_cytology_and_scope_become_standard_findings(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "鼻咽镜检查": {
+                    "status": "abnormal",
+                    "result": {"结论": "鼻咽黏膜充血，淋巴滤泡增生，慢性炎症改变"},
+                },
+                "脱落细胞学检查": {
+                    "status": "abnormal",
+                    "result": {"结论": "脱落细胞学提示慢性炎症"},
+                },
+            },
+        )
+        findings = bundle.findings("positive")
+        self.assertIn("nasopharyngoscopy_abnormal", findings)
+        self.assertIn("nasopharyngeal_chronic_inflammation", findings)
+        self.assertIn("cytology_chronic_inflammation", findings)
+
+    def test_otoscopy_abnormality_becomes_tympanitis_findings(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "耳镜检查": {
+                    "status": "abnormal",
+                    "result": {"结论": "鼓膜明显充血，鼓膜疱疹，局部鼓膜炎症"},
+                }
+            },
+        )
+        findings = bundle.findings("positive")
+        self.assertIn("acute_tympanitis", findings)
+        self.assertIn("tympanic_membrane_inflammation", findings)
+        self.assertIn("tympanic_bulla", findings)
+
+    def test_stage2_specialty_findings_are_structured(self):
+        bundle = self.normalizer.normalize(
+            {
+                "symptoms": [
+                    "皮肤水疱伴瘙痒，幼儿园同班小朋友有类似情况",
+                    "平卧加重、前倾缓解的胸痛",
+                    "阴道出血伴下腹痛，停经后早孕",
+                ]
+            },
+            {
+                "裂隙灯检查": {
+                    "status": "abnormal",
+                    "result": {"结论": "虹膜裂隙，钥匙孔样瞳孔"},
+                },
+                "胃镜": {
+                    "status": "abnormal",
+                    "result": {"结论": "食管黏膜溃疡"},
+                },
+                "血清β-hCG": {
+                    "status": "abnormal",
+                    "result": {"β-hCG": "1500 IU/L［参考值：<5］"},
+                },
+                "基因检测": {
+                    "status": "abnormal",
+                    "result": {"核型": "47,XXX"},
+                },
+            },
+        )
+        findings = bundle.findings("positive")
+        self.assertIn("vesicular_rash", findings)
+        self.assertIn("childcare_exposure", findings)
+        self.assertIn("pericarditic_chest_pain", findings)
+        self.assertIn("vaginal_bleeding", findings)
+        self.assertIn("early_pregnancy", findings)
+        self.assertIn("hcg_positive", findings)
+        self.assertIn("iris_coloboma", findings)
+        self.assertIn("esophageal_ulcer", findings)
+        self.assertIn("triple_x_karyotype", findings)
+
+    def test_stage2_seed53_findings_are_structured(self):
+        bundle = self.normalizer.normalize(
+            {
+                "symptoms": [
+                    "看近模糊，阅读困难，需要老花镜",
+                    "张口后不能闭口，耳前区疼痛",
+                    "外阴瘙痒伴黄绿色泡沫样分泌物",
+                    "脐部流液伴下腹正中包块",
+                    "农村接触后皮损结痂流黄水，腹股沟淋巴结肿大",
+                ]
+            },
+            {
+                "染色体核型分析": {
+                    "status": "abnormal",
+                    "result": {"结论": "46,XX/46,XY嵌合，提示性别发育异常"},
+                },
+                "组织病理学检查": {
+                    "status": "abnormal",
+                    "result": {"结论": "可见卵巢和睾丸组织"},
+                },
+                "体格检查": {
+                    "status": "abnormal",
+                    "result": {"外阴": "菜花样疣体，考虑HPV相关病变"},
+                },
+            },
+        )
+        findings = bundle.findings("positive")
+        for finding in {
+            "near_vision_difficulty",
+            "age_related_near_blur",
+            "jaw_locked_open",
+            "preauricular_pain",
+            "frothy_vaginal_discharge",
+            "vaginal_pruritus",
+            "umbilical_discharge",
+            "umbilical_mass",
+            "rural_child_contact",
+            "crusted_exudative_skin_ulcer",
+            "regional_lymphadenopathy",
+            "sex_development_disorder",
+            "karyotype_mosaic",
+            "ovotesticular_tissue",
+            "anogenital_warts",
+            "cauliflower_lesions",
+        }:
+            self.assertIn(finding, findings)
+
+    def test_interpreter_maps_patient_language_to_clinical_findings(self):
+        bundle = self.normalizer.normalize(
+            {
+                "symptoms": [
+                    "\u8d70\u4e24\u6b65\u5c31\u5598",
+                    "\u996d\u540e\u6076\u5fc3",
+                    "\u65e9\u6668\u8d77\u5e8a\u773c\u775b\u80bf",
+                    "\u559d\u5f88\u591a\u6c34",
+                    "\u70ed\u5e26\u5730\u533a\u751f\u6d3b\u540e\u51fa\u73b0\u6df1\u90e8\u6e83\u75a1\u5e76\u7ed3\u75c2",
+                    "\u5c40\u90e8\u9aa8\u819c\u708e",
+                ],
+                "history": "\u519c\u6751\u73af\u5883\u66b4\u9732",
+            },
+            {},
+        )
+        findings = bundle.findings("positive")
+        for finding in {
+            "dyspnea_on_exertion",
+            "exercise_intolerance",
+            "postprandial_nausea",
+            "periorbital_edema",
+            "fluid_retention_pattern",
+            "polydipsia",
+            "tropical_exposure",
+            "deep_skin_ulcer",
+            "crusted_skin_lesion",
+            "periostitis",
+            "treponemal_skin_lesion",
+            "cardiopulmonary_exertional_pattern",
+        }:
+            self.assertIn(finding, findings)
+
+    def test_normal_otoscopy_does_not_become_tympanitis(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "耳镜检查": {
+                    "status": "normal",
+                    "result": {"结论": "外耳道清洁，鼓膜完整且活动良好"},
+                }
+            },
+        )
+        findings = bundle.findings("positive")
+        self.assertNotIn("acute_tympanitis", findings)
+        self.assertNotIn("tympanic_membrane_inflammation", findings)
+        self.assertNotIn("tympanic_bulla", findings)
+
+    def test_dre_source_with_pressure_pain_becomes_prostate_tenderness(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "直肠指检（DRE）": {
+                    "status": "abnormal",
+                    "result": {"结论": "压痛明显"},
+                }
+            },
+        )
+        self.assertIn("prostate_tenderness", bundle.findings("positive"))
 
     def test_short_mr_alias_does_not_match_mri(self):
         bundle = self.normalizer.normalize(

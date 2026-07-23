@@ -115,6 +115,11 @@ _ADVANCED_CARDIAC_EXAMS = {
     "心导管检查",
 }
 
+_STRICT_COMPANION_EXAM_PATHS = {
+    frozenset({"肺不张", "支气管肺炎"}),
+    frozenset({"右位心", "室间隔缺损（VSD）"}),
+}
+
 _STRONG_VERIFICATION_EXAMS = {
     "低镁血症": [
         "综合代谢面板（CMP）",
@@ -154,15 +159,49 @@ _STRONG_VERIFICATION_EXAMS = {
         "痰培养",
         "抗菌药物敏感性试验（AST）",
     ],
+    "二度房室传导阻滞": [
+        "体格检查",
+        "心电图（ECG）",
+        "动态心电图（Holter）",
+    ],
+    "克里格勒-纳贾尔综合征": [
+        "肝功能检查（LFTs）",
+        "凝血功能全套",
+        "腹部超声",
+        "基因检测",
+    ],
+    "慢性鼻咽炎": [
+        "鼻咽镜检查",
+        "脱落细胞学检查",
+    ],
+    "小耳畸形": [
+        "听性脑干反应（ABR）",
+        "颞骨CT扫描（颞骨CT）",
+        "基因检测",
+    ],
+    "急性细菌性前列腺炎": [
+        "直肠指检（DRE）",
+        "尿液分析（UA）",
+        "尿培养",
+        "全血细胞计数（CBC）",
+        "抗菌药物敏感性试验（AST）",
+        "前列腺超声",
+    ],
 }
 
 
 class ExamStrategyAgent:
     """轻量检查策略角色，不调用外部服务，只做本地规则增强。"""
 
-    def __init__(self, knowledge: KnowledgeBase, max_new_items: int = 10):
+    def __init__(
+        self,
+        knowledge: KnowledgeBase,
+        max_new_items: int = 10,
+        discriminating_exam_max_items: int = 4,
+    ):
         self.knowledge = knowledge
         self.max_new_items = max_new_items
+        self.discriminating_exam_max_items = discriminating_exam_max_items
 
     def recommend(
         self,
@@ -170,6 +209,7 @@ class ExamStrategyAgent:
         candidate_diseases: Optional[List[Any]] = None,
         proposed_items: Optional[List[str]] = None,
         existing_results: Optional[Dict[str, Any]] = None,
+        judge_decision: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """返回本轮建议检查项。
 
@@ -181,6 +221,117 @@ class ExamStrategyAgent:
         existing_set = set(existing_results.keys()) | set(existing_valid)
 
         proposed_valid, invalid_items = self.knowledge.normalize_examinations(proposed_items or [])
+        judge_payload = self._judge_payload(judge_decision)
+        differential_plan = self._differential_driven_plan(
+            collected_info=collected_info,
+            candidate_diseases=candidate_diseases,
+            proposed_items=proposed_valid,
+            existing_results=existing_results,
+            judge_decision=judge_decision,
+        )
+        if differential_plan:
+            items = differential_plan["items"]
+            considered = list(
+                dict.fromkeys(proposed_valid + differential_plan["candidate_exam_pool"])
+            )
+            blocked_items = self._blocked_exam_items(
+                considered,
+                allowed=items,
+                existing_results=existing_results,
+            )
+            return {
+                "items": items,
+                "strong_verification_items": [],
+                "required_items": [],
+                "red_flag_items": [],
+                "evidence_driven_items": items,
+                "information_gain": differential_plan["information_gain"],
+                "exam_authorization_details": differential_plan.get(
+                    "exam_authorization_details",
+                    [],
+                ),
+                "added_required": [],
+                "invalid_items": invalid_items,
+                "strict_diagnosis_driven": False,
+                "differential_driven": True,
+                "primary_diagnosis": differential_plan["primary_diagnosis"],
+                "differential_candidates": differential_plan["differential_candidates"],
+                "discriminating_items": items,
+                "blocked_items": blocked_items,
+                "clinical_context": self.knowledge.build_clinical_context(
+                    symptoms=symptoms,
+                    candidate_diseases=differential_plan["differential_candidates"],
+                ),
+            }
+        if judge_payload and judge_payload.get("needs_discriminating_exams"):
+            blocked_items = self._blocked_exam_items(
+                proposed_valid,
+                allowed=[],
+                existing_results=existing_results,
+            )
+            return {
+                "items": [],
+                "strong_verification_items": [],
+                "required_items": [],
+                "red_flag_items": [],
+                "evidence_driven_items": [],
+                "information_gain": {},
+                "exam_authorization_details": [],
+                "added_required": [],
+                "invalid_items": invalid_items,
+                "strict_diagnosis_driven": False,
+                "differential_driven": False,
+                "primary_diagnosis": str(
+                    judge_payload.get("provisional_primary")
+                    or judge_payload.get("primary")
+                    or judge_payload.get("judge_primary")
+                    or ""
+                ),
+                "differential_candidates": list(
+                    judge_payload.get("differential_candidates") or []
+                ),
+                "discriminating_items": [],
+                "blocked_items": blocked_items,
+                "clinical_context": self.knowledge.build_clinical_context(
+                    symptoms=symptoms,
+                    candidate_diseases=judge_payload.get("differential_candidates") or [],
+                ),
+            }
+        if judge_payload and str(judge_payload.get("primary_status") or "") != "locked":
+            blocked_items = self._blocked_exam_items(
+                proposed_valid,
+                allowed=[],
+                existing_results=existing_results,
+            )
+            return {
+                "items": [],
+                "strong_verification_items": [],
+                "required_items": [],
+                "red_flag_items": [],
+                "evidence_driven_items": [],
+                "information_gain": {},
+                "exam_authorization_details": [],
+                "added_required": [],
+                "invalid_items": invalid_items,
+                "strict_diagnosis_driven": False,
+                "differential_driven": False,
+                "primary_diagnosis": str(
+                    judge_payload.get("provisional_primary")
+                    or judge_payload.get("primary")
+                    or judge_payload.get("judge_primary")
+                    or ""
+                ),
+                "differential_candidates": list(
+                    judge_payload.get("differential_candidates") or []
+                ),
+                "discriminating_items": [],
+                "blocked_items": blocked_items,
+                "clinical_context": self.knowledge.build_clinical_context(
+                    symptoms=symptoms,
+                    candidate_diseases=judge_payload.get("differential_candidates") or [],
+                ),
+            }
+
         strong_verification_items = self._strong_verification_items(
             collected_info=collected_info,
             candidate_diseases=candidate_diseases,
@@ -198,9 +349,112 @@ class ExamStrategyAgent:
         )
         red_flag_items = self._scenario_items(collected_info, candidate_diseases)
         evidence_driven_items = list(dict.fromkeys(red_flag_items + ranked_items))
+        priority_proposed = self._priority_proposed_items(
+            proposed_valid,
+            collected_info=collected_info,
+            candidate_diseases=candidate_diseases,
+        )
+        remaining_proposed = [
+            item for item in proposed_valid if item not in set(priority_proposed)
+        ]
+        strict_plan = self._strict_authorized_exam_plan(
+            collected_info=collected_info,
+            candidate_diseases=candidate_diseases,
+            proposed_items=proposed_items,
+        )
+        if strict_plan:
+            merged = self.prepare_order_items(
+                strict_plan["items"],
+                collected_info=collected_info,
+                candidate_diseases=[strict_plan["primary_diagnosis"]],
+                existing_results=existing_results,
+                max_items=strict_plan["max_items"],
+                add_strong_verification=False,
+            )
+            considered = list(
+                dict.fromkeys(
+                    proposed_valid
+                    + priority_proposed
+                    + evidence_driven_items
+                    + required_items
+                    + remaining_proposed
+                )
+            )
+            blocked_items = self._blocked_exam_items(
+                considered,
+                allowed=merged,
+                existing_results=existing_results,
+            )
+            return {
+                "items": merged,
+                "strong_verification_items": [
+                    item for item in strict_plan["strong_items"] if item not in existing_set
+                ],
+                "required_items": required_items,
+                "red_flag_items": red_flag_items,
+                "evidence_driven_items": evidence_driven_items,
+                "information_gain": information_gain,
+                "added_required": [item for item in required_items if item not in proposed_valid],
+                "invalid_items": invalid_items,
+                "strict_diagnosis_driven": True,
+                "differential_driven": False,
+                "primary_diagnosis": strict_plan["primary_diagnosis"],
+                "differential_candidates": [],
+                "discriminating_items": [],
+                "blocked_items": blocked_items,
+                "clinical_context": self.knowledge.build_clinical_context(
+                    symptoms=symptoms,
+                    candidate_diseases=[strict_plan["primary_diagnosis"]],
+                ),
+            }
+        if judge_payload:
+            blocked_items = self._blocked_exam_items(
+                list(
+                    dict.fromkeys(
+                        proposed_valid
+                        + priority_proposed
+                        + evidence_driven_items
+                        + required_items
+                        + remaining_proposed
+                    )
+                ),
+                allowed=[],
+                existing_results=existing_results,
+            )
+            return {
+                "items": [],
+                "strong_verification_items": [],
+                "required_items": [],
+                "red_flag_items": [],
+                "evidence_driven_items": [],
+                "information_gain": information_gain,
+                "exam_authorization_details": [],
+                "added_required": [],
+                "invalid_items": invalid_items,
+                "strict_diagnosis_driven": False,
+                "differential_driven": False,
+                "primary_diagnosis": str(
+                    judge_payload.get("primary") or judge_payload.get("judge_primary") or ""
+                ),
+                "differential_candidates": list(
+                    judge_payload.get("differential_candidates") or []
+                ),
+                "discriminating_items": [],
+                "blocked_items": blocked_items,
+                "clinical_context": self.knowledge.build_clinical_context(
+                    symptoms=symptoms,
+                    candidate_diseases=judge_payload.get("differential_candidates") or [],
+                ),
+            }
 
         merged: List[str] = []
-        for item in strong_verification_items + evidence_driven_items + required_items + proposed_valid:
+        for item in (
+            strong_verification_items
+            + priority_proposed
+            + evidence_driven_items
+            + required_items
+            + remaining_proposed
+        ):
             if item and item not in merged:
                 merged.append(item)
         merged = self.prepare_order_items(
@@ -223,11 +477,378 @@ class ExamStrategyAgent:
             "information_gain": information_gain,
             "added_required": [item for item in required_items if item not in proposed_valid],
             "invalid_items": invalid_items,
+            "strict_diagnosis_driven": False,
+            "differential_driven": False,
+            "primary_diagnosis": "",
+            "differential_candidates": [],
+            "discriminating_items": [],
+            "blocked_items": [],
             "clinical_context": self.knowledge.build_clinical_context(
                 symptoms=symptoms,
                 candidate_diseases=candidate_diseases,
             ),
         }
+
+    def _differential_driven_plan(
+        self,
+        collected_info: Dict[str, Any],
+        candidate_diseases: Optional[List[Any]],
+        proposed_items: List[str],
+        existing_results: Dict[str, Any],
+        judge_decision: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        payload = self._judge_payload(judge_decision)
+        if not payload:
+            return {}
+        raw_discriminating = [
+            str(item).strip()
+            for item in payload.get("discriminating_exams", []) or []
+            if str(item).strip()
+        ]
+        if not raw_discriminating:
+            return {}
+        differential_candidates = [
+            self.knowledge.normalize_diagnosis(str(item)) or str(item)
+            for item in (
+                payload.get("differential_candidates")
+                or payload.get("evidence_gap_targets")
+                or candidate_diseases
+                or []
+            )
+            if str(item).strip()
+        ]
+        differential_candidates = list(dict.fromkeys(differential_candidates))[:5]
+        normalized, _ = self.knowledge.normalize_examinations(raw_discriminating)
+        if not normalized:
+            return {}
+        _ranked, information_gain = self._rank_by_information_gain(
+            candidate_diseases=differential_candidates or candidate_diseases or [],
+            symptoms=(collected_info or {}).get("symptoms", []),
+            proposed_items=list(dict.fromkeys(normalized + proposed_items)),
+        )
+        high_value_proposed = [
+            item
+            for item in proposed_items
+            if information_gain.get(item, 0.0) >= 0.35
+        ]
+        if payload.get("needs_discriminating_exams"):
+            high_value_proposed = []
+            ordered = list(dict.fromkeys(normalized))
+        else:
+            ordered = list(dict.fromkeys(high_value_proposed + normalized))
+        items = self.prepare_order_items(
+            list(dict.fromkeys(ordered)),
+            collected_info=collected_info,
+            candidate_diseases=differential_candidates or candidate_diseases,
+            existing_results=existing_results,
+            max_items=self.discriminating_exam_max_items,
+            add_strong_verification=False,
+        )
+        if not items:
+            return {}
+        target_findings = [
+            str(item).strip()
+            for item in payload.get("discriminating_findings", []) or []
+            if str(item).strip()
+        ]
+        authorization_details = [
+            {
+                "exam": item,
+                "exam_source": "judge_discriminating_exam",
+                "target_candidates": list(differential_candidates),
+                "target_findings": list(target_findings),
+                "information_gain": information_gain.get(item, 0.0),
+                "allowed_reason": (
+                    "needs_discriminating_exams"
+                    if payload.get("needs_discriminating_exams")
+                    else "judge_discriminating_exam"
+                ),
+                "blocked_reason": "",
+            }
+            for item in items
+        ]
+        return {
+            "items": items,
+            "information_gain": information_gain,
+            "differential_candidates": differential_candidates,
+            "primary_diagnosis": str(payload.get("primary") or payload.get("judge_primary") or ""),
+            "candidate_exam_pool": normalized,
+            "exam_authorization_details": authorization_details,
+        }
+
+    @staticmethod
+    def _judge_payload(judge_decision: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not judge_decision:
+            return {}
+        if isinstance(judge_decision, dict):
+            return judge_decision
+        if hasattr(judge_decision, "to_dict"):
+            return judge_decision.to_dict()
+        return {
+            key: getattr(judge_decision, key)
+            for key in (
+                "primary",
+                "judge_primary",
+                "primary_status",
+                "needs_discriminating_exams",
+                "provisional_primary",
+                "locked_primary",
+                "differential_candidates",
+                "evidence_gap_targets",
+                "discriminating_exams",
+            )
+            if hasattr(judge_decision, key)
+        }
+
+    def _strict_authorized_exam_plan(
+        self,
+        collected_info: Dict[str, Any],
+        candidate_diseases: Optional[List[Any]] = None,
+        proposed_items: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        primary = self._strict_primary_diagnosis(
+            collected_info=collected_info,
+            candidate_diseases=candidate_diseases,
+        )
+        if not primary:
+            return {}
+        strong_items = self._strong_verification_items_for_disease(primary)
+        if not strong_items:
+            return {}
+        if self._has_advanced_cardiac_signal(collected_info, candidate_diseases):
+            proposed_valid, _ = self.knowledge.normalize_examinations(proposed_items or [])
+            for item in proposed_valid:
+                if item in _ADVANCED_CARDIAC_EXAMS and item not in strong_items:
+                    strong_items.append(item)
+        for companion in self._explicit_candidate_names(candidate_diseases):
+            if companion == primary:
+                continue
+            if not self._is_strict_exam_companion(primary, companion):
+                continue
+            for item in self._strong_verification_items_for_disease(companion):
+                if item and item not in strong_items:
+                    strong_items.append(item)
+        required_items = self.knowledge.get_required_exams(
+            candidate_diseases=[primary],
+            symptoms=(collected_info or {}).get("symptoms", []),
+            include_optional=False,
+        )
+        items = list(dict.fromkeys(strong_items + required_items))
+        max_items = min(self.max_new_items, max(1, len(strong_items)))
+        return {
+            "primary_diagnosis": primary,
+            "items": items,
+            "strong_items": strong_items,
+            "max_items": max_items,
+        }
+
+    def _strict_primary_diagnosis(
+        self,
+        collected_info: Dict[str, Any],
+        candidate_diseases: Optional[List[Any]] = None,
+    ) -> str:
+        raw_by_name = self._candidate_items_by_name(candidate_diseases)
+        explicit_names = list(raw_by_name)
+        for name in explicit_names:
+            if self._strong_verification_items_for_disease(name):
+                if not self._candidate_supported_by_context(
+                    name,
+                    collected_info,
+                    len(explicit_names),
+                    raw_by_name.get(name),
+                ):
+                    continue
+                return name
+        profiles = self.knowledge.recall_disease_profiles(
+            symptoms=(collected_info or {}).get("symptoms", []),
+            candidate_diseases=explicit_names,
+            top_k=3,
+        )
+        for profile in profiles:
+            name = str(profile.get("name") or "")
+            try:
+                hit_score = float(profile.get("hit_score", 0) or 0)
+            except (TypeError, ValueError):
+                hit_score = 0.0
+            if hit_score < 2:
+                continue
+            if self._strong_verification_items_for_disease(name):
+                return name
+        return ""
+
+    def _candidate_supported_by_context(
+        self,
+        disease: str,
+        collected_info: Dict[str, Any],
+        candidate_count: int,
+        candidate_item: Optional[Any] = None,
+    ) -> bool:
+        if self._candidate_has_objective_support(candidate_item):
+            return True
+        profile = self.knowledge.get_disease_profile(disease) or {}
+        text = self._case_text_without_candidates(collected_info)
+        if not text.strip():
+            return candidate_count <= 1
+        if disease and disease in text:
+            return True
+        for alias in profile.get("aliases", []) or []:
+            alias_text = str(alias).strip()
+            if alias_text and alias_text in text:
+                return True
+        hit_count = 0
+        for term in self._profile_context_terms(profile):
+            if not term:
+                continue
+            if term in text or (len(term) >= 3 and any(term in part or part in term for part in text.split())):
+                hit_count += 1
+            if hit_count >= 2:
+                return True
+        return candidate_count <= 1 and hit_count >= 1
+
+    @staticmethod
+    def _candidate_has_objective_support(candidate_item: Optional[Any]) -> bool:
+        if not candidate_item:
+            return False
+        if not isinstance(candidate_item, dict):
+            required = getattr(candidate_item, "required_met", False)
+            matched = getattr(candidate_item, "matched_evidence", []) or []
+            score = float(getattr(candidate_item, "coverage_score", 0.0) or 0.0)
+        else:
+            required = bool(candidate_item.get("required_met", False))
+            matched = candidate_item.get("matched_evidence", []) or []
+            try:
+                score = float(
+                    candidate_item.get("coverage_score")
+                    or candidate_item.get("explanatory_coverage")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                score = 0.0
+        if required or score >= 0.45:
+            return True
+        for item in matched:
+            finding = str(item or "")
+            if finding and not finding.startswith("symptom:") and not finding.startswith("field:"):
+                return True
+        return False
+
+    @classmethod
+    def _case_text_without_candidates(cls, collected_info: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for key in (
+            "chief_complaint",
+            "present_illness",
+            "past_history",
+            "personal_history",
+            "physical_signs",
+            "raw_responses",
+            "question_focus",
+        ):
+            value = (collected_info or {}).get(key)
+            if value:
+                parts.append(str(value))
+        for symptom in (collected_info or {}).get("symptoms", []) or []:
+            parts.append(str(symptom))
+        return " ".join(parts)
+
+    @classmethod
+    def _profile_context_terms(cls, profile: Dict[str, Any]) -> List[str]:
+        terms: List[str] = []
+        for field_name in (
+            "common_symptoms",
+            "red_flags",
+            "hallmark_findings",
+            "discriminating_features",
+        ):
+            for item in profile.get(field_name, []) or []:
+                for term in cls._extract_profile_terms(item):
+                    if term and term not in terms:
+                        terms.append(term)
+        return terms
+
+    @classmethod
+    def _extract_profile_terms(cls, item: Any) -> List[str]:
+        if isinstance(item, str):
+            return [item.strip()] if item.strip() else []
+        if isinstance(item, dict):
+            terms: List[str] = []
+            for key in ("terms", "keywords", "term"):
+                value = item.get(key)
+                if isinstance(value, list):
+                    terms.extend(str(part).strip() for part in value if str(part).strip())
+                elif value:
+                    terms.append(str(value).strip())
+            return [term for term in terms if term]
+        if isinstance(item, list):
+            terms: List[str] = []
+            for child in item:
+                terms.extend(cls._extract_profile_terms(child))
+            return terms
+        return []
+
+    def _candidate_items_by_name(
+        self,
+        candidate_diseases: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for item in candidate_diseases or []:
+            name = self.knowledge._candidate_name(item)
+            if not name and hasattr(item, "diagnosis"):
+                name = str(getattr(item, "diagnosis") or "")
+            if not name:
+                continue
+            standard = self.knowledge.normalize_diagnosis(name) or name
+            result.setdefault(standard, item)
+        return result
+
+    def _explicit_candidate_names(
+        self,
+        candidate_diseases: Optional[List[Any]] = None,
+    ) -> List[str]:
+        names: List[str] = []
+        for item in candidate_diseases or []:
+            name = self.knowledge._candidate_name(item)
+            if not name and hasattr(item, "diagnosis"):
+                name = str(getattr(item, "diagnosis") or "")
+            if not name:
+                continue
+            standard = self.knowledge.normalize_diagnosis(name) or name
+            if standard not in names:
+                names.append(standard)
+        return names
+
+    def _strong_verification_items_for_disease(self, disease: str) -> List[str]:
+        standard = self.knowledge.normalize_diagnosis(disease) or disease
+        profile = self.knowledge.get_disease_profile(standard) or {}
+        raw_items = (
+            list(profile.get("strong_verification_exams") or [])
+            or list(_STRONG_VERIFICATION_EXAMS.get(standard, []) or [])
+        )
+        normalized, _ = self.knowledge.normalize_examinations(raw_items)
+        return list(dict.fromkeys(normalized))
+
+    @staticmethod
+    def _is_strict_exam_companion(primary: str, companion: str) -> bool:
+        return frozenset({primary, companion}) in _STRICT_COMPANION_EXAM_PATHS
+
+    def _blocked_exam_items(
+        self,
+        items: List[str],
+        allowed: List[str],
+        existing_results: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        existing_valid, _ = self.knowledge.normalize_examinations(
+            list((existing_results or {}).keys())
+        )
+        existing_set = set((existing_results or {}).keys()) | set(existing_valid)
+        allowed_set = set(allowed or [])
+        blocked: List[str] = []
+        for item in items or []:
+            if not item or item in existing_set or item in allowed_set:
+                continue
+            if item not in blocked:
+                blocked.append(item)
+        return blocked
 
     def prepare_order_items(
         self,
@@ -254,6 +875,20 @@ class ExamStrategyAgent:
             if item and item not in merged:
                 merged.append(item)
 
+        if add_strong_verification:
+            strict_plan = self._strict_authorized_exam_plan(
+                collected_info=collected_info,
+                candidate_diseases=candidate_diseases,
+                proposed_items=items,
+            )
+            if strict_plan:
+                allowed = set(strict_plan["items"])
+                merged = [item for item in merged if item in allowed]
+                if not merged:
+                    merged = list(strict_plan["items"])
+                if max_items is None:
+                    max_items = strict_plan["max_items"]
+
         merged = self._filter_contextual_items(
             merged,
             collected_info=collected_info,
@@ -273,11 +908,16 @@ class ExamStrategyAgent:
         proposed_items: Optional[List[str]] = None,
     ) -> List[str]:
         diseases: List[str] = []
-        for item in candidate_diseases or []:
-            name = self.knowledge._candidate_name(item)
-            if not name:
+        raw_by_name = self._candidate_items_by_name(candidate_diseases)
+        explicit_names = list(raw_by_name)
+        for standard in explicit_names:
+            if not self._candidate_supported_by_context(
+                standard,
+                collected_info,
+                len(explicit_names),
+                raw_by_name.get(standard),
+            ):
                 continue
-            standard = self.knowledge.normalize_diagnosis(name) or name
             if standard not in diseases:
                 diseases.append(standard)
 
@@ -340,7 +980,13 @@ class ExamStrategyAgent:
         relevance: Dict[str, float] = {}
         for rank, disease in enumerate(candidates):
             profile = self.knowledge.get_disease_profile(disease) or {}
-            raw_items = list(profile.get("required_exams") or [])
+            raw_items: List[str] = []
+            for field_name in (
+                "discriminating_exams",
+                "strong_verification_exams",
+                "required_exams",
+            ):
+                raw_items.extend(profile.get(field_name) or [])
             normalized_items, _ = self.knowledge.normalize_examinations(raw_items)
             for exam in normalized_items:
                 exam_support.setdefault(exam, set()).add(disease)
@@ -411,6 +1057,16 @@ class ExamStrategyAgent:
             items.extend(_CONGENITAL_SHUNT_EXAMS)
         normalized, _ = self.knowledge.normalize_examinations(items)
         return normalized
+
+    def _priority_proposed_items(
+        self,
+        proposed_items: List[str],
+        collected_info: Dict[str, Any],
+        candidate_diseases: Optional[List[Any]] = None,
+    ) -> List[str]:
+        if not self._has_advanced_cardiac_signal(collected_info, candidate_diseases):
+            return []
+        return [item for item in proposed_items if item in _ADVANCED_CARDIAC_EXAMS]
 
     def _filter_contextual_items(
         self,

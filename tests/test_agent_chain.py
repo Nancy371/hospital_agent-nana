@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import yaml
 
 from agent.agent import MyDoctorAgent
+from agent.clinical_evidence import EvidenceBundle, Observation
 from agent.diagnosis_critic import CriticDecision
 
 
@@ -180,7 +181,65 @@ class EvidenceGapExamRecommendationTests(unittest.TestCase):
         self.assertIn("抗中性粒细胞胞质抗体（ANCA）谱", exams)
         self.assertIn("MPO-ANCA", exams)
         self.assertIn("尿液分析（UA）", exams)
-        self.assertIn("肾功能", exams)
+        self.assertIn("肾功能检查（RFTs）", exams)
+
+    def test_strict_primary_av_block_stops_low_magnesium_gap_exams(self):
+        agent = self.make_agent()
+        av_block = "\u4e8c\u5ea6\u623f\u5ba4\u4f20\u5bfc\u963b\u6ede"
+        low_magnesium = "\u4f4e\u9541\u8840\u75c7"
+        evidence = EvidenceBundle(
+            [
+                Observation("second_degree_av_block", "test", confidence=0.98),
+                Observation("av_block", "test", confidence=0.96),
+                Observation("bradycardia", "test", confidence=0.9),
+                Observation(f"diagnosis:{av_block}", "test", confidence=0.98),
+                Observation("dizziness", "test", confidence=0.82),
+                Observation("palpitation", "test", confidence=0.82),
+            ]
+        )
+        decision = agent.diagnosis_engine.decide(
+            {
+                "diagnosis_candidates": [
+                    {"name": av_block, "confidence": 0.96},
+                    {"name": low_magnesium, "confidence": 0.9},
+                ]
+            },
+            [],
+            evidence,
+        )
+        self.assertEqual(decision.final_diagnoses[0], av_block)
+        self.assertTrue(agent._strict_primary_exam_stop_active(decision))
+        self.assertEqual(agent._evidence_gap_target_diagnoses(decision), [])
+        self.assertEqual(agent._recommend_evidence_gap_exams(decision, {}, {}), [])
+
+    def test_tricuspid_regurgitation_blocks_cross_system_ohss_gap_exams(self):
+        agent = self.make_agent()
+        primary = "三尖瓣反流"
+        cross_system = "卵巢过度刺激综合征"
+        evidence = EvidenceBundle(
+            [
+                Observation("tricuspid_regurgitation", "test", confidence=0.98),
+                Observation("right_heart_enlargement", "test", confidence=0.92),
+                Observation("leg_edema", "test", confidence=0.9),
+                Observation("dyspnea", "test", confidence=0.88),
+                Observation("abdominal_distension", "test", confidence=0.82),
+                Observation(f"diagnosis:{primary}", "test", confidence=0.98),
+                Observation("ascites", "test", confidence=0.76),
+            ]
+        )
+        decision = agent.diagnosis_engine.decide(
+            {
+                "diagnosis_candidates": [
+                    {"name": primary, "confidence": 0.95},
+                    {"name": cross_system, "confidence": 0.9},
+                ]
+            },
+            [],
+            evidence,
+        )
+        self.assertEqual(decision.final_diagnoses[0], primary)
+        self.assertNotIn(cross_system, agent._evidence_gap_target_diagnoses(decision))
+        self.assertEqual(agent._recommend_evidence_gap_exams(decision, {}, {}), [])
 
     def test_final_name_filter_drops_generic_pneumonia_when_child_selected(self):
         agent = self.make_agent()
@@ -246,6 +305,14 @@ class EvidenceGapExamRecommendationTests(unittest.TestCase):
             ["显微镜下多血管炎", "肺癌"],
             "显微镜下多血管炎最能解释肺肾综合征，肺癌需鉴别。",
         )
+        agent._restore_legacy_candidate_submission(
+            decision,
+            {"diagnosis": ["显微镜下多血管炎"], "diagnosis_candidates": ["肺癌"]},
+            CriticDecision(
+                selected_diagnoses=["肺癌"],
+                reason="肺癌作为鉴别诊断保留，但不作为最终诊断提交。",
+            ),
+        )
         fixed = agent.diagnosis_engine.apply_to_result(
             {"diagnosis": list(decision.final_diagnoses), "reasoning": ""},
             decision,
@@ -256,6 +323,146 @@ class EvidenceGapExamRecommendationTests(unittest.TestCase):
         differential_only = fixed["_diagnosis_decision"]["differential_only_diagnoses"]
         self.assertIn("肺癌", [item["diagnosis"] for item in differential_only])
         self.assertIn("仅鉴别", fixed["reasoning"])
+
+    def test_critic_reason_text_is_not_recovered_as_final_diagnosis(self):
+        agent = self.make_agent()
+        critic = CriticDecision(
+            selected_diagnoses=["显微镜下多血管炎"],
+            reason="显微镜下多血管炎为主诊断，肺癌作为鉴别诊断保留。",
+        )
+        resolved = agent._resolved_critic_names(critic)
+        self.assertEqual(resolved, ["显微镜下多血管炎"])
+
+    def test_critic_cannot_add_weak_coronary_disease_to_valve_heart_failure(self):
+        agent = self.make_agent()
+        evidence = agent.clinical_normalizer.normalize(
+            {
+                "symptoms": ["活动后气短", "夜间阵发性呼吸困难", "不能平卧", "下肢水肿"],
+                "physical_signs": "心尖部收缩期杂音",
+            },
+            {
+                "超声心动图": {
+                    "status": "abnormal",
+                    "result": {"结论": "重度二尖瓣反流，左心室扩大，心力衰竭表现"},
+                },
+                "心肌酶谱": {
+                    "status": "normal",
+                    "result": {"肌钙蛋白": "正常"},
+                },
+            },
+        )
+        decision = agent.diagnosis_engine.decide(
+            {
+                "diagnosis_candidates": [
+                    "二尖瓣反流",
+                    "心力衰竭",
+                    "冠心病",
+                ]
+            },
+            [],
+            evidence,
+        )
+        self.assertIn("二尖瓣反流", decision.final_diagnoses)
+        self.assertIn("心力衰竭", decision.final_diagnoses)
+
+        agent._apply_critic_selection(
+            decision,
+            ["二尖瓣反流", "冠心病", "心力衰竭"],
+            "冠心病作为常见鉴别保留。",
+        )
+
+        self.assertIn("二尖瓣反流", decision.final_diagnoses)
+        self.assertIn("心力衰竭", decision.final_diagnoses)
+        self.assertNotIn("冠心病", decision.final_diagnoses)
+
+    def test_reasoning_inference_promotes_low_magnesium_evidence(self):
+        agent = self.make_agent()
+        evidence = agent.clinical_normalizer.normalize(
+            {"symptoms": ["腹泻", "手足抽筋", "心悸"]},
+            {},
+        )
+        diagnosis_result = {
+            "diagnosis_candidates": [
+                {
+                    "name": "低镁血症",
+                    "supporting_evidence": [
+                        "补查显示24小时尿镁降低，镁负荷保留率升高，提示镁储备不足。",
+                    ],
+                },
+                {"name": "心律失常"},
+            ],
+            "reasoning": "强验证检查提示镁储备不足，低镁血症能统一解释抽筋、心悸与QT异常。",
+        }
+        augmented = agent._augment_evidence_from_reasoning(evidence, diagnosis_result)
+        findings = augmented.findings("positive")
+        self.assertIn("low_urine_magnesium", findings)
+        self.assertIn("magnesium_load_retention_high", findings)
+        self.assertIn("magnesium_depletion", findings)
+
+        decision = agent.diagnosis_engine.decide(diagnosis_result, [], augmented)
+        self.assertEqual(decision.final_diagnoses[0], "低镁血症")
+        self.assertNotIn("心律失常", decision.final_diagnoses)
+
+    def test_reasoning_inference_structures_pulmonary_renal_evidence(self):
+        agent = self.make_agent()
+        evidence = agent.clinical_normalizer.normalize(
+            {"symptoms": ["咳血痰", "尿色变深", "全身酸痛", "脚踝水肿"]},
+            {},
+        )
+        diagnosis_result = {
+            "diagnosis_candidates": [
+                {
+                    "name": "显微镜下多血管炎",
+                    "supporting_evidence": [
+                        "MPO-ANCA阳性，尿色变深提示血尿/蛋白尿，胸部CT提示弥漫性肺泡出血。",
+                    ],
+                },
+                {"name": "肺癌", "supporting_evidence": "肺癌需鉴别。"},
+            ],
+            "reasoning": "显微镜下多血管炎能更好解释肺肾综合征，肺癌仅作为鉴别保留。",
+        }
+        augmented = agent._augment_evidence_from_reasoning(evidence, diagnosis_result)
+        findings = augmented.findings("positive")
+        self.assertIn("mpo_anca_positive", findings)
+        self.assertIn("microscopic_hematuria", findings)
+        self.assertIn("proteinuria", findings)
+        self.assertIn("pulmonary_hemorrhage", findings)
+
+        decision = agent.diagnosis_engine.decide(diagnosis_result, [], augmented)
+        self.assertEqual(decision.final_diagnoses, ["显微镜下多血管炎"])
+
+    def test_legacy_restore_cannot_override_authorized_primary(self):
+        agent = self.make_agent()
+        evidence = agent.clinical_normalizer.normalize(
+            {"symptoms": ["婴儿", "黄疸", "巩膜黄染", "嗜睡", "家族遗传病史"]},
+            {
+                "肝功能检查（LFTs）": {
+                    "status": "abnormal",
+                    "result": {
+                        "总胆红素": "380 umol/L",
+                        "间接胆红素": "360 umol/L",
+                    },
+                },
+                "基因检测": {
+                    "status": "abnormal",
+                    "result": {"结论": "UGT1A1 双等位致病变异"},
+                },
+            },
+        )
+        decision = agent.diagnosis_engine.decide(
+            {"diagnosis_candidates": ["肺炎", "克里格勒-纳贾尔综合征"]},
+            [],
+            evidence,
+        )
+        self.assertEqual(decision.final_diagnoses, ["克里格勒-纳贾尔综合征"])
+
+        agent._restore_legacy_candidate_submission(
+            decision,
+            {"diagnosis": ["肺炎"], "diagnosis_candidates": ["肺炎"]},
+            CriticDecision(selected_diagnoses=["肺炎"], reason="legacy primary"),
+        )
+
+        self.assertEqual(decision.final_diagnoses, ["克里格勒-纳贾尔综合征"])
 
 
 if __name__ == "__main__":

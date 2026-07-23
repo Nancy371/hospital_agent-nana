@@ -214,9 +214,32 @@ class OpenWorldDiagnosisResolver:
         best = [item for item in matches if item[0] == longest]
         canonicals = {item[1] for item in best}
         if len(canonicals) > 1:
-            return None
+            specific = self._choose_specific_alias_match([item[1] for item in best])
+            if not specific:
+                return None
+            return specific, min(0.93, 0.70 + longest / max(1, len(query)) * 0.35)
         confidence = min(0.93, 0.70 + longest / max(1, len(query)) * 0.35)
         return best[0][1], confidence
+
+    def _choose_specific_alias_match(self, names: Sequence[str]) -> Optional[str]:
+        unique = list(dict.fromkeys(name for name in names if name))
+        if len(unique) <= 1:
+            return unique[0] if unique else None
+        entries = {name: self.knowledge.get(name) for name in unique}
+        for name, entry in entries.items():
+            parent = str(entry.get("parent_diagnosis") or "")
+            if parent and parent in unique:
+                return name
+        ranked = sorted(
+            unique,
+            key=lambda item: float(entries[item].get("specificity", 0.5) or 0.5),
+            reverse=True,
+        )
+        best_specificity = float(entries[ranked[0]].get("specificity", 0.5) or 0.5)
+        second_specificity = float(entries[ranked[1]].get("specificity", 0.5) or 0.5)
+        if best_specificity >= second_specificity + 0.04:
+            return ranked[0]
+        return None
 
     def _rank_terms(self, clean: str) -> List[Tuple[float, str, str]]:
         query = clean.lower()

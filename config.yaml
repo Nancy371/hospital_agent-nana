@@ -126,6 +126,12 @@ diagnosis:
   margin_threshold: 0.12
   max_final_diagnoses: 3
   candidate_limit: 12
+  judge_top_k: 5
+  filtered_pool_max_size: 8
+  differential_score_margin: 0.12
+  pairwise_close_margin: 0.18
+  discriminating_exam_max_items: 4
+  dynamic_rerank_after_discriminating_exams: true
   etiology_priority_bonus: 0.08
   etiology_close_margin: 0.12
   max_evidence_gap_targets: 2

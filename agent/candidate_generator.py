@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .clinical_evidence import EvidenceBundle, EvidenceGraph, Observation
+from .disease_retrieval import DiseaseRetriever
 
 
 @dataclass
@@ -26,6 +27,7 @@ class CandidatePool:
     items: List[CandidateSource] = field(default_factory=list)
     name_resolutions: List[Dict[str, Any]] = field(default_factory=list)
     unresolved_candidates: List[str] = field(default_factory=list)
+    disease_categories: List[Dict[str, Any]] = field(default_factory=list)
 
     def add(
         self,
@@ -68,6 +70,7 @@ class CandidatePool:
             "items": [item.to_dict() for item in self.items],
             "name_resolutions": list(self.name_resolutions),
             "unresolved_candidates": list(self.unresolved_candidates),
+            "disease_categories": list(self.disease_categories),
         }
 
 
@@ -77,6 +80,7 @@ class CandidateGenerator:
     def __init__(self, knowledge: Any, resolver: Any):
         self.knowledge = knowledge
         self.resolver = resolver
+        self.disease_retriever = DiseaseRetriever(knowledge, resolver)
 
     def generate(
         self,
@@ -91,6 +95,7 @@ class CandidateGenerator:
         self._from_llm(pool, llm_result or {})
         self._from_rag(pool, rag_chunks or [])
         self._from_memory(pool, memory_hits or [])
+        self._from_disease_retriever(pool, bundle)
         self._from_evidence(pool, bundle)
         return pool
 
@@ -149,6 +154,22 @@ class CandidateGenerator:
                 resolution = self.resolver.resolve(raw)
                 if resolution.canonical_name:
                     pool.add(raw, resolution.canonical_name, "memory", prior=min(0.75, prior))
+
+    def _from_disease_retriever(self, pool: CandidatePool, evidence: EvidenceBundle) -> None:
+        hits, categories = self.disease_retriever.retrieve(evidence, top_k=20)
+        pool.disease_categories = [item.to_dict() for item in categories]
+        for hit in hits:
+            pool.add(
+                hit.diagnosis,
+                hit.diagnosis,
+                "disease_retriever",
+                prior=hit.score,
+                evidence_links=hit.evidence_links,
+                metadata={
+                    "category": hit.category,
+                    **dict(hit.metadata or {}),
+                },
+            )
 
     def _from_evidence(self, pool: CandidatePool, evidence: EvidenceBundle) -> None:
         observations = evidence.observations if evidence else []

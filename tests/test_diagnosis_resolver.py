@@ -31,9 +31,10 @@ class OpenWorldDiagnosisResolverTests(unittest.TestCase):
         self.assertEqual(result.canonical_name, "肺炎")
         self.assertEqual(result.method, "hierarchy")
 
-    def test_complex_congenital_heart_phrase_maps_to_controlled_parent(self):
+    def test_complex_congenital_heart_phrase_maps_to_specific_vsd(self):
         result = self.resolver.resolve("大型室间隔缺损伴艾森门格综合征早期表现")
-        self.assertEqual(result.canonical_name, "先天性心脏病")
+        self.assertEqual(result.canonical_name, "室间隔缺损（VSD）")
+        self.assertEqual(result.parent_name, "先天性心脏病")
         self.assertEqual(result.method, "alias_contains")
 
     def test_fuzzy_typo_maps_only_when_unambiguous(self):

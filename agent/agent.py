@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -33,7 +34,7 @@ from .qc import QualityAgent
 from .treatment_strategy import TreatmentStrategyAgent
 from .structural_diagnosis import StructuralDiagnosisAgent
 from .evidence_engine import EvidenceDiagnosisEngine
-from .clinical_evidence import ClinicalEvidenceNormalizer, EvidenceAgent, EvidenceBundle
+from .clinical_evidence import ClinicalEvidenceNormalizer, EvidenceAgent, EvidenceBundle, Observation
 from .diagnosis_engine import DiagnosisDecisionEngine
 from .diagnosis_critic import DiagnosisCritic
 from .diagnostic_learning import DiagnosticLearningStore
@@ -690,7 +691,13 @@ class MyDoctorAgent(BaseDoctorAgent):
         self.clinical_normalizer = ClinicalEvidenceNormalizer(ref_dir=ref_dir)
         self.evidence_agent = EvidenceAgent(ref_dir=ref_dir, normalizer=self.clinical_normalizer)
         self.diagnosis_engine = DiagnosisDecisionEngine(config=config, ref_dir=ref_dir)
-        self.exam_agent = ExamStrategyAgent(self.knowledge)
+        diagnosis_config = config.get("diagnosis", {}) or {}
+        self.exam_agent = ExamStrategyAgent(
+            self.knowledge,
+            discriminating_exam_max_items=int(
+                diagnosis_config.get("discriminating_exam_max_items", 4) or 4
+            ),
+        )
         self.inquiry_agent = InquiryStrategyAgent(self.knowledge)
         self.quality_agent = QualityAgent(
             self.knowledge,
@@ -709,7 +716,6 @@ class MyDoctorAgent(BaseDoctorAgent):
         )
         self.structural_agent = StructuralDiagnosisAgent()
         self.evidence_engine = EvidenceDiagnosisEngine(ref_dir=ref_dir)
-        diagnosis_config = config.get("diagnosis", {}) or {}
         self.diagnostic_learning = DiagnosticLearningStore(
             path=diagnosis_config.get(
                 "learning_path",
@@ -721,6 +727,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._case_clinical_deadline = 0.0
         self._case_post_submit_reserve_seconds = 0.0
         self._last_diagnosis_audit: Dict[str, Any] = {}
+        self._last_exam_authorization: List[Dict[str, Any]] = []
 
         # 规划器（延迟初始化，因为需要绑定异步方法）
         self._planner: Optional[Planner] = None
@@ -880,6 +887,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             else 0.0
         )
         self._last_diagnosis_audit = {}
+        self._last_exam_authorization = []
         runner = (
             self._execute_fast_path(patient_id)
             if self.fast_mode
@@ -1054,6 +1062,19 @@ class MyDoctorAgent(BaseDoctorAgent):
             proposed_items=proposed_items,
             existing_results=exam_results,
         )
+        if strategy.get("strict_diagnosis_driven") or strategy.get("blocked_items"):
+            self._last_exam_authorization.append(
+                {
+                    "stage": "fast_exam",
+                    "round": 1,
+                    "strict_diagnosis_driven": bool(
+                        strategy.get("strict_diagnosis_driven")
+                    ),
+                    "primary_diagnosis": strategy.get("primary_diagnosis", ""),
+                    "authorized_items": list(strategy.get("items") or []),
+                    "blocked_items": list(strategy.get("blocked_items") or []),
+                }
+            )
         normalized_fast_items, _ = self.knowledge.normalize_examinations(self.fast_exam_items)
         raw_exam_items = []
         for item in list(self.fast_exam_items) + normalized_fast_items + strategy.get("items", []):
@@ -1398,6 +1419,22 @@ class MyDoctorAgent(BaseDoctorAgent):
 
         return updated_info
 
+    def _pre_exam_judge_payload(
+        self,
+        collected_info: Dict[str, Any],
+        exam_results: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            evidence = self.clinical_normalizer.normalize(collected_info, exam_results)
+            decision = self.diagnosis_engine.decide({}, [], evidence)
+            payload = dict(getattr(decision, "judge_decision", None) or {})
+            if payload:
+                payload["stage"] = "pre_exam_judge"
+            return payload
+        except Exception as exc:
+            logger.debug("[Judge] pre-exam judge skipped: %s", exc)
+            return {}
+
     async def _execute_order_examination(
         self,
         patient_id: str,
@@ -1441,6 +1478,13 @@ class MyDoctorAgent(BaseDoctorAgent):
         _cands = None
         if thinking and isinstance(thinking, dict):
             _cands = thinking.get("differential_diagnosis") or thinking.get("candidate_diseases")
+        pre_exam_judge = self._pre_exam_judge_payload(collected_info, exam_results)
+        if pre_exam_judge.get("differential_candidates"):
+            _cands = [
+                str(item).strip()
+                for item in pre_exam_judge.get("differential_candidates") or []
+                if str(item).strip()
+            ]
         try:
             knowledge_context = self.knowledge.build_rag_context(_sym, _cands)
         except Exception:
@@ -1474,6 +1518,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             candidate_diseases=_cands if isinstance(_cands, list) else None,
             proposed_items=exam_items,
             existing_results=exam_results,
+            judge_decision=pre_exam_judge or None,
         )
         if strategy.get("strong_verification_items"):
             logger.info(f"[检查策略] 强验证检查: {strategy['strong_verification_items']}")
@@ -1485,6 +1530,33 @@ class MyDoctorAgent(BaseDoctorAgent):
             logger.info(f"[检查策略] 补齐必查检查: {strategy['added_required']}")
         if strategy.get("invalid_items"):
             logger.info(f"[检查策略] 过滤无效检查项: {strategy['invalid_items']}")
+        if (
+            strategy.get("strict_diagnosis_driven")
+            or strategy.get("differential_driven")
+            or strategy.get("blocked_items")
+        ):
+            self._last_exam_authorization.append(
+                {
+                    "stage": "planner_exam",
+                    "target": target,
+                    "strict_diagnosis_driven": bool(
+                        strategy.get("strict_diagnosis_driven")
+                    ),
+                    "differential_driven": bool(strategy.get("differential_driven")),
+                    "primary_diagnosis": strategy.get("primary_diagnosis", ""),
+                    "differential_candidates": list(
+                        strategy.get("differential_candidates") or []
+                    ),
+                    "discriminating_items": list(
+                        strategy.get("discriminating_items") or []
+                    ),
+                    "authorized_items": list(strategy.get("items") or []),
+                    "blocked_items": list(strategy.get("blocked_items") or []),
+                    "exam_authorization_details": list(
+                        strategy.get("exam_authorization_details") or []
+                    ),
+                }
+            )
         exam_items = self.exam_agent.prepare_order_items(
             strategy.get("items", []),
             collected_info=collected_info,
@@ -1695,6 +1767,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             for item in candidates[:5]
             if isinstance(item, dict) and item.get("diagnosis")
         ]
+        top_twenty = [
+            str(item.get("diagnosis"))
+            for item in candidates[:20]
+            if isinstance(item, dict) and item.get("diagnosis")
+        ]
         expected = _names(detail.get("expected") or report.get("finalDiagnosis"))
         submitted = _names(
             detail.get("submitted")
@@ -1702,6 +1779,313 @@ class MyDoctorAgent(BaseDoctorAgent):
             or final_result.get("diagnosis")
         )
         recall_at_five = all(name in top_five for name in expected) if expected else None
+        recall_at_twenty = all(name in top_twenty for name in expected) if expected else None
+        ranking_accuracy = (
+            bool(expected and top_twenty)
+            and top_twenty[0] in set(expected)
+        ) if expected else None
+        authorized = _names(
+            decision.get("authorized_diagnoses")
+            or decision.get("final_diagnoses")
+            or final_result.get("_authorized_diagnoses")
+        )
+        submission_alignment = (
+            authorized == submitted
+            if authorized or submitted
+            else None
+        )
+        retriever_top1 = str(
+            decision.get("retriever_top1")
+            or (top_twenty[0] if top_twenty else "")
+            or ""
+        )
+        judge_primary = str(
+            decision.get("judge_primary")
+            or (authorized[0] if authorized else "")
+            or ""
+        )
+        submitter_final = _names(
+            decision.get("submitter_final")
+            or decision.get("authorized_diagnoses")
+            or final_result.get("_authorized_diagnoses")
+            or submitted
+        )
+        raw_override = decision.get("decision_override")
+        decision_override_rate = (
+            bool(raw_override)
+            if raw_override is not None
+            else bool(retriever_top1 and judge_primary and retriever_top1 != judge_primary)
+        )
+        required_gap_authorized_diagnoses = _names(
+            decision.get("required_gap_authorized_diagnoses")
+        )
+        judge_payload = decision.get("judge_decision") or {}
+        pairwise_comparisons = list(judge_payload.get("pairwise_comparisons") or [])
+        pool_filter_summary = dict(judge_payload.get("pool_filter_summary") or {})
+        differential_candidates = _names(judge_payload.get("differential_candidates"))
+        discriminating_exams = _names(judge_payload.get("discriminating_exams"))
+        discriminating_findings = _names(judge_payload.get("discriminating_findings"))
+        dynamic_trace = list(judge_payload.get("dynamic_rerank_trace") or [])
+        dynamic_rerank_changed_primary = bool(
+            judge_payload.get("dynamic_rerank_changed_primary")
+            or any(
+                isinstance(item, dict) and item.get("changed_primary")
+                for item in dynamic_trace
+            )
+        )
+        primary_unlock_reason = str(judge_payload.get("primary_unlock_reason") or "")
+        explanation_score_changed_ranking = bool(
+            judge_payload.get("explanation_score_changed_ranking")
+        )
+        gap_state_distribution = dict(judge_payload.get("gap_state_distribution") or {})
+        judge_gap_authorization_rate = bool(required_gap_authorized_diagnoses)
+        judge_primary_accuracy = (
+            bool(expected and judge_primary in set(expected))
+            if expected
+            else None
+        )
+
+        def _priority_expected_names(names: List[str]) -> List[str]:
+            priority: List[str] = []
+            for name in names or []:
+                entry = self.diagnosis_engine.knowledge.get(name)
+                dtype = str(entry.get("diagnosis_type") or "").lower()
+                try:
+                    specificity = float(entry.get("specificity", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    specificity = 0.0
+                if dtype in {"etiology", "metabolic", "structural", "systemic"} or specificity >= 0.85:
+                    priority.append(name)
+            return priority
+
+        priority_expected = _priority_expected_names(expected)
+        etiology_preference = (
+            any(name in set(submitted) for name in priority_expected)
+            if priority_expected
+            else None
+        )
+        unauthorized_exam_count = sum(
+            len(item.get("blocked_items") or [])
+            for item in getattr(self, "_last_exam_authorization", []) or []
+            if isinstance(item, dict)
+        )
+        evidence_payload = audit.get("evidence") or {}
+        observations = [
+            item
+            for item in (evidence_payload.get("observations") or [])
+            if isinstance(item, dict) and item.get("finding")
+        ]
+        positive_findings = {
+            str(item.get("finding"))
+            for item in observations
+            if item.get("polarity", "positive") == "positive"
+        }
+        negative_findings = {
+            str(item.get("finding"))
+            for item in observations
+            if item.get("polarity") == "negative"
+        }
+        diagnostic_findings = {
+            finding
+            for finding in positive_findings
+            if not finding.startswith(("field:", "symptom:"))
+        }
+        finding_extraction_summary = {
+            "observation_count": len(observations),
+            "positive_finding_count": len(positive_findings),
+            "negative_finding_count": len(negative_findings),
+            "diagnostic_finding_count": len(diagnostic_findings),
+            "diagnostic_findings": sorted(diagnostic_findings)[:24],
+        }
+        top_candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+        matched_count = len(top_candidate.get("matched_evidence") or [])
+        gap_count = len(top_candidate.get("required_gaps") or [])
+        if top_candidate:
+            required_evidence_coverage = (
+                1.0
+                if top_candidate.get("required_met")
+                else (
+                    matched_count / max(1, matched_count + gap_count)
+                    if matched_count or gap_count
+                    else 0.0
+                )
+            )
+        else:
+            required_evidence_coverage = None
+        soft_contradiction_count = sum(
+            len(item.get("soft_contradicted_evidence") or [])
+            for item in candidates
+            if isinstance(item, dict)
+        )
+        hard_contradiction_count = sum(
+            len(item.get("hard_contradicted_evidence") or [])
+            for item in candidates
+            if isinstance(item, dict)
+        )
+        exam_authorization_records = list(
+            getattr(self, "_last_exam_authorization", []) or []
+        )
+        exam_authorization_mode = (
+            "differential_driven"
+            if any(
+                isinstance(item, dict) and item.get("differential_driven")
+                for item in exam_authorization_records
+            )
+            else (
+                "strict_diagnosis_driven"
+                if any(
+                    isinstance(item, dict) and item.get("strict_diagnosis_driven")
+                    for item in exam_authorization_records
+                )
+                else ("authorized" if exam_authorization_records else "not_recorded")
+            )
+        )
+        ordered_exam_names = _names(final_result.get("ordered_examinations"))
+        exam_authorization_details = [
+            detail
+            for record in exam_authorization_records
+            if isinstance(record, dict)
+            for detail in (record.get("exam_authorization_details") or [])
+            if isinstance(detail, dict)
+        ]
+        differential_source_items = {
+            str(detail.get("exam") or "")
+            for detail in exam_authorization_details
+            if str(detail.get("exam_source") or "") == "judge_discriminating_exam"
+        }
+        authorized_source_items = {
+            str(detail.get("exam") or "")
+            for detail in exam_authorization_details
+            if str(detail.get("exam") or "")
+        }
+        differential_exam_contribution_rate = (
+            len(set(ordered_exam_names) & differential_source_items)
+            / max(1, len(ordered_exam_names))
+            if ordered_exam_names
+            else None
+        )
+        legacy_exam_package_contribution_rate = (
+            len(set(ordered_exam_names) - authorized_source_items)
+            / max(1, len(ordered_exam_names))
+            if ordered_exam_names and exam_authorization_mode == "differential_driven"
+            else None
+        )
+        differential_exam_precision = (
+            len(set(ordered_exam_names) & set(discriminating_exams))
+            / max(1, len(ordered_exam_names))
+            if ordered_exam_names and discriminating_exams
+            else None
+        )
+        discriminating_exam_recall = (
+            len(set(ordered_exam_names) & set(discriminating_exams))
+            / max(1, len(discriminating_exams))
+            if ordered_exam_names and discriminating_exams
+            else None
+        )
+        exam_information_gain = (
+            round(
+                (
+                    float(differential_exam_precision or 0.0)
+                    + float(discriminating_exam_recall or 0.0)
+                )
+                / 2,
+                4,
+            )
+            if differential_exam_precision is not None
+            or discriminating_exam_recall is not None
+            else None
+        )
+        discriminating_gap_closed_rate = (
+            len(set(diagnostic_findings) & set(discriminating_findings))
+            / max(1, len(discriminating_findings))
+            if discriminating_findings
+            else None
+        )
+        gap_closure_rate = discriminating_gap_closed_rate
+        primary_candidate = next(
+            (
+                item
+                for item in candidates
+                if isinstance(item, dict)
+                and item.get("diagnosis") == judge_primary
+            ),
+            top_candidate,
+        ) or {}
+        explanatory_coverage = (
+            judge_payload.get("explanatory_coverage")
+            if judge_payload.get("explanatory_coverage") is not None
+            else primary_candidate.get(
+                "explanatory_coverage",
+                primary_candidate.get("coverage_score"),
+            )
+        )
+        core_explanatory_coverage = (
+            judge_payload.get("core_explanatory_coverage")
+            if judge_payload.get("core_explanatory_coverage") is not None
+            else primary_candidate.get(
+                "core_explanatory_coverage",
+                (primary_candidate.get("component_scores") or {}).get(
+                    "core_explanatory_coverage"
+                ),
+            )
+        )
+        residual_evidence_score = (
+            judge_payload.get("residual_evidence_score")
+            if judge_payload.get("residual_evidence_score") is not None
+            else primary_candidate.get(
+                "residual_evidence_score",
+                primary_candidate.get("residual_score"),
+            )
+        )
+        residual_core_evidence_count = (
+            judge_payload.get("residual_core_evidence_count")
+            if judge_payload.get("residual_core_evidence_count") is not None
+            else primary_candidate.get(
+                "residual_core_evidence_count",
+                (primary_candidate.get("component_scores") or {}).get(
+                    "residual_core_evidence_count"
+                ),
+            )
+        )
+        expected_set = set(expected)
+        differential_candidate_set = set(differential_candidates)
+        differential_pool_expected_included = (
+            bool(expected_set & differential_candidate_set)
+            if expected_set and differential_candidates
+            else None
+        )
+        differential_pool_precision = (
+            len(expected_set & differential_candidate_set)
+            / max(1, len(differential_candidates))
+            if expected_set and differential_candidates
+            else None
+        )
+        pairwise_noise_rejection_count = pool_filter_summary.get(
+            "pairwise_noise_rejection_count"
+        )
+        cluster_gate_rejection_count = pool_filter_summary.get(
+            "cluster_gate_rejection_count"
+        )
+        core_evidence_coverage = pool_filter_summary.get("core_evidence_coverage")
+        pairwise_relevant = [
+            item
+            for item in pairwise_comparisons
+            if isinstance(item, dict)
+            and (
+                str(item.get("left") or "") in expected_set
+                or str(item.get("right") or "") in expected_set
+            )
+        ]
+        pairwise_judge_accuracy = (
+            sum(
+                1
+                for item in pairwise_relevant
+                if str(item.get("preferred") or "") in expected_set
+            )
+            / max(1, len(pairwise_relevant))
+            if expected_set and pairwise_relevant
+            else None
+        )
         critic = audit.get("critic") or {}
         elapsed = audit.get(
             "training_elapsed_seconds",
@@ -1742,8 +2126,72 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "treatmentOverallScore", "treatment_overall_score"
                 ),
                 "treatment_safety": _metric("treatmentSafety", "treatment_safety"),
+                "candidate_recall_at_20": recall_at_twenty,
                 "candidate_recall_at_5": recall_at_five,
+                "ranking_accuracy": ranking_accuracy,
+                "submission_alignment": submission_alignment,
+                "submission_override_count": int(
+                    decision.get("submission_override_count", 0) or 0
+                ) if isinstance(decision, dict) else 0,
+                "etiology_preference": etiology_preference,
+                "decision_override_rate": decision_override_rate,
+                "judge_gap_authorization_rate": judge_gap_authorization_rate,
+                "required_gap_authorized_count": len(
+                    required_gap_authorized_diagnoses
+                ),
+                "judge_primary_accuracy": judge_primary_accuracy,
+                "explanatory_coverage": explanatory_coverage,
+                "core_explanatory_coverage": core_explanatory_coverage,
+                "residual_evidence_score": residual_evidence_score,
+                "residual_core_evidence_count": residual_core_evidence_count,
+                "differential_exam_precision": differential_exam_precision,
+                "discriminating_exam_recall": discriminating_exam_recall,
+                "exam_information_gain": exam_information_gain,
+                "discriminating_gap_closed_rate": discriminating_gap_closed_rate,
+                "gap_closure_rate": gap_closure_rate,
+                "dynamic_rerank_changed_primary": dynamic_rerank_changed_primary,
+                "explanation_score_changed_ranking_rate": explanation_score_changed_ranking,
+                "primary_unlock_rate": bool(primary_unlock_reason),
+                "legacy_exam_package_contribution_rate": legacy_exam_package_contribution_rate,
+                "differential_exam_contribution_rate": differential_exam_contribution_rate,
+                "gap_state_satisfied_count": gap_state_distribution.get("satisfied"),
+                "gap_state_actionable_count": gap_state_distribution.get("actionable_gap"),
+                "gap_state_nonblocking_count": gap_state_distribution.get("nonblocking_gap"),
+                "gap_state_unsupported_count": gap_state_distribution.get("unsupported_gap"),
+                "gap_state_hard_blocked_count": (
+                    gap_state_distribution.get("hard_contradiction")
+                    or gap_state_distribution.get("hard_blocked")
+                ),
+                "gap_state_partially_satisfied_count": gap_state_distribution.get(
+                    "partially_satisfied"
+                ),
+                "fallback_to_pre_discrimination_primary": bool(
+                    judge_payload.get("fallback_to_pre_discrimination_primary")
+                ),
+                "pairwise_judge_accuracy": pairwise_judge_accuracy,
+                "differential_pool_precision": differential_pool_precision,
+                "differential_pool_expected_included": differential_pool_expected_included,
+                "pairwise_noise_rejection_count": pairwise_noise_rejection_count,
+                "cluster_gate_rejection_count": cluster_gate_rejection_count,
+                "core_evidence_coverage": core_evidence_coverage,
+                "judge_deferred_primary": bool(
+                    judge_payload.get("needs_discriminating_exams")
+                ),
+                "unauthorized_exam_count": unauthorized_exam_count,
+                "required_evidence_coverage": required_evidence_coverage,
+                "soft_contradiction_count": soft_contradiction_count,
+                "hard_contradiction_count": hard_contradiction_count,
             },
+            "top_candidates": top_twenty,
+            "retriever_top1": retriever_top1,
+            "judge_primary": judge_primary,
+            "judge_primary_status": str(judge_payload.get("primary_status") or ""),
+            "submitter_final": submitter_final,
+            "required_gap_authorized_diagnoses": required_gap_authorized_diagnoses,
+            "authorized_diagnoses": authorized,
+            "blocked_diagnoses": list(decision.get("blocked_diagnoses") or [])
+            if isinstance(decision, dict)
+            else [],
             "audit": {
                 "elapsed_seconds": elapsed,
                 "timed_out": bool(
@@ -1760,6 +2208,45 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "critic_llm_used": bool(critic.get("llm_used", False)),
                 "llm_calls": self._llm_call_count,
                 "llm_calls_by_kind": dict(self._llm_call_by_kind),
+                "exam_authorization": exam_authorization_records,
+                "exam_authorization_mode": exam_authorization_mode,
+                "finding_extraction_summary": finding_extraction_summary,
+                "pairwise_comparison_count": len(pairwise_comparisons),
+                "judge_primary_status": str(judge_payload.get("primary_status") or ""),
+                "needs_discriminating_exams": bool(
+                    judge_payload.get("needs_discriminating_exams")
+                ),
+                "provisional_primary": str(
+                    judge_payload.get("provisional_primary") or ""
+                ),
+                "locked_primary": str(judge_payload.get("locked_primary") or ""),
+                "defer_reason": str(judge_payload.get("defer_reason") or ""),
+                "differential_candidates": differential_candidates,
+                "excluded_from_pairwise": list(
+                    judge_payload.get("excluded_from_pairwise") or []
+                ),
+                "pool_filter_reasons": dict(
+                    judge_payload.get("pool_filter_reasons") or {}
+                ),
+                "cluster_assignments": dict(
+                    judge_payload.get("cluster_assignments") or {}
+                ),
+                "pairwise_allowed_matrix": list(
+                    judge_payload.get("pairwise_allowed_matrix") or []
+                ),
+                "pool_filter_summary": pool_filter_summary,
+                "discriminating_exams": discriminating_exams,
+                "discriminating_findings": discriminating_findings,
+                "primary_unlock_reason": primary_unlock_reason,
+                "explanation_score_changed_ranking": explanation_score_changed_ranking,
+                "gap_state_distribution": gap_state_distribution,
+                "explanatory_coverage": explanatory_coverage,
+                "core_explanatory_coverage": core_explanatory_coverage,
+                "residual_evidence_score": residual_evidence_score,
+                "residual_core_evidence_count": residual_core_evidence_count,
+                "high_value_gap_candidates": _names(
+                    judge_payload.get("high_value_gap_candidates")
+                ),
             },
             "evaluation_error": evaluation_error,
             "reflection_error": reflection_error,
@@ -2032,6 +2519,13 @@ class MyDoctorAgent(BaseDoctorAgent):
             _cands2 = None
             if thinking and isinstance(thinking, dict):
                 _cands2 = thinking.get("differential_diagnosis") or thinking.get("candidate_diseases")
+            pre_exam_judge = self._pre_exam_judge_payload(collected_info, exam_results)
+            if pre_exam_judge.get("differential_candidates"):
+                _cands2 = [
+                    str(item).strip()
+                    for item in pre_exam_judge.get("differential_candidates") or []
+                    if str(item).strip()
+                ]
             try:
                 knowledge_context2 = self.knowledge.build_rag_context(_sym2, _cands2)
             except Exception:
@@ -2066,6 +2560,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 candidate_diseases=_cands2 if isinstance(_cands2, list) else None,
                 proposed_items=exam_items,
                 existing_results=exam_results,
+                judge_decision=pre_exam_judge or None,
             )
             if strategy.get("strong_verification_items"):
                 logger.info(f"[检查策略] 强验证检查: {strategy['strong_verification_items']}")
@@ -2077,6 +2572,33 @@ class MyDoctorAgent(BaseDoctorAgent):
                 logger.info(f"[检查策略] 补齐必查检查: {strategy['added_required']}")
             if strategy.get("invalid_items"):
                 logger.info(f"[检查策略] 过滤无效检查项: {strategy['invalid_items']}")
+            if (
+                strategy.get("strict_diagnosis_driven")
+                or strategy.get("differential_driven")
+                or strategy.get("blocked_items")
+            ):
+                self._last_exam_authorization.append(
+                    {
+                        "stage": "initial_exam",
+                        "round": exam_round + 1,
+                        "strict_diagnosis_driven": bool(
+                            strategy.get("strict_diagnosis_driven")
+                        ),
+                        "differential_driven": bool(strategy.get("differential_driven")),
+                        "primary_diagnosis": strategy.get("primary_diagnosis", ""),
+                        "differential_candidates": list(
+                            strategy.get("differential_candidates") or []
+                        ),
+                        "discriminating_items": list(
+                            strategy.get("discriminating_items") or []
+                        ),
+                        "authorized_items": list(strategy.get("items") or []),
+                        "blocked_items": list(strategy.get("blocked_items") or []),
+                        "exam_authorization_details": list(
+                            strategy.get("exam_authorization_details") or []
+                        ),
+                    }
+                )
             exam_items = self.exam_agent.prepare_order_items(
                 strategy.get("items", []),
                 collected_info=collected_info,
@@ -2170,6 +2692,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                 {"role": "user", "content": "请做出诊断并制定治疗方案，以 JSON 格式输出。"},
             ]
             diagnosis_result = await self._llm_generate_diagnosis(messages)
+            evidence = self._augment_evidence_from_reasoning(evidence, diagnosis_result)
+            evidence_graph = evidence.to_graph()
             llm_resolutions = self.diagnosis_engine.resolve_open_candidates(diagnosis_result)
             llm_candidates = []
             for item in llm_resolutions:
@@ -2200,24 +2724,42 @@ class MyDoctorAgent(BaseDoctorAgent):
             )
             self._apply_critic_selection(decision, critic.selected_diagnoses, critic.reason)
             self._restore_legacy_candidate_submission(decision, diagnosis_result, critic)
+            self.diagnosis_engine.judge_and_submit(decision)
+            pre_corrective_judge = dict(getattr(decision, "judge_decision", None) or {})
+            pre_corrective_primary = str(getattr(decision, "judge_primary", "") or "")
 
             evidence_gap_exams = self._recommend_evidence_gap_exams(
                 decision=decision,
                 collected_info=collected_info,
                 exam_results=exam_results,
             )
-            recommended_exams = list(
-                dict.fromkeys(evidence_gap_exams + list(critic.recommended_exams or []))
-            )
+            if pre_corrective_judge.get("needs_discriminating_exams"):
+                recommended_exams = list(dict.fromkeys(evidence_gap_exams))
+            else:
+                recommended_exams = list(
+                    dict.fromkeys(
+                        evidence_gap_exams + list(critic.recommended_exams or [])
+                    )
+                )
             corrective_targets = self._evidence_gap_target_diagnoses(decision) or list(
                 decision.final_diagnoses or []
             )
+            corrective_candidate_diseases = corrective_targets
+            if pre_corrective_judge.get("needs_discriminating_exams"):
+                corrective_candidate_diseases = [
+                    str(item).strip()
+                    for item in pre_corrective_judge.get("differential_candidates") or []
+                    if str(item).strip()
+                ] or corrective_targets
             corrective_results = await self._maybe_order_critic_exams(
                 patient_id=patient_id,
                 recommended_exams=recommended_exams,
                 exam_results=exam_results,
                 collected_info=collected_info,
-                candidate_diseases=corrective_targets,
+                candidate_diseases=corrective_candidate_diseases,
+                add_strong_verification=not bool(
+                    pre_corrective_judge.get("needs_discriminating_exams")
+                ),
             )
             if corrective_results:
                 exam_results.update(corrective_results)
@@ -2225,6 +2767,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                 self._last_exam_results = dict(exam_results)
                 evidence_graph = self.evidence_agent.build_graph(collected_info, exam_results)
                 evidence = evidence_graph.bundle
+                evidence = self._augment_evidence_from_reasoning(evidence, diagnosis_result)
+                evidence_graph = evidence.to_graph()
                 rag_chunks = self.memory_manager.search_rag(
                     collected_info=collected_info,
                     query=(
@@ -2247,6 +2791,48 @@ class MyDoctorAgent(BaseDoctorAgent):
                     final_critic.reason,
                 )
                 self._restore_legacy_candidate_submission(decision, diagnosis_result, final_critic)
+                self.diagnosis_engine.judge_and_submit(decision)
+                post_corrective_judge = dict(getattr(decision, "judge_decision", None) or {})
+                post_corrective_primary = str(getattr(decision, "judge_primary", "") or "")
+                fallback_applied = self._apply_pre_discrimination_fallback(
+                    decision,
+                    pre_corrective_judge,
+                    post_corrective_judge,
+                )
+                if fallback_applied:
+                    post_corrective_judge = dict(
+                        getattr(decision, "judge_decision", None) or post_corrective_judge
+                    )
+                    post_corrective_primary = str(
+                        getattr(decision, "judge_primary", "") or post_corrective_primary
+                    )
+                rerank_trace = list(
+                    pre_corrective_judge.get("dynamic_rerank_trace") or []
+                )
+                rerank_trace.extend(post_corrective_judge.get("dynamic_rerank_trace") or [])
+                rerank_trace.append(
+                    {
+                        "stage": "after_discriminating_exams",
+                        "ordered_exams": list(corrective_results.keys()),
+                        "previous_primary": pre_corrective_primary,
+                        "primary": post_corrective_primary,
+                        "changed_primary": bool(
+                            pre_corrective_primary
+                            and post_corrective_primary
+                            and pre_corrective_primary != post_corrective_primary
+                        ),
+                        "fallback_to_pre_discrimination_primary": bool(
+                            fallback_applied
+                        ),
+                    }
+                )
+                post_corrective_judge["dynamic_rerank_trace"] = rerank_trace
+                post_corrective_judge["dynamic_rerank_changed_primary"] = any(
+                    bool(item.get("changed_primary"))
+                    for item in rerank_trace
+                    if isinstance(item, dict)
+                )
+                decision.judge_decision = post_corrective_judge
                 critic.issues = list(dict.fromkeys(critic.issues + final_critic.issues))
 
             diagnosis_result = self.diagnosis_engine.apply_to_result(
@@ -2325,16 +2911,18 @@ class MyDoctorAgent(BaseDoctorAgent):
         if (
             decision is not None
             and evidence is not None
-            and not self.legacy_candidate_submission
         ):
             diagnosis_result = self._refilter_diagnosis_result(
                 diagnosis_result,
                 decision,
                 evidence,
             )
-        filtered_names = self._remove_suppressed_diagnosis_names(
-            self._diagnosis_names_from_result(diagnosis_result)
-        )
+        if decision is not None and decision.final_diagnoses:
+            filtered_names = list(decision.final_diagnoses)
+        else:
+            filtered_names = self._remove_suppressed_diagnosis_names(
+                self._diagnosis_names_from_result(diagnosis_result)
+            )
         if filtered_names:
             diagnosis_result["diagnosis"] = filtered_names
         if diagnosis_result.get("_qc_issues"):
@@ -2344,9 +2932,12 @@ class MyDoctorAgent(BaseDoctorAgent):
             f"[诊断] 诊断结果: {json.dumps(diagnosis_result, ensure_ascii=False, indent=2)}"
         )
 
-        submission_diagnoses = self._remove_suppressed_diagnosis_names(
-            self._diagnosis_names_from_result(diagnosis_result)
-        )
+        if decision is not None and decision.final_diagnoses:
+            submission_diagnoses = list(decision.final_diagnoses)
+        else:
+            submission_diagnoses = self._remove_suppressed_diagnosis_names(
+                self._diagnosis_names_from_result(diagnosis_result)
+            )
         if submission_diagnoses:
             diagnosis_result["diagnosis"] = submission_diagnoses
 
@@ -2375,6 +2966,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         reviewed["_case_elapsed_seconds"] = elapsed
         reviewed["_case_timed_out"] = False
         if self._last_diagnosis_audit:
+            if decision is not None:
+                self._last_diagnosis_audit["diagnosis_decision"] = decision.to_dict()
             self._last_diagnosis_audit["elapsed_seconds"] = elapsed
             self._last_diagnosis_audit["timed_out"] = False
         return reviewed
@@ -2405,24 +2998,282 @@ class MyDoctorAgent(BaseDoctorAgent):
             values = [values]
         return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
+    def _augment_evidence_from_reasoning(
+        self,
+        evidence: EvidenceBundle,
+        diagnosis_result: Dict[str, Any],
+    ) -> EvidenceBundle:
+        if not isinstance(evidence, EvidenceBundle) or not isinstance(diagnosis_result, dict):
+            return evidence
+        additions: List[Observation] = []
+        for index, text in enumerate(self._reasoning_evidence_texts(diagnosis_result)):
+            additions.extend(
+                self._reasoning_inference_observations(
+                    text,
+                    field_path=f"reasoning.{index}",
+                )
+            )
+        if not additions:
+            return evidence
+
+        observations = list(evidence.observations)
+        seen = {
+            (item.finding, item.source, item.polarity)
+            for item in observations
+        }
+        added_findings: List[str] = []
+        for item in additions:
+            key = (item.finding, item.source, item.polarity)
+            if key in seen:
+                continue
+            observations.append(item)
+            seen.add(key)
+            added_findings.append(item.finding)
+        if added_findings:
+            logger.info(
+                "[诊断证据] reasoning 推论证据: %s",
+                list(dict.fromkeys(added_findings)),
+            )
+        return EvidenceBundle(observations)
+
+    def _reasoning_evidence_texts(self, result: Dict[str, Any]) -> List[str]:
+        texts: List[str] = []
+
+        def add_text(value: Any) -> None:
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    texts.append(text)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    add_text(item)
+                return
+            if isinstance(value, dict):
+                for key in (
+                    "supporting_evidence",
+                    "evidence",
+                    "evidence_summary",
+                    "reasoning",
+                    "reason",
+                    "rationale",
+                ):
+                    if key in value:
+                        add_text(value.get(key))
+
+        add_text(result.get("reasoning"))
+        for key in (
+            "diagnosis_candidates",
+            "candidate_diagnoses",
+            "open_diagnosis_candidates",
+        ):
+            add_text(result.get(key))
+        return list(dict.fromkeys(texts))
+
+    def _reasoning_inference_observations(
+        self,
+        text: str,
+        field_path: str,
+    ) -> List[Observation]:
+        raw_text = " ".join(str(text or "").split())
+        if not raw_text:
+            return []
+        findings: List[tuple] = []
+
+        def add(finding: str, confidence: float, direction: str = "") -> None:
+            if finding not in [item[0] for item in findings]:
+                findings.append((finding, confidence, direction))
+
+        if (
+            self._reasoning_has_assertive_term(
+                raw_text,
+                ("镁负荷保留率升高", "镁保留率升高"),
+            )
+            or self._reasoning_regex_assertive(
+                raw_text,
+                r"镁负荷.{0,16}(?:保留率|保留).{0,16}(?:升高|增高|偏高|高于|>|＞|\d+(?:\.\d+)?%)",
+            )
+        ):
+            add("magnesium_load_retention_high", 0.9, "high")
+            add("magnesium_depletion", 0.88)
+        if (
+            self._reasoning_has_assertive_term(
+                raw_text,
+                ("24小时尿镁降低", "尿镁降低", "尿镁偏低"),
+            )
+            or self._reasoning_regex_assertive(
+                raw_text,
+                r"(?:24小时)?尿镁.{0,16}(?:降低|减低|偏低|低于|<|＜)",
+            )
+        ):
+            add("low_urine_magnesium", 0.86, "low")
+            add("magnesium_depletion", 0.86)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("镁储备不足", "镁储备缺乏", "镁缺乏"),
+        ):
+            add("magnesium_depletion", 0.88)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("血镁降低", "血镁偏低", "低血镁"),
+        ):
+            add("low_magnesium", 0.9, "low")
+
+        if self._reasoning_has_assertive_term(raw_text, ("肺肾综合征",)):
+            add("pulmonary_hemorrhage", 0.82)
+            add("renal_impairment", 0.78)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("肺泡出血", "弥漫性肺泡出血", "肺出血"),
+        ):
+            add("pulmonary_hemorrhage", 0.88)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("镜下血尿", "显微镜下血尿", "血尿", "尿红细胞增多"),
+        ):
+            add("microscopic_hematuria", 0.84)
+        if (
+            self._reasoning_has_assertive_term(raw_text, ("尿色深", "尿色变深"))
+            and self._reasoning_has_assertive_term(raw_text, ("血尿", "肾小球肾炎"))
+        ):
+            add("microscopic_hematuria", 0.8)
+        if self._reasoning_has_assertive_term(raw_text, ("蛋白尿", "尿蛋白阳性")):
+            add("proteinuria", 0.82)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("肾功能受损", "肾功能损害", "肾损害", "肌酐升高", "肾小球滤过率降低"),
+        ):
+            add("renal_impairment", 0.84)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("MPO-ANCA阳性", "MPO-ANCA 阳性", "MPO抗体阳性", "抗MPO阳性"),
+        ):
+            add("mpo_anca_positive", 0.9)
+            add("anca_positive", 0.84)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("p-ANCA阳性", "P-ANCA阳性", "p-ANCA 阳性"),
+        ):
+            add("p_anca_positive", 0.86)
+            add("anca_positive", 0.82)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("ANCA阳性", "ANCA 阳性", "ANCA谱阳性"),
+        ):
+            add("anca_positive", 0.82)
+
+        heart_failure_terms = (
+            "BNP升高",
+            "BNP增高",
+            "NT-proBNP升高",
+            "NT-proBNP增高",
+            "EF下降",
+            "射血分数降低",
+            "肺淤血",
+            "肺水肿",
+            "心影增大",
+            "心脏扩大",
+            "容量超负荷",
+        )
+        if self._reasoning_has_assertive_term(raw_text, heart_failure_terms):
+            add("heart_failure_state", 0.86)
+        if (
+            self._reasoning_has_assertive_term(raw_text, ("心力衰竭", "心衰"))
+            and self._reasoning_has_assertive_term(raw_text, ("端坐呼吸",))
+            and self._reasoning_has_assertive_term(raw_text, ("水肿",))
+        ):
+            add("heart_failure_state", 0.84)
+
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("肺动脉瓣狭窄", "肺动脉瓣口狭窄"),
+        ):
+            add("pulmonary_valve_stenosis", 0.92)
+            add("diagnosis:肺动脉瓣狭窄", 0.9)
+        if self._reasoning_regex_assertive(
+            raw_text,
+            r"(?:肺动脉瓣|跨瓣|峰值).{0,12}(?:压差|压力阶差).{0,12}(?:升高|增高|[5-9]\d\s*mmHg|\d{2,3}\s*mmHg)",
+        ):
+            add("pulmonary_valve_gradient", 0.9, "high")
+        if self._reasoning_has_assertive_term(raw_text, ("右心室肥厚", "右室肥厚")):
+            add("right_ventricular_hypertrophy", 0.84)
+        if self._reasoning_has_assertive_term(raw_text, ("肺动脉高压", "肺动脉压升高")):
+            add("pulmonary_hypertension", 0.84)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("室间隔缺损", "大型VSD", "大型室间隔缺损", "VSD"),
+        ):
+            add("ventricular_septal_defect", 0.9)
+            add("diagnosis:室间隔缺损（VSD）", 0.86)
+        if self._reasoning_has_assertive_term(raw_text, ("右向左分流", "右至左分流")):
+            add("right_to_left_shunt", 0.88)
+        if self._reasoning_has_assertive_term(
+            raw_text,
+            ("先天性心脏病", "先心病", "先天性心脏缺陷", "紫绀型先天性心脏病"),
+        ):
+            add("congenital_heart_defect", 0.9)
+            add("diagnosis:先天性心脏病", 0.88)
+
+        return [
+            Observation(
+                finding=finding,
+                source="reasoning_inference",
+                direction=direction,
+                polarity="positive",
+                confidence=confidence,
+                raw_text=raw_text[:240],
+                field_path=field_path,
+            )
+            for finding, confidence, direction in findings
+        ]
+
+    def _reasoning_has_assertive_term(self, text: str, terms: tuple) -> bool:
+        for term in terms:
+            search_from = 0
+            while True:
+                start = str(text).find(term, search_from)
+                if start < 0:
+                    break
+                if not self._reasoning_window_blocked(text, start, start + len(term)):
+                    return True
+                search_from = start + len(term)
+        return False
+
+    def _reasoning_regex_assertive(self, text: str, pattern: str) -> bool:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            if not self._reasoning_window_blocked(text, match.start(), match.end()):
+                return True
+        return False
+
+    @staticmethod
+    def _reasoning_window_blocked(text: str, start: int, end: int) -> bool:
+        window = text[max(0, start - 24): min(len(text), end + 36)]
+        blockers = (
+            "不支持", "排除", "不能解释", "缺乏", "无", "未见", "未发现",
+            "阴性", "正常", "鉴别", "待鉴别", "需鉴别", "待排", "待查",
+            "需查", "建议", "排查", "除外", "可能", "疑似",
+        )
+        return any(token in window for token in blockers)
+
     def _refilter_diagnosis_result(self, result: Dict[str, Any], decision, evidence) -> Dict[str, Any]:
+        if getattr(decision, "judge_decision", None):
+            self.diagnosis_engine.judge_and_submit(decision)
+            return self.diagnosis_engine.apply_to_result(result, decision, evidence)
         original_names = self._diagnosis_names_from_result(result)
         names = self._remove_suppressed_diagnosis_names(original_names)
         if not names:
-            return result
-        filtered = self.diagnosis_engine.filter_final_diagnoses(names, decision.candidates)
-        if not filtered:
-            return result
-        filtered_names = [item.diagnosis for item in filtered]
+            return self.diagnosis_engine.apply_to_result(result, decision, evidence)
+        self.diagnosis_engine.authorize_final_diagnoses(
+            decision,
+            names,
+            respect_differential_only=True,
+        )
+        if not decision.final_diagnoses:
+            return self.diagnosis_engine.apply_to_result(result, decision, evidence)
+        filtered_names = list(decision.final_diagnoses)
         if filtered_names == original_names:
-            return result
+            return self.diagnosis_engine.apply_to_result(result, decision, evidence)
         score_by_name = {item.diagnosis: item for item in decision.candidates}
-        decision.final_diagnoses = filtered_names
-        decision.trusted_diagnoses = [
-            name for name in filtered_names
-            if score_by_name.get(name)
-            and score_by_name[name].score >= self.diagnosis_engine.trusted_threshold
-        ]
         if filtered_names and filtered_names[0] in score_by_name:
             decision.confidence = score_by_name[filtered_names[0]].score
         return self.diagnosis_engine.apply_to_result(result, decision, evidence)
@@ -2448,54 +3299,53 @@ class MyDoctorAgent(BaseDoctorAgent):
         if not selected_diagnoses:
             return
         score_by_name = {item.diagnosis: item for item in decision.candidates}
-        validated = [
-            name for name in selected_diagnoses
-            if name in score_by_name
-            and not score_by_name[name].hard_contradiction
-            and score_by_name[name].trusted
-        ]
-        if not validated:
-            return
-        strong_evidence = [
-            item.diagnosis for item in decision.candidates
-            if item.diagnosis in decision.trusted_diagnoses
-            and item.support_score >= 0.8
-            and not item.hard_contradiction
-        ]
-        selected_best = max(
-            (score_by_name[name].score for name in validated if name in score_by_name),
-            default=0.0,
-        )
-        protected_causal = [
-            item.diagnosis for item in decision.candidates[:5]
-            if item.trusted
-            and self._is_etiology_priority_candidate(item)
-            and item.score >= self.diagnosis_engine.trusted_threshold
-            and item.score >= selected_best - self.diagnosis_engine.margin_threshold
-        ]
-        # LLM Critic may reorder ambiguous candidates, but cannot discard a
-        # diagnosis already established by strong deterministic evidence.
-        filtered = self.diagnosis_engine.filter_final_diagnoses(
-            list(dict.fromkeys(protected_causal + strong_evidence + validated)),
-            decision.candidates,
-        )
-        if not filtered:
-            return
-        decision.final_diagnoses = [item.diagnosis for item in filtered]
-        decision.trusted_diagnoses = [
-            name for name in decision.final_diagnoses
-            if score_by_name[name].score >= self.diagnosis_engine.trusted_threshold
-        ]
-        decision.confidence = score_by_name[decision.final_diagnoses[0]].score
-        decision.differential_only_diagnoses = self.diagnosis_engine.differential_only_details(
-            decision.candidates
+        base_final = list(decision.final_diagnoses or [])
+        for name in selected_diagnoses:
+            candidate = score_by_name.get(name)
+            if not candidate:
+                continue
+            if (
+                not candidate.hard_contradiction
+                and candidate.trusted
+                and not candidate.differential_only
+                and not candidate.differential_only_reason
+                and not self._critic_submission_eligible(candidate, base_final)
+            ):
+                self.diagnosis_engine._mark_differential_only(
+                    candidate,
+                    "作为 critic 提出的鉴别诊断保留，但缺少直接诊断证据、独立并发证据或足够高的证据评分，不作为最终诊断提交。",
+                )
+        self.diagnosis_engine.authorize_final_diagnoses(
+            decision,
+            base_final,
+            respect_differential_only=True,
         )
         if reason:
             extra = self.diagnosis_engine.differential_only_reasoning(decision.candidates)
-            suffix = "。提交前审查：" + str(reason).rstrip("。") + "。"
+            suffix = " Final diagnosis authorization reviewed critic suggestions: " + str(reason).strip()
             if extra:
                 suffix += extra
-            decision.evidence_reasoning = decision.evidence_reasoning.rstrip("。") + suffix
+            if suffix not in decision.evidence_reasoning:
+                decision.evidence_reasoning = decision.evidence_reasoning + suffix
+        return
+
+    def _critic_submission_eligible(self, candidate, base_final: List[str]) -> bool:
+        if not candidate:
+            return False
+        if candidate.diagnosis in set(base_final or []):
+            return True
+        if f"diagnosis:{candidate.diagnosis}" in set(candidate.matched_evidence or []):
+            return True
+        if (
+            self.diagnosis_engine._is_secondary_manifestation(candidate)
+            and self.diagnosis_engine._has_independent_state_evidence(candidate)
+            and any(
+                self.diagnosis_engine._diagnoses_submission_related(candidate.diagnosis, name)
+                for name in base_final or []
+            )
+        ):
+            return True
+        return candidate.score >= self.diagnosis_engine.trusted_threshold
 
     def _restore_legacy_candidate_submission(
         self,
@@ -2515,6 +3365,24 @@ class MyDoctorAgent(BaseDoctorAgent):
         primary_names = self._resolved_llm_primary_names(llm_result)
         supporting_names = self._resolved_llm_candidate_names(llm_result)
         supporting_names.extend(self._resolved_critic_names(critic))
+
+        if decision.final_diagnoses:
+            base_final = list(decision.final_diagnoses or [])
+            for name in list(dict.fromkeys(primary_names + supporting_names)):
+                if name in base_final:
+                    continue
+                candidate = score_by_name.get(name)
+                if candidate and self._legacy_submission_eligible(candidate):
+                    self.diagnosis_engine._mark_differential_only(
+                        candidate,
+                        "legacy candidate retained for audit; final submission is locked to the authorized evidence-first decision",
+                    )
+            self.diagnosis_engine.authorize_final_diagnoses(
+                decision,
+                base_final,
+                respect_differential_only=True,
+            )
+            return
 
         primary_eligible = [
             name for name in primary_names
@@ -2539,11 +3407,15 @@ class MyDoctorAgent(BaseDoctorAgent):
         if not names:
             return
         names = self._remove_suppressed_diagnosis_names(names)
-        filtered = [
-            score_by_name[name] for name in names
-            if name in score_by_name
-            and self._legacy_submission_eligible(score_by_name[name])
-        ][: self.diagnosis_engine.max_final_diagnoses]
+        filtered = self.diagnosis_engine.filter_final_diagnoses(
+            [
+                name for name in names
+                if name in score_by_name
+                and self._legacy_submission_eligible(score_by_name[name])
+            ],
+            decision.candidates,
+            respect_differential_only=True,
+        )
         if not filtered:
             return
         filtered_names = [item.diagnosis for item in filtered]
@@ -2555,9 +3427,12 @@ class MyDoctorAgent(BaseDoctorAgent):
             if item.score >= self.diagnosis_engine.trusted_threshold
         ]
         decision.confidence = filtered[0].score
+        decision.differential_only_diagnoses = self.diagnosis_engine.differential_only_details(
+            decision.candidates
+        )
         suffix = (
-            "。提交前审查：已恢复旧版宽松候选提交逻辑；"
-            "LLM/Critic 已提出且证据候选中无硬反证的标准诊断被保留。"
+            "。提交前审查：Legacy 候选恢复已通过最终诊断 gate；"
+            "仅保留 required 已满足、非仅鉴别且无硬反证的标准诊断。"
         )
         if suffix not in decision.evidence_reasoning:
             decision.evidence_reasoning = decision.evidence_reasoning.rstrip("。") + suffix
@@ -2588,7 +3463,6 @@ class MyDoctorAgent(BaseDoctorAgent):
     def _resolved_critic_names(self, critic) -> List[str]:
         values: List[Any] = []
         values.extend(list(getattr(critic, "selected_diagnoses", []) or []))
-        values.extend(self._extract_allowed_diagnoses_from_text(getattr(critic, "reason", "") or ""))
         return self._resolve_diagnosis_values(values)
 
     def _resolve_diagnosis_values(self, values: List[Any]) -> List[str]:
@@ -2640,8 +3514,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             return False
         return (
             candidate.trusted
+            and bool(candidate.required_met)
             and bool(candidate.matched_evidence)
             and not candidate.hard_contradiction
+            and not candidate.differential_only
+            and not candidate.differential_only_reason
             and candidate.score >= self.diagnosis_engine.differential_threshold
         )
 
@@ -2669,26 +3546,86 @@ class MyDoctorAgent(BaseDoctorAgent):
     ) -> List[str]:
         if not decision:
             return []
-        targets = self._evidence_gap_target_diagnoses(decision)
-        if not targets:
+        judge_payload = getattr(decision, "judge_decision", None) or {}
+        needs_discriminating = bool(judge_payload.get("needs_discriminating_exams"))
+        if self._strict_primary_exam_stop_active(decision) and not needs_discriminating:
             return []
+        targets = self._evidence_gap_target_diagnoses(decision)
+        if not targets and not needs_discriminating:
+            return []
+        if targets:
+            targets = self._prioritize_evidence_gap_exam_targets(decision, targets)
 
-        proposed: List[str] = []
+        target_proposed: List[str] = []
         for name in targets:
             entry = self.diagnosis_engine.knowledge.get(name)
             for exam in entry.get("discriminating_exams", []) or []:
                 text = str(exam).strip()
-                if text and text not in proposed:
-                    proposed.append(text)
+                if text and text not in target_proposed:
+                    target_proposed.append(text)
+
+        judge_proposed: List[str] = []
+        for exam in judge_payload.get("discriminating_exams", []) or []:
+            text = str(exam).strip()
+            if text and text not in judge_proposed:
+                judge_proposed.append(text)
+
+        differential_names = [
+            str(item).strip()
+            for item in judge_payload.get("differential_candidates") or []
+            if str(item).strip()
+        ]
+        if needs_discriminating:
+            proposed = list(dict.fromkeys(judge_proposed + target_proposed))
+            strategy_judge_payload = dict(judge_payload)
+            strategy_judge_payload["discriminating_exams"] = list(proposed)
+            strategy_judge_payload["differential_candidates"] = list(
+                dict.fromkeys(
+                    list(judge_payload.get("differential_candidates") or [])
+                    + targets
+                )
+            )
+        else:
+            proposed = list(dict.fromkeys(target_proposed + judge_proposed))
+            # When a concrete evidence-gap target already exposes discriminating exams,
+            # keep that disease-specific workup ahead of generic TopK differential tests.
+            # The generic Judge exams are still available as later fill-ins.
+            strategy_judge_payload = judge_payload if not target_proposed else None
+
+        if (
+            not needs_discriminating
+            and self.exam_agent._needs_pulmonary_renal_workup(
+                collected_info,
+                list(dict.fromkeys(targets + differential_names)),
+            )
+        ):
+            pulmonary_renal_priority, _ = self.exam_agent.knowledge.normalize_examinations(
+                [
+                    "尿液分析（UA）",
+                    "肾功能检查（RFTs）",
+                    "抗中性粒细胞胞质抗体（ANCA）谱",
+                    "MPO-ANCA",
+                ]
+            )
+            proposed = list(dict.fromkeys(pulmonary_renal_priority + proposed))
+            if strategy_judge_payload is not None:
+                strategy_judge_payload = dict(strategy_judge_payload)
+                strategy_judge_payload["discriminating_exams"] = list(proposed)
 
         strategy = self.exam_agent.recommend(
             collected_info=collected_info,
             candidate_diseases=targets,
             proposed_items=proposed,
             existing_results=exam_results,
+            judge_decision=strategy_judge_payload,
         )
-        ordered_items = list(dict.fromkeys(proposed + list(strategy.get("items", []) or [])))
-        return self.exam_agent.prepare_order_items(
+        if needs_discriminating:
+            ordered_items = list(dict.fromkeys(list(strategy.get("items", []) or [])))
+        else:
+            ordered_items = list(
+                dict.fromkeys(proposed + list(strategy.get("items", []) or []))
+            )
+        items = self.exam_agent.prepare_order_items(
             ordered_items,
             collected_info=collected_info,
             candidate_diseases=targets,
@@ -2696,10 +3633,171 @@ class MyDoctorAgent(BaseDoctorAgent):
             max_items=self.diagnosis_critic.max_corrective_exam_items,
             add_strong_verification=False,
         )
+        if (
+            strategy.get("strict_diagnosis_driven")
+            or strategy.get("differential_driven")
+            or strategy.get("blocked_items")
+        ):
+            self._last_exam_authorization.append(
+                {
+                    "stage": "evidence_gap_exam",
+                    "strict_diagnosis_driven": bool(
+                        strategy.get("strict_diagnosis_driven")
+                    ),
+                    "differential_driven": bool(strategy.get("differential_driven")),
+                    "primary_diagnosis": strategy.get("primary_diagnosis", ""),
+                    "differential_candidates": list(
+                        strategy.get("differential_candidates") or []
+                    ),
+                    "discriminating_items": list(
+                        strategy.get("discriminating_items") or []
+                    ),
+                    "authorized_items": list(items or []),
+                    "blocked_items": list(strategy.get("blocked_items") or []),
+                    "exam_authorization_details": list(
+                        strategy.get("exam_authorization_details") or []
+                    ),
+                }
+            )
+        return items
+
+    def _apply_pre_discrimination_fallback(
+        self,
+        decision,
+        pre_judge: Dict[str, Any],
+        post_judge: Dict[str, Any],
+    ) -> bool:
+        if not decision or not pre_judge or not pre_judge.get("needs_discriminating_exams"):
+            return False
+        pre_primary = str(
+            pre_judge.get("pre_discrimination_primary")
+            or pre_judge.get("provisional_primary")
+            or pre_judge.get("primary")
+            or pre_judge.get("judge_primary")
+            or ""
+        ).strip()
+        if not pre_primary:
+            return False
+        post_primary = str(
+            post_judge.get("primary") or post_judge.get("judge_primary") or ""
+        ).strip()
+        if post_primary == pre_primary:
+            return False
+        by_name = {item.diagnosis: item for item in getattr(decision, "candidates", [])}
+        fallback = by_name.get(pre_primary)
+        if not fallback or getattr(fallback, "hard_contradiction", False):
+            return False
+        if not getattr(fallback, "matched_evidence", None):
+            return False
+        current = by_name.get(post_primary)
+        try:
+            fallback_score = self.diagnosis_engine.judge._primary_eligibility_score(
+                fallback
+            )
+            current_score = (
+                self.diagnosis_engine.judge._primary_eligibility_score(current)
+                if current
+                else -1.0
+            )
+        except Exception:
+            fallback_score = float(getattr(fallback, "score", 0.0) or 0.0)
+            current_score = float(getattr(current, "score", 0.0) or -1.0) if current else -1.0
+        if fallback_score + 0.04 < current_score:
+            return False
+
+        setattr(fallback, "required_gap_authorized", True)
+        fallback.differential_only = False
+        fallback.differential_only_reason = ""
+        self.diagnosis_engine.authorize_final_diagnoses(
+            decision,
+            [pre_primary],
+            respect_differential_only=False,
+        )
+        payload = dict(post_judge or {})
+        payload.update(
+            {
+                "primary": pre_primary,
+                "judge_primary": pre_primary,
+                "primary_status": "locked",
+                "locked_primary": pre_primary,
+                "provisional_primary": "",
+                "fallback_primary": pre_primary,
+                "fallback_to_pre_discrimination_primary": True,
+                "fallback_reason": (
+                    "discriminating exams did not produce a clearly superior "
+                    "primary; returning to pre-discrimination explanatory primary"
+                ),
+                "required_gap_authorized_diagnoses": list(
+                    dict.fromkeys(
+                        list(
+                            payload.get("required_gap_authorized_diagnoses") or []
+                        )
+                        + [pre_primary]
+                    )
+                ),
+                "final_diagnoses": list(decision.final_diagnoses),
+                "discrimination_attempted": True,
+                "discrimination_resolved": False,
+            }
+        )
+        decision.judge_primary = pre_primary
+        decision.submitter_final = list(decision.final_diagnoses)
+        decision.required_gap_authorized_diagnoses = list(
+            dict.fromkeys(list(decision.required_gap_authorized_diagnoses or []) + [pre_primary])
+        )
+        decision.judge_decision = payload
+        return True
+
+    def _prioritize_evidence_gap_exam_targets(
+        self,
+        decision,
+        targets: List[str],
+    ) -> List[str]:
+        if not decision or not targets:
+            return targets
+        by_name = {item.diagnosis: item for item in getattr(decision, "candidates", [])}
+        judge_payload = getattr(decision, "judge_decision", None) or {}
+        review_scores = {
+            str(item.get("diagnosis") or ""): float(item.get("judge_score", 0.0) or 0.0)
+            for item in (judge_payload.get("reviews") or [])
+            if isinstance(item, dict)
+        }
+
+        def key(name: str) -> tuple:
+            candidate = by_name.get(name)
+            if not candidate:
+                return (0, 0, 0, 0.0, 0.0)
+            has_gap = 1 if getattr(candidate, "required_gaps", None) else 0
+            priority = 1 if self._is_etiology_priority_candidate(candidate) else 0
+            objective = 1 if getattr(candidate, "matched_evidence", None) else 0
+            judge_score = review_scores.get(
+                name,
+                float(getattr(candidate, "score", 0.0) or 0.0),
+            )
+            specificity = float(getattr(candidate, "specificity", 0.0) or 0.0)
+            return (has_gap, priority, objective, judge_score, specificity)
+
+        return sorted(list(dict.fromkeys(targets)), key=key, reverse=True)
 
     def _evidence_gap_target_diagnoses(self, decision) -> List[str]:
+        judge_payload = getattr(decision, "judge_decision", None) or {}
+        if (
+            self._strict_primary_exam_stop_active(decision)
+            and not bool(judge_payload.get("needs_discriminating_exams"))
+        ):
+            return []
         by_name = {item.diagnosis: item for item in decision.candidates}
         targets: List[str] = []
+        judge_targets = [
+            str(item).strip()
+            for item in (judge_payload.get("evidence_gap_targets") or [])
+            if str(item).strip()
+        ]
+        if judge_targets:
+            for name in dict.fromkeys(judge_targets):
+                candidate = by_name.get(name)
+                if candidate and getattr(candidate, "required_gap_authorized", False):
+                    targets.append(name)
 
         close_margin = getattr(self.diagnosis_engine, "etiology_close_margin", 0.12)
         coverage_threshold = getattr(
@@ -2713,22 +3811,20 @@ class MyDoctorAgent(BaseDoctorAgent):
             0.72,
         )
         selected = by_name.get((decision.final_diagnoses or [""])[0])
+        selected_names = set(decision.final_diagnoses or [])
+        unexplained = set(decision.unexplained_evidence or [])
         gap_candidates = []
         for item in decision.candidates:
-            if (
-                item.required_gaps
-                and item.matched_evidence
-                and not item.hard_contradiction
-                and self._is_etiology_priority_candidate(item)
-                and (
-                    getattr(item, "coverage_score", 0.0) >= coverage_threshold
-                    or getattr(item, "residual_score", 1.0) <= residual_threshold
-                    or item.source_prior >= 0.45
-                    or (
-                        selected is not None
-                        and item.score >= max(0.0, selected.score - close_margin)
-                    )
-                )
+            if getattr(item, "differential_only", False) and not getattr(item, "required_gaps", None):
+                continue
+            if self._is_actionable_evidence_gap_candidate(
+                item,
+                selected=selected,
+                selected_names=selected_names,
+                unexplained=unexplained,
+                close_margin=close_margin,
+                coverage_threshold=coverage_threshold,
+                residual_threshold=residual_threshold,
             ):
                 gap_candidates.append(item)
         gap_candidates.sort(
@@ -2758,36 +3854,202 @@ class MyDoctorAgent(BaseDoctorAgent):
             if name in by_name and name not in targets:
                 targets.append(name)
 
-        priority_candidates = [
-            item
-            for item in decision.candidates
-            if item.matched_evidence
-            and not item.hard_contradiction
-            and self._is_etiology_priority_candidate(item)
-        ]
-        priority_candidates.sort(
-            key=lambda item: (
-                getattr(item, "coverage_score", 0.0),
-                1.0 - getattr(item, "residual_score", 1.0),
-                item.score,
-            ),
-            reverse=True,
-        )
-        if priority_candidates and priority_candidates[0].diagnosis not in targets:
-            targets.append(priority_candidates[0].diagnosis)
-
-        unexplained = set(decision.unexplained_evidence or [])
         if unexplained:
             for item in decision.candidates:
                 if item.hard_contradiction:
                     continue
-                if unexplained & set(item.matched_evidence or []):
+                if getattr(item, "differential_only", False) and not getattr(item, "required_gaps", None):
+                    continue
+                if (
+                    unexplained & set(item.matched_evidence or [])
+                    and self._is_gap_candidate_competitive_with_selected(
+                        item,
+                        selected=selected,
+                        close_margin=close_margin,
+                    )
+                    and (
+                        not self._evidence_gap_scope_gate_active(selected)
+                        or self._evidence_gap_companion_allowed(item, selected)
+                    )
+                ):
                     if item.diagnosis not in targets:
                         targets.append(item.diagnosis)
                     break
 
         limit = getattr(self.diagnosis_engine, "max_evidence_gap_targets", 2)
         return targets[: max(1, int(limit or 2))]
+
+    def _strict_primary_exam_stop_active(self, decision) -> bool:
+        if not decision or not getattr(decision, "final_diagnoses", None):
+            return False
+        judge_payload = getattr(decision, "judge_decision", None) or {}
+        if bool(judge_payload.get("needs_discriminating_exams")):
+            return False
+        by_name = {item.diagnosis: item for item in getattr(decision, "candidates", [])}
+        primary = by_name.get(decision.final_diagnoses[0])
+        if not primary:
+            return False
+        if (
+            not getattr(primary, "required_met", False)
+            or getattr(primary, "required_gaps", None)
+            or getattr(primary, "hard_contradiction", False)
+            or float(getattr(primary, "score", 0.0) or 0.0)
+            < float(getattr(self.diagnosis_engine, "trusted_threshold", 0.65) or 0.65)
+            or not self._is_etiology_priority_candidate(primary)
+        ):
+            return False
+        try:
+            strong_items = self.exam_agent._strong_verification_items_for_disease(
+                primary.diagnosis
+            )
+        except AttributeError:
+            strong_items = []
+        if not strong_items:
+            return False
+        matched = set(getattr(primary, "matched_evidence", None) or [])
+        objective = float(
+            (getattr(primary, "component_scores", None) or {}).get(
+                "objective_evidence",
+                0.0,
+            )
+            or 0.0
+        )
+        return objective >= 1.0 or f"diagnosis:{primary.diagnosis}" in matched
+
+    def _is_actionable_evidence_gap_candidate(
+        self,
+        candidate,
+        selected,
+        selected_names: set,
+        unexplained: set,
+        close_margin: float,
+        coverage_threshold: float,
+        residual_threshold: float,
+    ) -> bool:
+        if not (
+            getattr(candidate, "required_gaps", None)
+            and getattr(candidate, "matched_evidence", None)
+            and not getattr(candidate, "hard_contradiction", False)
+            and self._is_etiology_priority_candidate(candidate)
+        ):
+            return False
+        if candidate.diagnosis in selected_names:
+            return True
+        quality_signal = (
+            getattr(candidate, "coverage_score", 0.0) >= coverage_threshold
+            or getattr(candidate, "residual_score", 1.0) <= residual_threshold
+            or getattr(candidate, "source_prior", 0.0) >= 0.45
+        )
+        if not quality_signal:
+            return False
+        if selected is None:
+            return True
+        if self._evidence_gap_scope_gate_active(selected) and not self._evidence_gap_companion_allowed(candidate, selected):
+            return False
+        if candidate.score >= selected.score + close_margin:
+            return True
+        if (
+            (getattr(candidate, "source_prior", 0.0) >= 0.45 or unexplained & set(candidate.matched_evidence or []))
+            and self._is_gap_candidate_competitive_with_selected(
+                candidate,
+                selected=selected,
+                close_margin=close_margin,
+            )
+        ):
+            return True
+        if unexplained & set(candidate.matched_evidence or []):
+            return (
+                candidate.score >= max(0.0, selected.score - 2 * close_margin)
+                or getattr(candidate, "coverage_score", 0.0) + close_margin
+                >= getattr(selected, "coverage_score", 0.0)
+                or getattr(candidate, "residual_score", 1.0)
+                <= getattr(selected, "residual_score", 1.0) + close_margin
+            )
+        return False
+
+    @staticmethod
+    def _is_gap_candidate_competitive_with_selected(
+        candidate,
+        selected,
+        close_margin: float,
+    ) -> bool:
+        if selected is None:
+            return True
+        if candidate.score < max(0.0, selected.score - close_margin):
+            return False
+        return (
+            getattr(candidate, "coverage_score", 0.0) + close_margin
+            >= getattr(selected, "coverage_score", 0.0)
+            or getattr(candidate, "residual_score", 1.0)
+            <= getattr(selected, "residual_score", 1.0) + close_margin
+        )
+
+    def _evidence_gap_companion_allowed(self, candidate, selected) -> bool:
+        if selected is None or candidate is None:
+            return True
+        if getattr(candidate, "diagnosis", "") == getattr(selected, "diagnosis", ""):
+            return True
+        try:
+            left = self.diagnosis_engine.knowledge.get(candidate.diagnosis)
+            right = self.diagnosis_engine.knowledge.get(selected.diagnosis)
+        except Exception:
+            return True
+        if self._diagnosis_graph_related(candidate.diagnosis, selected.diagnosis, left, right):
+            return True
+        left_system = str(left.get("body_system") or "")
+        right_system = str(right.get("body_system") or "")
+        left_family = str(left.get("disease_family") or left.get("family") or "")
+        right_family = str(right.get("disease_family") or right.get("family") or "")
+        if left_system and right_system and left_system == right_system:
+            return bool(left_family and right_family and left_family == right_family)
+        return False
+
+    def _evidence_gap_scope_gate_active(self, selected) -> bool:
+        if selected is None:
+            return False
+        if not (
+            getattr(selected, "required_met", False)
+            and not getattr(selected, "required_gaps", None)
+            and not getattr(selected, "hard_contradiction", False)
+            and bool(getattr(selected, "matched_evidence", None))
+        ):
+            return False
+        trusted_threshold = float(
+            getattr(self.diagnosis_engine, "trusted_threshold", 0.65) or 0.65
+        )
+        if float(getattr(selected, "score", 0.0) or 0.0) < trusted_threshold:
+            return False
+        try:
+            strong_items = self.exam_agent._strong_verification_items_for_disease(
+                selected.diagnosis
+            )
+        except AttributeError:
+            strong_items = []
+        return bool(strong_items and self._is_etiology_priority_candidate(selected))
+
+    @staticmethod
+    def _diagnosis_graph_related(
+        left_name: str,
+        right_name: str,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+    ) -> bool:
+        if left_name == right_name:
+            return True
+        left_related = set(str(item) for item in left.get("related_complications", []) or [])
+        right_related = set(str(item) for item in right.get("related_complications", []) or [])
+        if right_name in left_related or left_name in right_related:
+            return True
+        left_causes = set(str(item) for item in left.get("causes", []) or [])
+        right_causes = set(str(item) for item in right.get("causes", []) or [])
+        left_caused_by = set(str(item) for item in left.get("caused_by", []) or [])
+        right_caused_by = set(str(item) for item in right.get("caused_by", []) or [])
+        return (
+            right_name in left_causes
+            or left_name in right_causes
+            or right_name in left_caused_by
+            or left_name in right_caused_by
+        )
 
     def _has_close_etiology_candidate(self, decision) -> bool:
         if not decision.candidates or not decision.final_diagnoses:
@@ -2815,6 +4077,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 and not item.hard_contradiction
                 and self._is_etiology_priority_candidate(item)
                 and (
+                    not self._evidence_gap_scope_gate_active(selected)
+                    or self._evidence_gap_companion_allowed(item, selected)
+                )
+                and (
                     item.required_gaps
                     or item.source_prior >= 0.45
                     or getattr(item, "coverage_score", 0.0) >= coverage_threshold
@@ -2838,6 +4104,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         exam_results: Dict[str, Any],
         collected_info: Optional[Dict[str, Any]] = None,
         candidate_diseases: Optional[List[Any]] = None,
+        add_strong_verification: bool = True,
     ) -> Dict[str, Any]:
         if (
             not recommended_exams
@@ -2853,7 +4120,29 @@ class MyDoctorAgent(BaseDoctorAgent):
             candidate_diseases=candidate_diseases,
             existing_results=exam_results,
             max_items=self.diagnosis_critic.max_corrective_exam_items,
+            add_strong_verification=add_strong_verification,
         )
+        normalized_recommended, _ = self.knowledge.normalize_examinations(
+            recommended_exams or []
+        )
+        blocked_items = [
+            item for item in normalized_recommended
+            if item not in set(items or [])
+        ]
+        if blocked_items:
+            self._last_exam_authorization.append(
+                {
+                    "stage": "critic_corrective_exam",
+                    "strict_diagnosis_driven": True,
+                    "primary_diagnosis": (
+                        str(candidate_diseases[0])
+                        if candidate_diseases
+                        else ""
+                    ),
+                    "authorized_items": list(items or []),
+                    "blocked_items": list(dict.fromkeys(blocked_items)),
+                }
+            )
         if not items:
             return {}
         try:

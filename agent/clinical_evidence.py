@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 _NEGATION_RE = re.compile(
-    r"(?:未见|未发现|未提示|不支持|无明显|无|否认|排除|阴性|正常|完整|未检出|未培养出)"
+    r"(?:未见|未发现|未提示|不支持|无明显|无(?!力)|否认|排除|阴性|正常|完整|未检出|未培养出)"
 )
 _UNCERTAINTY_RE = re.compile(r"(?:考虑|可能|疑似|不能除外|倾向|待排)" )
 _POSITIVE_RE = re.compile(r"(?:阳性|提示|符合|诊断为|检出|发现|可见|存在|增高|升高|降低|减低)" )
@@ -21,17 +21,157 @@ _ANATOMY_TERMS = (
     "肝脏", "胆囊", "胰腺", "脑", "视网膜", "脊柱", "关节",
 )
 
+_INTERPRETER_RULES: Tuple[Dict[str, Any], ...] = (
+    {
+        "finding": "dyspnea_on_exertion",
+        "terms": (
+            "\u8d70\u4e24\u6b65\u5c31\u5598",
+            "\u8d70\u51e0\u6b65\u5c31\u5598",
+            "\u6d3b\u52a8\u540e\u6c14\u77ed",
+            "\u52b3\u529b\u6027\u547c\u5438\u56f0\u96be",
+            "\u8fd0\u52a8\u540e\u6c14\u4fc3",
+        ),
+        "confidence": 0.9,
+    },
+    {
+        "finding": "exercise_intolerance",
+        "terms": (
+            "\u8d70\u4e24\u6b65\u5c31\u5598",
+            "\u6d3b\u52a8\u8010\u91cf\u4e0b\u964d",
+            "\u8fd0\u52a8\u8010\u91cf\u4e0b\u964d",
+            "\u52b3\u7d2f\u540e\u660e\u663e\u4e0d\u9002",
+        ),
+        "confidence": 0.88,
+    },
+    {
+        "finding": "postprandial_nausea",
+        "terms": (
+            "\u996d\u540e\u6076\u5fc3",
+            "\u8fdb\u98df\u540e\u6076\u5fc3",
+            "\u9910\u540e\u6076\u5fc3",
+        ),
+        "confidence": 0.88,
+    },
+    {
+        "finding": "periorbital_edema",
+        "terms": (
+            "\u65e9\u6668\u8d77\u5e8a\u773c\u775b\u80bf",
+            "\u6668\u8d77\u773c\u7751\u6d6e\u80bf",
+            "\u773c\u5468\u6d6e\u80bf",
+            "\u773c\u7751\u6d6e\u80bf",
+        ),
+        "confidence": 0.9,
+    },
+    {
+        "finding": "fluid_retention_pattern",
+        "terms": (
+            "\u65e9\u6668\u8d77\u5e8a\u773c\u775b\u80bf",
+            "\u6668\u8d77\u773c\u7751\u6d6e\u80bf",
+            "\u773c\u5468\u6d6e\u80bf",
+            "\u4e0b\u80a2\u6c34\u80bf",
+        ),
+        "confidence": 0.84,
+    },
+    {
+        "finding": "polydipsia",
+        "terms": (
+            "\u559d\u5f88\u591a\u6c34",
+            "\u996e\u6c34\u660e\u663e\u589e\u591a",
+            "\u591a\u996e",
+            "\u53e3\u6e34\u591a\u996e",
+        ),
+        "confidence": 0.9,
+    },
+    {
+        "finding": "tropical_exposure",
+        "terms": (
+            "\u70ed\u5e26\u66b4\u9732",
+            "\u70ed\u5e26\u5730\u533a",
+            "\u5357\u65b9\u519c\u6751",
+            "\u519c\u6751\u513f\u7ae5",
+            "\u519c\u6751\u73af\u5883",
+        ),
+        "confidence": 0.88,
+    },
+    {
+        "finding": "deep_skin_ulcer",
+        "terms": (
+            "\u6df1\u90e8\u6e83\u75a1",
+            "\u76ae\u80a4\u6e83\u75a1",
+            "\u6e83\u75a1\u6027\u76ae\u635f",
+            "\u6e17\u51fa\u6027\u6e83\u75a1",
+        ),
+        "confidence": 0.9,
+    },
+    {
+        "finding": "crusted_skin_lesion",
+        "terms": (
+            "\u7ed3\u75c2",
+            "\u75c2\u76ae",
+            "\u9ec4\u8272\u75c2\u76ae",
+            "\u6e17\u51fa\u540e\u7ed3\u75c2",
+        ),
+        "confidence": 0.86,
+    },
+    {
+        "finding": "periostitis",
+        "terms": (
+            "\u9aa8\u819c\u708e",
+            "\u9aa8\u819c\u589e\u539a",
+            "\u9aa8\u75db",
+            "\u591c\u95f4\u9aa8\u75db",
+        ),
+        "confidence": 0.9,
+    },
+    {
+        "finding": "treponemal_disease_pattern",
+        "terms": (
+            "\u96c5\u53f8\u75c5",
+            "\u8815\u65cb\u4f53",
+            "\u6885\u6bd2\u8840\u6e05\u5b66\u9633\u6027",
+            "\u975e\u6027\u75c5\u6027\u6885\u6bd2\u87ba\u65cb\u4f53",
+        ),
+        "confidence": 0.92,
+    },
+)
+
 
 # These findings are reusable clinical concepts rather than disease-specific rules.
 _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "cough": ("咳嗽", "干咳", "咳痰"),
     "fever": ("发热", "高热", "低热", "发烧"),
+    "night_sweats": ("盗汗", "夜间盗汗", "晚上出汗", "夜间出汗"),
+    "acute_course": ("1天", "2天", "3天", "急性起病", "突然开始", "受凉后"),
+    "rhinorrhea": ("流鼻涕", "流涕", "鼻涕变稠", "清涕"),
+    "nasal_congestion": ("鼻塞", "张口呼吸", "鼻子不通气"),
+    "wheeze": ("喘息", "哮鸣音", "喘"),
     "dyspnea": ("呼吸困难", "气短", "气促", "喘不上气", "呼吸急促"),
     "hypoxemia": ("低氧血症", "血氧下降", "氧饱和度下降", "SpO2降低", "SpO₂降低"),
     "hemoptysis": ("咯血", "血痰", "咳血"),
     "arthralgia": ("关节痛", "关节疼痛", "关节肿痛"),
+    "joint_stiffness": ("关节僵硬", "晨僵", "膝关节僵硬"),
+    "trauma_history": ("外伤史", "创伤史", "受伤后", "扭伤后", "跌倒后", "摔伤后", "撞伤后"),
+    "post_traumatic_joint_pain": ("创伤后关节痛", "外伤后关节痛", "受伤后关节痛"),
+    "activity_related_joint_pain": ("活动后关节痛", "活动后疼痛", "负重后疼痛", "上下楼疼痛"),
+    "mechanical_overload_trigger": ("长时间步行", "步行距离增加", "爬楼梯", "负重", "运动后加重", "机械负荷"),
+    "joint_space_narrowing": ("关节间隙变窄", "关节间隙狭窄"),
+    "osteophyte": ("骨赘", "骨刺", "边缘骨质增生"),
     "weakness": ("乏力", "无力", "全身无力"),
     "dizziness": ("头晕", "眩晕"),
+    "syncope": ("晕厥", "昏厥", "晕倒"),
+    "presyncope": ("近晕厥", "晕厥前兆", "快要晕倒", "眼前发黑"),
+    "bradycardia": ("心动过缓", "心率慢", "脉搏慢", "心率过慢"),
+    "av_block": ("房室传导阻滞", "传导阻滞"),
+    "second_degree_av_block": (
+        "二度房室传导阻滞",
+        "Ⅱ度房室传导阻滞",
+        "II度房室传导阻滞",
+        "二度AV传导阻滞",
+        "Mobitz",
+        "Wenckebach",
+    ),
+    "pr_prolongation": ("PR间期延长", "PR 间期延长", "PR延长"),
+    "dropped_beats": ("漏搏", "脱落搏动", "P波未下传", "QRS波群脱落"),
     "palpitation": ("心悸", "心慌"),
     "muscle_cramp": ("抽筋", "肌肉痉挛", "手足搐搦"),
     "dark_urine": ("尿色变深", "深色尿", "酱油色尿"),
@@ -64,6 +204,22 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     ),
     "p_anca_positive": ("p-ANCA阳性", "P-ANCA阳性", "p-ANCA 阳性"),
     "renal_impairment": ("肾功能受损", "肌酐升高", "肾小球滤过率降低"),
+    "jaundice": ("黄疸", "皮肤黄染"),
+    "scleral_icterus": ("巩膜黄染", "眼白发黄"),
+    "neonatal_jaundice": ("新生儿黄疸", "出生后黄疸", "婴儿黄疸"),
+    "bilirubin_high": ("胆红素升高", "高胆红素血症"),
+    "unconjugated_hyperbilirubinemia": ("间接胆红素升高", "非结合胆红素升高", "未结合胆红素升高"),
+    "ugt1a1_positive": (
+        "UGT1A1基因突变",
+        "UGT1A1突变",
+        "UGT1A1双等位致病变异",
+        "UGT1A1 双等位致病变异",
+        "UGT1A1致病变异",
+        "UGT1A1变异",
+    ),
+    "genetic_suspicion": ("遗传", "家族史", "基因异常", "基因突变"),
+    "poor_feeding": ("喂养差", "吃奶差", "拒奶"),
+    "lethargy": ("嗜睡", "反应差", "精神差"),
     "low_magnesium": ("低镁血症", "血镁降低", "血镁偏低", "镁降低"),
     "low_urine_magnesium": ("尿镁降低", "尿镁偏低", "24小时尿镁降低"),
     "magnesium_load_retention_high": ("镁负荷保留率升高", "镁保留率升高"),
@@ -75,6 +231,10 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "waddling_gait": ("鸭步", "摇摆步态", "步态异常"),
     "mitral_regurgitation": ("二尖瓣反流", "二尖瓣返流"),
     "tricuspid_regurgitation": ("三尖瓣反流", "三尖瓣返流"),
+    "cardiac_murmur": ("心脏杂音", "收缩期杂音", "胸骨左缘杂音", "全收缩期杂音"),
+    "dextrocardia": ("右位心", "心脏右位", "右位心影"),
+    "right_apex_beat": ("心尖搏动右移", "右侧心尖搏动", "心尖搏动位于右侧"),
+    "mirror_image_ecg": ("胸前导联R波进展反向", "镜像心电图", "右位心心电图"),
     "pulmonary_valve_stenosis": ("肺动脉瓣狭窄",),
     "congenital_heart_defect": ("先天性心脏病", "先心病", "先天性心脏缺陷", "先天性缺损"),
     "ventricular_septal_defect": ("室间隔缺损", "大型室间隔缺损", "VSD"),
@@ -106,6 +266,17 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "oliguria": ("少尿", "尿量减少"),
     "eyelid_edema": ("眼睑水肿", "眼皮水肿"),
     "pruritus": ("皮肤瘙痒", "瘙痒"),
+    "vesicular_rash": ("水疱", "小水疱", "小泡泡", "疱疹样皮疹", "水痘样皮疹", "成批水疱"),
+    "childcare_exposure": ("幼儿园接触", "同班小朋友", "学校接触", "水痘接触史", "接触水痘", "接触确诊患儿"),
+    "maculopapular_rash": ("丘疹", "斑丘疹", "红色丘疹", "皮肤丘疹"),
+    "pericarditic_chest_pain": ("深呼吸加重", "平卧加重", "前倾缓解", "坐起前倾缓解", "胸膜性胸痛"),
+    "pericardial_effusion": ("心包积液", "心包腔积液"),
+    "pericardial_thickening": ("心包增厚", "心包膜增厚"),
+    "tuberculosis_exposure": ("结核接触", "结核病接触", "接触确诊患者", "接触肺结核患者"),
+    "post_icu_state": ("刚从ICU出来", "近期ICU", "ICU出院", "重症监护后"),
+    "immunocompromised": ("免疫抑制", "免疫低下", "长期激素", "化疗后", "移植后", "中性粒细胞减少"),
+    "candida_positive": ("念珠菌", "白色念珠菌", "假丝酵母菌", "Candida"),
+    "fungal_pneumonia": ("真菌性肺炎", "肺真菌感染", "真菌病原体"),
     "uremia": ("尿毒症", "终末期肾病", "ESRD"),
     "egfr_low": ("eGFR降低", "eGFR下降", "肾小球滤过率降低"),
     "urea_elevated": ("尿素氮升高", "BUN升高"),
@@ -122,15 +293,119 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "varices": ("食管胃底静脉曲张", "静脉曲张"),
     "thrombocytopenia": ("血小板减少", "血小板降低"),
     "detrusor_overactivity": ("逼尿肌过度活动",),
+    "urinary_incontinence": ("尿失禁", "漏尿"),
+    "stress_urinary_incontinence": ("压力性尿失禁", "压力性漏尿", "腹压性尿失禁"),
+    "urine_leak_with_pressure": ("咳嗽漏尿", "喷嚏漏尿", "大笑漏尿", "运动漏尿", "腹压增加漏尿", "腹压增加时漏尿"),
     "urinary_urgency": ("尿急",),
     "urinary_frequency": ("尿频",),
     "dysuria": ("尿痛", "排尿烧灼", "排尿时烧灼", "烧灼感"),
+    "perineal_pain": ("会阴痛", "会阴部疼痛", "会阴胀痛"),
+    "pelvic_pain": ("盆腔痛", "下腹痛", "耻骨上疼痛"),
+    "prostate_tenderness": ("前列腺压痛", "直肠指检压痛", "DRE压痛"),
+    "pyuria": ("脓尿", "尿白细胞增多", "白细胞尿"),
+    "bacteriuria": ("菌尿", "尿细菌增多"),
     "urine_culture_positive": ("尿培养阳性", "尿培养检出"),
     "urine_culture_no_growth": ("尿培养阴性", "尿培养无生长", "未培养出细菌"),
     "neutropenia": ("中性粒细胞减少", "粒细胞减少"),
     "splenomegaly": ("脾大", "脾脏增大"),
+    "cor_triatriatum": ("三房心", "左心房隔膜", "左房隔膜", "限制性开窗"),
+    "atrioventricular_septal_defect": ("心内膜垫缺损", "房室间隔缺损", "完全性房室间隔缺损", "共同房室瓣"),
+    "pulmonary_venous_obstruction": ("肺静脉回流受阻", "左房流入受阻", "肺静脉梗阻"),
+    "lacrimal_gland_swelling": ("泪腺肿大", "泪腺区肿胀", "眼睑外上方肿胀", "外上眶肿胀"),
+    "lacrimal_gland_pain": ("泪腺区疼痛", "眼眶外上方疼痛", "眼部压迫感"),
+    "tearing": ("流泪", "溢泪"),
+    "heartburn": ("烧心", "反酸", "胃酸反流"),
+    "retrosternal_burning": ("胸骨后烧灼", "胸口烧灼", "胸骨后烧灼样疼痛"),
+    "odynophagia": ("吞咽痛", "吞咽疼痛"),
+    "esophageal_ulcer": ("食管溃疡", "食道溃疡", "食管黏膜溃疡", "食管黏膜糜烂溃疡"),
+    "vaginal_bleeding": ("阴道出血", "阴道流血", "少量阴道流血"),
+    "early_pregnancy": ("早孕", "妊娠早期", "停经", "怀孕", "孕早期"),
+    "hcg_positive": ("β-hCG阳性", "血清β-hCG升高", "hCG阳性", "妊娠试验阳性"),
+    "progesterone_low": ("孕酮降低", "孕酮偏低"),
+    "oligomenorrhea": ("月经稀发", "月经不规律", "闭经", "月经紊乱"),
+    "hyperandrogenism": ("高雄激素", "多毛", "痤疮", "雄激素升高"),
+    "polycystic_ovaries": ("多囊卵巢", "多囊样卵巢", "卵巢多囊样改变"),
+    "treponemal_skin_lesion": ("莓疮", "雅司", "乳头瘤样皮损", "树莓样皮损", "湿疣样丘疹"),
+    "treponema_positive": ("梅毒螺旋体颗粒凝集试验阳性", "TPPA阳性", "螺旋体阳性", "Treponema"),
+    "iris_coloboma": ("虹膜缺损", "虹膜裂隙", "钥匙孔样瞳孔", "虹膜缺损畸形"),
+    "photophobia": ("畏光", "怕光"),
+    "night_vision_decline": ("夜视力下降", "夜间视力差"),
+    "visual_blurring": ("视物模糊", "看东西模糊", "视力下降", "看不清"),
+    "lens_dislocation": ("晶状体脱位", "晶状体半脱位", "晶状体位置异常"),
+    "dermatomal_pain": ("沿神经分布疼痛", "带状疼痛", "烧灼样皮痛"),
+    "renal_colic": ("肾绞痛", "腰腹部绞痛", "阵发性绞痛"),
+    "renal_stone": ("肾结石", "输尿管结石", "泌尿系结石"),
+    "triple_x_karyotype": ("47,XXX", "X三体", "Triple X", "超雌综合征"),
+    "tall_stature": ("身材高大", "高身材", "身高偏高"),
+    "premature_ovarian_insufficiency": ("卵巢功能不全", "卵巢早衰", "卵巢储备下降"),
+    "adrenal_insufficiency": ("肾上腺功能不全", "Addison", "阿狄森", "肾上腺皮质功能减退"),
+    "orthostatic_hypotension": ("体位性低血压", "直立性低血压", "站起时头晕", "卧立位血压下降"),
+    "hyperpigmentation": ("皮肤色素沉着", "色素沉着", "皮肤变黑"),
+    "cortisol_low": ("皮质醇降低", "血清皮质醇低", "8AM皮质醇低"),
+    "acth_high": ("ACTH升高", "促肾上腺皮质激素升高"),
+    "hyponatremia": ("低钠血症", "血钠降低", "钠降低"),
+    "near_vision_difficulty": ("看近模糊", "近距离看不清", "阅读困难", "填表困难", "看手机费劲"),
+    "age_related_near_blur": ("老花", "老视", "年龄相关调节不足", "中老年看近模糊"),
+    "refractive_error": ("屈光不正", "屈光异常", "验光异常", "需要阅读眼镜", "+1.50D"),
+    "ambiguous_genitalia": ("外生殖器发育异常", "性别发育异常", "生殖器不典型", "阴蒂肥大", "尿道下裂"),
+    "sex_development_disorder": ("性发育异常", "性别发育异常", "DSD", "性腺发育异常"),
+    "ovotesticular_tissue": ("卵睾组织", "卵巢和睾丸组织", "卵睾性"),
+    "karyotype_mosaic": ("嵌合核型", "染色体嵌合", "46,XX/46,XY", "46XX/46XY"),
+    "cryptorchidism": ("隐睾", "睾丸未降"),
+    "hypospadias": ("尿道下裂",),
+    "jaw_locked_open": ("张口后不能闭口", "嘴巴合不上", "下巴合不上", "张口不能闭合"),
+    "unable_close_mouth": ("不能闭口", "闭不上嘴", "口不能闭合"),
+    "preauricular_pain": ("耳前区疼痛", "颞下颌关节疼痛", "下颌关节疼痛"),
+    "tmj_dislocation": ("颞下颌关节脱位", "下颌关节脱位", "TMJ脱位"),
+    "malocclusion": ("咬合错乱", "咬合不齐"),
+    "anogenital_warts": ("肛周疣体", "外阴疣体", "生殖器疣", "肛生殖器疣", "尖锐湿疣"),
+    "cauliflower_lesions": ("菜花样赘生物", "菜花样疣体", "乳头状赘生物", "疣状赘生物"),
+    "hpv_related_lesions": ("HPV阳性", "HPV疣", "人乳头瘤病毒"),
+    "frothy_vaginal_discharge": ("泡沫样分泌物", "黄绿色泡沫样白带", "泡沫样白带"),
+    "vaginal_pruritus": ("外阴瘙痒", "阴道瘙痒"),
+    "strawberry_cervix": ("草莓样宫颈", "宫颈点状出血"),
+    "trichomonas_positive": ("滴虫阳性", "阴道毛滴虫", "毛滴虫阳性", "Trichomonas"),
+    "vaginal_ph_high": ("阴道pH升高", "阴道pH>4.5", "pH大于4.5"),
+    "umbilical_discharge": ("脐部流液", "脐部渗液", "脐部流脓", "脐孔流液"),
+    "umbilical_mass": ("脐部肿块", "脐下肿块", "脐周包块", "下腹正中包块", "下腹正中肿块"),
+    "midline_suprapubic_cyst": ("下腹正中囊性肿物", "膀胱顶部囊性肿物", "脐尿管残余"),
+    "urachal_cyst_imaging": ("脐尿管囊肿", "脐尿管残余囊肿", "urachal cyst"),
+    "rural_child_contact": ("农村接触", "乡村接触", "儿童密切接触", "共用毛巾", "其他儿童类似皮损"),
+    "crusted_exudative_skin_ulcer": ("结痂流黄水", "渗出结痂", "乳头瘤样皮损", "树莓样皮损", "慢性结痂皮损"),
+    "regional_lymphadenopathy": ("腹股沟淋巴结肿大", "局部淋巴结肿大", "区域淋巴结肿大"),
+    "treponemal_serology_positive": ("梅毒血清学阳性", "螺旋体血清学阳性", "TPPA阳性", "RPR阳性"),
     "leukocoria": ("白瞳", "瞳孔发白", "猫眼反光"),
     "intraocular_mass": ("眼内肿物", "眼内占位", "视网膜肿瘤"),
+    "nasopharyngeal_foreign_body_sensation": ("咽部异物感", "鼻咽异物感", "咽喉异物感"),
+    "throat_dryness": ("咽干", "咽部干燥", "鼻咽干燥"),
+    "throat_clearing": ("清嗓", "频繁清嗓", "反复清嗓"),
+    "chronic_course": ("慢性", "反复", "长期", "迁延"),
+    "nasopharyngoscopy_abnormal": ("鼻咽镜异常", "鼻咽黏膜充血", "鼻咽部充血", "鼻咽部淋巴滤泡"),
+    "nasopharyngeal_chronic_inflammation": (
+        "鼻咽慢性炎症",
+        "鼻咽部慢性炎症",
+        "鼻咽黏膜慢性炎症",
+        "鼻咽炎症改变",
+    ),
+    "cytology_chronic_inflammation": (
+        "脱落细胞学提示慢性炎症",
+        "脱落细胞学慢性炎症",
+        "细胞学慢性炎症",
+    ),
+    "microtia": ("小耳畸形", "小耳"),
+    "auricular_malformation": ("耳廓畸形", "耳郭畸形", "耳廓发育不良"),
+    "external_auditory_canal_atresia": ("外耳道闭锁", "外耳道狭窄"),
+    "congenital_onset": ("出生即有", "出生后即发现", "先天", "出生时"),
+    "hearing_loss": ("听力下降", "听力差", "听力异常"),
+    "tinnitus": ("耳鸣",),
+    "ear_pain": ("耳痛", "耳部疼痛", "耳朵痛"),
+    "ear_fullness": ("耳闷", "耳堵", "耳胀"),
+    "ear_canal_irritation_trigger": ("棉签掏耳", "掏耳", "挖耳", "耳道刺激", "外耳道刺激", "采耳后", "清理耳道后"),
+    "acute_tympanitis": ("急性鼓膜炎", "鼓膜炎"),
+    "tympanic_membrane_inflammation": ("鼓膜充血", "鼓膜红肿", "鼓膜炎症", "鼓膜明显充血", "鼓膜红斑"),
+    "tympanic_bulla": ("鼓膜疱疹", "鼓膜大疱", "鼓膜水疱", "大疱性鼓膜炎"),
+    "abr_abnormal": ("ABR异常", "听性脑干反应异常"),
+    "temporal_bone_ct_abnormal": ("颞骨CT异常", "颞骨发育异常"),
 }
 
 _NEGATIVE_FACT_FINDINGS = {
@@ -320,12 +595,87 @@ class EvidenceAgent:
         return self.normalizer.normalize(collected_info, exam_results).to_graph()
 
 
+class ClinicalEvidenceInterpreter:
+    """Translate patient language into reusable clinical findings."""
+
+    def interpret(
+        self,
+        collected_info: Optional[Dict[str, Any]],
+        exam_results: Optional[Dict[str, Any]],
+    ) -> List[Observation]:
+        text = self._case_text(collected_info, exam_results)
+        if not text:
+            return []
+        observations: List[Observation] = []
+        matched_findings: set = set()
+        for rule in _INTERPRETER_RULES:
+            finding = str(rule.get("finding") or "").strip()
+            terms = tuple(str(item) for item in rule.get("terms") or ())
+            term = next((item for item in terms if item and item in text), "")
+            if not finding or not term:
+                continue
+            matched_findings.add(finding)
+            observations.append(
+                Observation(
+                    finding=finding,
+                    source="evidence_interpreter",
+                    polarity="positive",
+                    confidence=float(rule.get("confidence", 0.86) or 0.86),
+                    raw_text=term,
+                    field_path=f"interpreter.{finding}",
+                )
+            )
+
+        # Composite interpretations are deliberately conservative: they describe
+        # a clinical pattern, not a diagnosis, and still require the Judge to decide.
+        if {"deep_skin_ulcer", "crusted_skin_lesion"} & matched_findings and (
+            {"tropical_exposure", "periostitis"} & matched_findings
+        ):
+            observations.append(
+                Observation(
+                    finding="treponemal_skin_lesion",
+                    source="evidence_interpreter",
+                    polarity="positive",
+                    confidence=0.9,
+                    raw_text="skin ulcer pattern with compatible exposure or periostitis",
+                    field_path="interpreter.treponemal_skin_lesion",
+                )
+            )
+        if "dyspnea_on_exertion" in matched_findings:
+            observations.append(
+                Observation(
+                    finding="cardiopulmonary_exertional_pattern",
+                    source="evidence_interpreter",
+                    polarity="positive",
+                    confidence=0.82,
+                    raw_text="dyspnea on exertion",
+                    field_path="interpreter.cardiopulmonary_exertional_pattern",
+                )
+            )
+        return observations
+
+    @staticmethod
+    def _case_text(
+        collected_info: Optional[Dict[str, Any]],
+        exam_results: Optional[Dict[str, Any]],
+    ) -> str:
+        parts: List[str] = []
+        for _path, value in _flatten_leaves(collected_info or {}):
+            parts.append(_stringify(value))
+        for exam_name, payload in (exam_results or {}).items():
+            parts.append(str(exam_name))
+            for _path, value in _flatten_leaves(payload):
+                parts.append(_stringify(value))
+        return " ".join(part for part in parts if part)
+
+
 class ClinicalEvidenceNormalizer:
     """Convert heterogeneous nested payloads into reusable observations."""
 
     def __init__(self, ref_dir: str = "data/ref_data"):
         self.ref_dir = ref_dir
         self.diagnosis_aliases = self._load_diagnosis_aliases()
+        self.interpreter = ClinicalEvidenceInterpreter()
 
     def normalize(
         self,
@@ -374,6 +724,7 @@ class ClinicalEvidenceNormalizer:
                         )
                     )
 
+        observations.extend(self.interpreter.interpret(info, exams))
         return EvidenceBundle(self._dedupe(observations))
 
     def _leaf_observations(
@@ -483,27 +834,152 @@ class ClinicalEvidenceNormalizer:
     ) -> List[Observation]:
         """Normalize common binary lab semantics into reusable fact findings."""
         compact = _normalize_term(text)
+        result_compact = _normalize_term(_result_value_text(text))
+        context = _normalize_term(f"{source} {path} {text}")
         findings: List[Tuple[str, float]] = []
         negative = any(
             token in compact
             for token in ("阴性", "无生长", "未培养出", "未检出", "正常", "0-5", "0～5")
         )
-        positive = any(token in compact for token in ("阳性", "检出", "异常", "升高", "+"))
+        result_negative = any(
+            token in result_compact
+            for token in ("阴性", "无生长", "未培养出", "未检出", "正常", "0-5", "0～5")
+        )
+        result_positive = any(
+            token in result_compact for token in ("阳性", "检出", "异常", "升高", "+")
+        )
+        positive = result_positive or any(token in compact for token in ("阳性", "检出", "异常", "升高", "+"))
+        def assertive_term(terms: Iterable[str]) -> bool:
+            for term in terms:
+                if _normalize_term(term) not in compact:
+                    continue
+                polarity, _ = self._polarity(text, term)
+                if polarity == "positive":
+                    return True
+            return False
 
-        if "尿培养" in compact or "culture" in compact:
-            if any(token in compact for token in ("阴性", "无生长", "未培养出", "未检出")):
+        if "尿培养" in context or "culture" in context:
+            if any(token in result_compact for token in ("阴性", "无生长", "未培养出", "未检出")):
                 findings.append(("urine_culture_no_growth", 0.96))
-            elif positive or "生长" in compact:
+            elif result_positive or "生长" in result_compact or (
+                "cfu" in result_compact and any(ch.isdigit() for ch in result_compact)
+            ) or any(
+                token in result_compact
+                for token in ("大肠埃希菌", "大肠杆菌", "肠球菌", "葡萄球菌", "克雷伯菌", "变形杆菌")
+            ):
                 findings.append(("urine_culture_positive", 0.94))
+        if "ugt1a1" in context and assertive_term(("突变", "变异", "致病", "阳性", "检出")):
+            findings.append(("ugt1a1_positive", 0.98))
+            findings.append(("genetic_suspicion", 0.92))
+        if any(token in context for token in ("鼻咽镜", "鼻咽")) and assertive_term(
+            (
+                "黏膜充血",
+                "粘膜充血",
+                "弥漫性充血",
+                "充血",
+                "增厚",
+                "黏液",
+                "痂皮",
+                "红斑",
+                "肿胀",
+                "淋巴滤泡",
+                "滤泡增生",
+                "慢性炎症",
+                "炎症改变",
+            )
+        ):
+            findings.append(("nasopharyngoscopy_abnormal", 0.94))
+            findings.append(("nasopharyngeal_chronic_inflammation", 0.9))
+        if any(token in context for token in ("脱落细胞学", "细胞学")) and assertive_term(
+            (
+                "慢性炎症",
+                "炎症改变",
+                "炎症细胞",
+                "炎性细胞浸润",
+                "白细胞浸润",
+                "大量脱落上皮细胞",
+                "淋巴细胞",
+                "中性粒细胞",
+            )
+        ):
+            findings.append(("cytology_chronic_inflammation", 0.92))
+            findings.append(("nasopharyngeal_chronic_inflammation", 0.86))
+        if any(token in context for token in ("直肠指检", "dre", "前列腺")) and assertive_term(("压痛",)):
+            findings.append(("prostate_tenderness", 0.96))
+        if any(token in context for token in ("耳镜", "鼓膜", "耳部")):
+            if assertive_term(("鼓膜充血", "鼓膜红肿", "鼓膜炎症", "鼓膜明显充血", "鼓膜红斑")):
+                findings.append(("tympanic_membrane_inflammation", 0.95))
+                findings.append(("acute_tympanitis", 0.9))
+            if assertive_term(("鼓膜疱疹", "鼓膜大疱", "鼓膜水疱", "大疱性鼓膜炎", "鼓膜疱")):
+                findings.append(("tympanic_bulla", 0.96))
+                findings.append(("acute_tympanitis", 0.94))
+        if any(token in context for token in ("痰培养", "真菌培养", "支气管镜", "肺泡灌洗", "病原学")):
+            if assertive_term(("念珠菌", "白色念珠菌", "假丝酵母菌", "candida")):
+                findings.append(("candida_positive", 0.96))
+                findings.append(("fungal_pneumonia", 0.86))
+        if any(token in context for token in ("裂隙灯", "眼科", "眼部", "虹膜")):
+            if assertive_term(("虹膜缺损", "虹膜裂隙", "钥匙孔样瞳孔", "虹膜缺损畸形")):
+                findings.append(("iris_coloboma", 0.96))
+        if any(token in context for token in ("胃镜", "上消化道内镜", "内镜", "活检", "食管")):
+            if assertive_term(("食管溃疡", "食道溃疡", "食管黏膜溃疡", "溃疡", "糜烂溃疡")):
+                findings.append(("esophageal_ulcer", 0.96))
+        if any(token in context for token in ("染色体", "核型", "基因检测", "遗传学")):
+            if assertive_term(("47,xxx", "x三体", "triple x", "超雌")):
+                findings.append(("triple_x_karyotype", 0.98))
+                findings.append(("genetic_suspicion", 0.9))
+        if any(token in context for token in ("妊娠试验", "βhcg", "β-hcg", "hcg")):
+            if result_positive or any(ch.isdigit() for ch in result_compact):
+                findings.append(("hcg_positive", 0.94))
+                findings.append(("early_pregnancy", 0.82))
+        if any(token in context for token in ("盆腔超声", "妇科超声", "阴道超声", "超声")):
+            if assertive_term(("宫内孕", "宫内妊娠", "孕囊", "胎心")):
+                findings.append(("early_pregnancy", 0.88))
+            if assertive_term(("多囊卵巢", "多囊样卵巢", "卵巢多囊样改变")):
+                findings.append(("polycystic_ovaries", 0.94))
+        if any(token in context for token in ("泪腺", "眼眶", "眼部")):
+            if assertive_term(("泪腺肿大", "泪腺区肿胀", "外上方肿胀", "泪腺炎")):
+                findings.append(("lacrimal_gland_swelling", 0.94))
+            if assertive_term(("泪腺区疼痛", "眼眶外上方疼痛", "压痛")):
+                findings.append(("lacrimal_gland_pain", 0.86))
+        if any(token in context for token in ("视力", "验光", "屈光", "阅读", "近距离")):
+            if assertive_term(("看近模糊", "阅读困难", "近距离看不清", "老花", "老视", "屈光异常", "+")):
+                findings.append(("near_vision_difficulty", 0.9))
+                findings.append(("refractive_error", 0.86))
+        if any(token in context for token in ("染色体", "核型", "基因", "性腺", "dsd")):
+            if assertive_term(("46,XX/46,XY", "46XX/46XY", "嵌合", "DSD", "性别发育异常")):
+                findings.append(("sex_development_disorder", 0.94))
+                findings.append(("karyotype_mosaic", 0.9))
+            if assertive_term(("卵睾", "卵巢和睾丸组织", "ovotesticular")):
+                findings.append(("ovotesticular_tissue", 0.96))
+        if any(token in context for token in ("颞下颌", "下颌", "tmj", "口腔颌面")):
+            if assertive_term(("脱位", "关节头前移", "下颌关节脱位")):
+                findings.append(("tmj_dislocation", 0.96))
+            if assertive_term(("不能闭口", "闭不上嘴", "张口不能闭合")):
+                findings.append(("unable_close_mouth", 0.9))
+        if any(token in context for token in ("外阴", "阴道", "宫颈", "肛周", "生殖器", "hpv")):
+            if assertive_term(("菜花样", "疣体", "乳头状赘生物", "尖锐湿疣", "HPV阳性")):
+                findings.append(("anogenital_warts", 0.94))
+                findings.append(("cauliflower_lesions", 0.9))
+            if assertive_term(("滴虫", "毛滴虫", "泡沫样", "草莓样宫颈")):
+                findings.append(("trichomonas_positive", 0.94))
+                findings.append(("frothy_vaginal_discharge", 0.84))
+            if assertive_term(("pH>4.5", "pH大于4.5", "pH升高")):
+                findings.append(("vaginal_ph_high", 0.86))
+        if any(token in context for token in ("脐尿管", "脐部", "脐孔", "膀胱顶部", "下腹正中")):
+            if assertive_term(("脐尿管囊肿", "脐尿管残余", "囊性肿物", "膀胱顶部囊性")):
+                findings.append(("urachal_cyst_imaging", 0.96))
+                findings.append(("midline_suprapubic_cyst", 0.88))
+            if assertive_term(("流液", "流脓", "渗液")):
+                findings.append(("umbilical_discharge", 0.9))
         if "白细胞酯酶" in compact:
             findings.append(
-                ("leukocyte_esterase_negative" if negative else "leukocyte_esterase_positive", 0.92)
+                ("leukocyte_esterase_negative" if result_negative else "leukocyte_esterase_positive", 0.92)
             )
         if "亚硝酸盐" in compact:
-            findings.append(("nitrite_negative" if negative else "nitrite_positive", 0.92))
-        if any(token in compact for token in ("尿白细胞", "尿液白细胞")) and negative:
+            findings.append(("nitrite_negative" if result_negative else "nitrite_positive", 0.92))
+        if any(token in compact for token in ("尿白细胞", "尿液白细胞")) and result_negative:
             findings.append(("urine_wbc_normal", 0.88))
-        if any(token in compact for token in ("残余尿", "排尿后残余")) and negative:
+        if any(token in compact for token in ("残余尿", "排尿后残余")) and result_negative:
             findings.append(("normal_postvoid_residual", 0.88))
         if not negative and any(
             token in compact
@@ -549,8 +1025,23 @@ class ClinicalEvidenceNormalizer:
             return []
         key = _normalize_term(path + " " + text)
         findings: List[Tuple[str, float]] = []
-        if "镁" in key:
+        if any(token in key for token in ("心率", "脉搏", "heartrate", "pulse", "hr")) and value is not None and value < 50:
+            findings.append(("bradycardia", 0.94))
+        elif any(token in key for token in ("pr间期", "printerval")) and value is not None and (
+            value > 200 or value > 0.20
+        ):
+            findings.append(("pr_prolongation", 0.94))
+        elif "镁" in key:
             findings.extend(self._magnesium_numeric_findings(key, value, direction))
+        elif any(token in key for token in ("间接胆红素", "非结合胆红素", "未结合胆红素")) and direction == "high":
+            findings.extend(
+                [
+                    ("unconjugated_hyperbilirubinemia", 0.96),
+                    ("bilirubin_high", 0.92),
+                ]
+            )
+        elif "胆红素" in key and direction == "high":
+            findings.append(("bilirubin_high", 0.92))
         elif any(token in key for token in ("25羟维生素d", "25ohd", "维生素d")) and direction == "low":
             findings.append(("vitamin_d_low", 0.94))
         elif any(token in key for token in ("碱性磷酸酶", "alp")) and direction == "high":
@@ -565,6 +1056,19 @@ class ClinicalEvidenceNormalizer:
             findings.append(("urea_elevated", 0.92))
         elif any(token in key for token in ("血钾", "钾")) and direction == "high":
             findings.append(("hyperkalemia", 0.9))
+        elif any(token in key for token in ("血钠", "钠")) and direction == "low":
+            findings.append(("hyponatremia", 0.9))
+        elif any(token in key for token in ("皮质醇", "cortisol")) and direction == "low":
+            findings.append(("cortisol_low", 0.94))
+            findings.append(("adrenal_insufficiency", 0.86))
+        elif any(token in key for token in ("acth", "促肾上腺皮质激素")) and direction == "high":
+            findings.append(("acth_high", 0.92))
+            findings.append(("adrenal_insufficiency", 0.86))
+        elif any(token in key for token in ("孕酮", "progesterone")) and direction == "low":
+            findings.append(("progesterone_low", 0.9))
+        elif any(token in key for token in ("βhcg", "β-hcg", "hcg")) and (direction == "high" or (value is not None and value > 5)):
+            findings.append(("hcg_positive", 0.94))
+            findings.append(("early_pregnancy", 0.82))
         elif any(token in key for token in ("碳酸氢根", "hco3", "ph")) and direction == "low":
             findings.append(("metabolic_acidosis", 0.88))
         elif any(token in key for token in ("白蛋白", "albumin")) and direction == "low":
@@ -577,6 +1081,12 @@ class ClinicalEvidenceNormalizer:
             findings.append(("thrombocytopenia", 0.9))
         elif any(token in key for token in ("尿红细胞", "rbc")) and direction == "high":
             findings.append(("microscopic_hematuria", 0.94))
+        elif any(token in key for token in ("尿白细胞", "白细胞尿", "wbc")) and direction == "high":
+            findings.append(("pyuria", 0.92))
+        elif any(token in key for token in ("尿细菌", "细菌计数", "bacteria")) and (
+            direction == "high" or value is not None
+        ):
+            findings.append(("bacteriuria", 0.9))
         elif any(token in key for token in ("mpoanca", "mpo抗体", "抗mpo", "髓过氧化物酶抗体")) and (
             direction == "high" or value is not None
         ):

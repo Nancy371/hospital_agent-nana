@@ -47,6 +47,11 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         for item in evaluated
         if (item.get("metrics") or {}).get("candidate_recall_at_5") is not None
     ]
+    recall20_values = [
+        (item.get("metrics") or {}).get("candidate_recall_at_20")
+        for item in evaluated
+        if (item.get("metrics") or {}).get("candidate_recall_at_20") is not None
+    ]
     critic_issue_count = sum(1 for audit in audits if audit.get("critic_issues"))
     critic_llm_count = sum(1 for audit in audits if audit.get("critic_llm_used"))
     total = len(results)
@@ -57,7 +62,60 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "examination_precision": metric("examination_precision"),
         "treatment_overall_score": metric("treatment_overall_score"),
         "treatment_safety": metric("treatment_safety"),
+        "candidate_recall_at_20": _mean_training_value(recall20_values),
         "candidate_recall_at_5": _mean_training_value(recall_values),
+        "ranking_accuracy": metric("ranking_accuracy"),
+        "submission_alignment": metric("submission_alignment"),
+        "submission_override_count": metric("submission_override_count"),
+        "etiology_preference": metric("etiology_preference"),
+        "decision_override_rate": metric("decision_override_rate"),
+        "judge_gap_authorization_rate": metric("judge_gap_authorization_rate"),
+        "required_gap_authorized_count": metric("required_gap_authorized_count"),
+        "judge_primary_accuracy": metric("judge_primary_accuracy"),
+        "explanatory_coverage": metric("explanatory_coverage"),
+        "core_explanatory_coverage": metric("core_explanatory_coverage"),
+        "residual_evidence_score": metric("residual_evidence_score"),
+        "residual_core_evidence_count": metric("residual_core_evidence_count"),
+        "differential_exam_precision": metric("differential_exam_precision"),
+        "discriminating_exam_recall": metric("discriminating_exam_recall"),
+        "exam_information_gain": metric("exam_information_gain"),
+        "discriminating_gap_closed_rate": metric("discriminating_gap_closed_rate"),
+        "gap_closure_rate": metric("gap_closure_rate"),
+        "dynamic_rerank_changed_primary": metric("dynamic_rerank_changed_primary"),
+        "explanation_score_changed_ranking_rate": metric(
+            "explanation_score_changed_ranking_rate"
+        ),
+        "primary_unlock_rate": metric("primary_unlock_rate"),
+        "legacy_exam_package_contribution_rate": metric(
+            "legacy_exam_package_contribution_rate"
+        ),
+        "differential_exam_contribution_rate": metric(
+            "differential_exam_contribution_rate"
+        ),
+        "gap_state_satisfied_count": metric("gap_state_satisfied_count"),
+        "gap_state_actionable_count": metric("gap_state_actionable_count"),
+        "gap_state_nonblocking_count": metric("gap_state_nonblocking_count"),
+        "gap_state_unsupported_count": metric("gap_state_unsupported_count"),
+        "gap_state_hard_blocked_count": metric("gap_state_hard_blocked_count"),
+        "gap_state_partially_satisfied_count": metric(
+            "gap_state_partially_satisfied_count"
+        ),
+        "fallback_to_pre_discrimination_primary": metric(
+            "fallback_to_pre_discrimination_primary"
+        ),
+        "pairwise_judge_accuracy": metric("pairwise_judge_accuracy"),
+        "differential_pool_precision": metric("differential_pool_precision"),
+        "differential_pool_expected_included": metric(
+            "differential_pool_expected_included"
+        ),
+        "pairwise_noise_rejection_count": metric("pairwise_noise_rejection_count"),
+        "cluster_gate_rejection_count": metric("cluster_gate_rejection_count"),
+        "core_evidence_coverage": metric("core_evidence_coverage"),
+        "judge_deferred_primary": metric("judge_deferred_primary"),
+        "unauthorized_exam_count": metric("unauthorized_exam_count"),
+        "required_evidence_coverage": metric("required_evidence_coverage"),
+        "soft_contradiction_count": metric("soft_contradiction_count"),
+        "hard_contradiction_count": metric("hard_contradiction_count"),
         "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,
         "critic_llm_rate": round(critic_llm_count / total, 4) if total else 0.0,
         "average_elapsed_seconds": _mean_training_value(

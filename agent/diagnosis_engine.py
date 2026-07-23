@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .candidate_generator import CandidateGenerator, CandidatePool
 from .clinical_evidence import EvidenceBundle, Observation
+from .diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter
 from .diagnosis_resolver import DiagnosisResolution, OpenWorldDiagnosisResolver
 
 
@@ -16,6 +17,61 @@ _SECONDARY_MANIFESTATION_DIAGNOSES = {
     "心律失常",
     "心力衰竭",
     "肺动脉高压",
+}
+
+_GENERIC_EXPLANATORY_FINDINGS = {
+    "acute_course",
+    "chronic_course",
+    "cough",
+    "dizziness",
+    "dyspnea",
+    "fatigue",
+    "fever",
+    "pain",
+    "pruritus",
+    "rash",
+    "weakness",
+}
+
+_CORE_EXPLANATORY_FINDINGS = {
+    "age_related_near_blur",
+    "ambiguous_genitalia",
+    "anogenital_warts",
+    "bradycardia",
+    "cauliflower_lesions",
+    "childcare_exposure",
+    "crusted_exudative_skin_ulcer",
+    "dark_urine",
+    "deep_skin_ulcer",
+    "dermatomal_vesicles",
+    "dyspnea_on_exertion",
+    "exercise_intolerance",
+    "fluid_retention_pattern",
+    "hemoptysis",
+    "iris_coloboma",
+    "lens_dislocation",
+    "midline_suprapubic_cyst",
+    "near_vision_difficulty",
+    "night_sweats",
+    "orthopnea",
+    "ovotesticular_tissue",
+    "paroxysmal_nocturnal_dyspnea",
+    "periorbital_edema",
+    "periostitis",
+    "polydipsia",
+    "postprandial_nausea",
+    "regional_lymphadenopathy",
+    "rural_child_contact",
+    "sex_development_disorder",
+    "treponema_positive",
+    "treponemal_disease_pattern",
+    "treponemal_serology_positive",
+    "treponemal_skin_lesion",
+    "tropical_exposure",
+    "tuberculosis_exposure",
+    "umbilical_discharge",
+    "umbilical_mass",
+    "urachal_cyst_imaging",
 }
 
 
@@ -33,6 +89,8 @@ class CandidateScore:
     hard_contradiction: bool
     matched_evidence: List[str] = field(default_factory=list)
     contradicted_evidence: List[str] = field(default_factory=list)
+    soft_contradicted_evidence: List[str] = field(default_factory=list)
+    hard_contradicted_evidence: List[str] = field(default_factory=list)
     required_gaps: List[str] = field(default_factory=list)
     residual_evidence: List[str] = field(default_factory=list)
     component_scores: Dict[str, float] = field(default_factory=dict)
@@ -43,6 +101,15 @@ class CandidateScore:
     causal_relation_to_selected: str = ""
     differential_only: bool = False
     differential_only_reason: str = ""
+    required_gap_authorized: bool = False
+    required_gap_state: str = ""
+    explanatory_coverage: float = 0.0
+    core_explanatory_coverage: float = 0.0
+    residual_evidence_score: float = 0.0
+    residual_core_evidence_count: int = 0
+    explained_evidence: List[str] = field(default_factory=list)
+    unexplained_core_evidence: List[str] = field(default_factory=list)
+    explanatory_rank_reason: str = ""
 
     @property
     def trusted(self) -> bool:
@@ -69,6 +136,16 @@ class DiagnosisDecision:
     name_resolutions: List[Dict[str, Any]] = field(default_factory=list)
     unresolved_candidates: List[str] = field(default_factory=list)
     differential_only_diagnoses: List[Dict[str, Any]] = field(default_factory=list)
+    pre_authorization_diagnoses: List[str] = field(default_factory=list)
+    authorized_diagnoses: List[str] = field(default_factory=list)
+    blocked_diagnoses: List[Dict[str, Any]] = field(default_factory=list)
+    submission_override_count: int = 0
+    retriever_top1: str = ""
+    judge_primary: str = ""
+    submitter_final: List[str] = field(default_factory=list)
+    decision_override: bool = False
+    required_gap_authorized_diagnoses: List[str] = field(default_factory=list)
+    judge_decision: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -83,6 +160,18 @@ class DiagnosisDecision:
             "name_resolutions": list(self.name_resolutions),
             "unresolved_candidates": list(self.unresolved_candidates),
             "differential_only_diagnoses": list(self.differential_only_diagnoses),
+            "pre_authorization_diagnoses": list(self.pre_authorization_diagnoses),
+            "authorized_diagnoses": list(self.authorized_diagnoses),
+            "blocked_diagnoses": list(self.blocked_diagnoses),
+            "submission_override_count": int(self.submission_override_count),
+            "retriever_top1": self.retriever_top1,
+            "judge_primary": self.judge_primary,
+            "submitter_final": list(self.submitter_final),
+            "decision_override": bool(self.decision_override),
+            "required_gap_authorized_diagnoses": list(
+                self.required_gap_authorized_diagnoses
+            ),
+            "judge_decision": dict(self.judge_decision),
         }
 
 
@@ -93,6 +182,7 @@ class DiagnosticKnowledgeBase:
         self.ref_dir = ref_dir
         self.catalog_path = os.path.join(ref_dir, "diseases_catalog.json")
         self.extensions_path = os.path.join(ref_dir, "submission_diagnosis_extensions.json")
+        self.graph_path = os.path.join(ref_dir, "disease_graph.json")
         self.knowledge_path = os.path.join(ref_dir, "diagnostic_knowledge.json")
         self.entries: Dict[str, Dict[str, Any]] = {}
         self.aliases: Dict[str, str] = {}
@@ -177,6 +267,8 @@ class DiagnosticKnowledgeBase:
             entry["sources"] = list(item.get("sources", []) or [])
             self.entries[name] = entry
 
+        self._merge_disease_graph()
+
         profiles: Dict[str, Dict[str, Any]] = {}
         if os.path.isdir(self.ref_dir):
             for filename in sorted(os.listdir(self.ref_dir)):
@@ -204,6 +296,48 @@ class DiagnosticKnowledgeBase:
             entry["treatment_protocol"] = list(profile.get("treatment_principles", []) or [])
             entry["avoid_mistakes"] = list(profile.get("avoid_mistakes", []) or [])
             entry["supporting_evidence"] = self._profile_support(profile, name)
+            entry["category"] = str(profile.get("category") or entry.get("category") or "")
+            if profile.get("diagnosis_type"):
+                entry["diagnosis_type"] = str(profile.get("diagnosis_type") or "")
+            if profile.get("specificity") is not None:
+                entry["specificity"] = float(profile.get("specificity") or entry.get("specificity") or 0.5)
+            if profile.get("parent_diagnosis") is not None:
+                entry["parent_diagnosis"] = str(profile.get("parent_diagnosis") or entry.get("parent_diagnosis") or "")
+            entry["body_system"] = str(profile.get("body_system") or entry.get("body_system") or "")
+            entry["disease_family"] = str(
+                profile.get("disease_family")
+                or profile.get("family")
+                or entry.get("disease_family")
+                or entry.get("family")
+                or ""
+            )
+            entry["family"] = entry["disease_family"]
+            if profile.get("required_groups"):
+                entry["required_groups"] = list(profile.get("required_groups") or [])
+            for key in ("causes", "caused_by", "suppress_diagnoses", "related_complications"):
+                entry[key] = _dedupe_objects(
+                    list(entry.get(key, []) or []) + list(profile.get(key, []) or [])
+                )
+            entry["generalization_suppressions"] = list(
+                dict.fromkeys(
+                    list(entry.get("generalization_suppressions", []) or [])
+                    + list(profile.get("generalization_suppressions", []) or [])
+                    + list(profile.get("common_confusions", []) or [])
+                    + list(profile.get("generic_suppressions", []) or [])
+                )
+            )
+            if profile.get("negative_features"):
+                entry["contradictions"] = _dedupe_objects(
+                    list(entry.get("contradictions", []) or [])
+                    + [
+                        dict(item, hard=bool(item.get("hard", False)))
+                        if isinstance(item, dict)
+                        else {"terms": [str(item)], "hard": False}
+                        for item in profile.get("negative_features", []) or []
+                    ]
+                )
+
+        self._merge_disease_graph()
 
         for knowledge_payload in self._iter_knowledge_payloads():
             if knowledge_payload.get("knowledge_version"):
@@ -229,6 +363,8 @@ class DiagnosticKnowledgeBase:
                         "contradictions",
                         "causes",
                         "caused_by",
+                        "suppress_diagnoses",
+                        "generalization_suppressions",
                     }:
                         merged[key] = _dedupe_objects(
                             list(merged.get(key, [])) + list(value or [])
@@ -236,6 +372,8 @@ class DiagnosticKnowledgeBase:
                     else:
                         merged[key] = value
                 self.entries[name] = merged
+
+        self._merge_disease_graph()
 
         # A direct positive or negative mention is a generic evidence source for every disease.
         for name, entry in self.entries.items():
@@ -269,11 +407,17 @@ class DiagnosticKnowledgeBase:
             "contradictions": [],
             "discriminating_exams": [],
             "specificity": 0.5,
+            "body_system": "",
+            "disease_family": "",
+            "family": "",
             "treatment_protocol": [],
             "contraindications": [],
             "suppress_diagnoses": [],
             "causes": [],
             "caused_by": [],
+            "related_complications": [],
+            "category": "",
+            "generalization_suppressions": [],
             "sources": [],
             "source_version": "",
             "department": "",
@@ -290,7 +434,55 @@ class DiagnosticKnowledgeBase:
             text = str(red_flag).strip()
             if text:
                 specs.append({"terms": [text], "weight": 0.24})
+        for item in profile.get("hallmark_findings", []) or []:
+            spec = _coerce_profile_evidence_spec(item, default_weight=0.55)
+            if spec:
+                specs.append(spec)
+        for item in profile.get("discriminating_features", []) or []:
+            spec = _coerce_profile_evidence_spec(item, default_weight=0.34)
+            if spec:
+                specs.append(spec)
         return specs
+
+    def _merge_disease_graph(self) -> None:
+        payload = _read_json(self.graph_path, {})
+        nodes = payload.get("nodes", []) if isinstance(payload, dict) else []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            name = str(node.get("name") or "").strip()
+            if not name or name not in self.entries:
+                continue
+            entry = self.entries[name]
+            entry["aliases"] = _dedupe_objects(
+                list(entry.get("aliases", []) or []) + list(node.get("aliases", []) or [])
+            )
+            self.aliases[name] = name
+            for alias in entry.get("aliases", []) or []:
+                text = str(alias).strip()
+                if text:
+                    self.aliases[text] = name
+            if node.get("body_system"):
+                entry["body_system"] = str(node.get("body_system") or "")
+            family = str(node.get("family") or node.get("disease_family") or "")
+            if family:
+                entry["disease_family"] = family
+                entry["family"] = family
+            if node.get("specificity") is not None:
+                entry["specificity"] = float(node.get("specificity") or entry.get("specificity") or 0.5)
+            if node.get("parent_diagnosis") is not None:
+                entry["parent_diagnosis"] = str(node.get("parent_diagnosis") or entry.get("parent_diagnosis") or "")
+            for key in ("generic_suppressions", "common_confusions"):
+                if node.get(key):
+                    entry["generalization_suppressions"] = _dedupe_objects(
+                        list(entry.get("generalization_suppressions", []) or [])
+                        + list(node.get(key, []) or [])
+                    )
+            for key in ("related_complications", "causes", "caused_by", "suppress_diagnoses"):
+                if node.get(key):
+                    entry[key] = _dedupe_objects(
+                        list(entry.get(key, []) or []) + list(node.get(key, []) or [])
+                    )
 
 
 class DiagnosisDecisionEngine:
@@ -326,6 +518,8 @@ class DiagnosisDecisionEngine:
         self.knowledge = DiagnosticKnowledgeBase(ref_dir=ref_dir)
         self.resolver = OpenWorldDiagnosisResolver(self.knowledge, config=config)
         self.candidate_generator = CandidateGenerator(self.knowledge, self.resolver)
+        self.judge = DiagnosisJudge(config=config, knowledge=self.knowledge)
+        self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
 
     @staticmethod
     def _load_weights(configured: Dict[str, Any]) -> Dict[str, float]:
@@ -339,6 +533,8 @@ class DiagnosisDecisionEngine:
             "age": 0.02,
             "risk": 0.03,
             "residual": 0.10,
+            "core_explain": 0.12,
+            "core_residual": 0.08,
             "contradiction": 1.0,
         }
         for key, default in list(defaults.items()):
@@ -378,6 +574,7 @@ class DiagnosisDecisionEngine:
             )
             for name, entry in self.knowledge.entries.items()
         ]
+        self._apply_competitive_specificity(scores)
         scores = self._sort_candidates(scores)
         self._clear_submission_marks(scores)
 
@@ -423,7 +620,7 @@ class DiagnosisDecisionEngine:
             or any(item.hard_contradiction for item in selected)
         )
         reasoning = self._reasoning(selected, unexplained)
-        return DiagnosisDecision(
+        decision = DiagnosisDecision(
             final_diagnoses=final_names,
             trusted_diagnoses=trusted_names,
             # Keep all scored diagnoses in the local audit object. Prompt and
@@ -439,25 +636,324 @@ class DiagnosisDecisionEngine:
             unresolved_candidates=list(candidate_pool.unresolved_candidates),
             differential_only_diagnoses=differential_only,
         )
+        self.judge_and_submit(decision)
+        return decision
+
+    def judge_and_submit(self, decision: DiagnosisDecision) -> DiagnosisDecision:
+        """Run the replayable judge and submitter over an existing decision."""
+        if not decision:
+            return decision
+        judge_decision = self.judge.judge(
+            decision.candidates,
+            preselected=decision.final_diagnoses,
+            max_final_diagnoses=self.max_final_diagnoses,
+        )
+        self.submitter.apply(decision, judge_decision)
+        self.authorize_final_diagnoses(
+            decision,
+            decision.final_diagnoses,
+            respect_differential_only=True,
+        )
+        return decision
 
     def filter_final_diagnoses(
         self,
         diagnosis_names: Sequence[str],
         scores: Sequence[CandidateScore],
+        respect_differential_only: bool = False,
     ) -> List[CandidateScore]:
-        self._clear_submission_marks(scores)
+        if not respect_differential_only:
+            self._clear_submission_marks(scores)
         score_by_name = {item.diagnosis: item for item in scores}
         pool = [
             score_by_name[name]
             for name in dict.fromkeys(str(item).strip() for item in diagnosis_names if str(item).strip())
             if name in score_by_name
-            and score_by_name[name].trusted
+            and (
+                score_by_name[name].trusted
+                or getattr(score_by_name[name], "required_gap_authorized", False)
+                or bool(score_by_name[name].matched_evidence)
+            )
             and not score_by_name[name].hard_contradiction
+            and not (
+                respect_differential_only
+                and score_by_name[name].differential_only
+            )
         ]
         selected = self._select_final(self._sort_candidates(pool))
         selected = self._append_independent_states(selected, scores)
         self._annotate_causal_relations(scores, selected)
         return selected[: self.max_final_diagnoses]
+
+    def authorize_final_diagnoses(
+        self,
+        decision: DiagnosisDecision,
+        requested_names: Optional[Sequence[str]] = None,
+        respect_differential_only: bool = True,
+    ) -> DiagnosisDecision:
+        """Apply the final deterministic submission gate.
+
+        Ranking decides what is clinically plausible. Authorization decides what is
+        allowed to enter the strict final `diagnosis` payload.
+        """
+        if not decision:
+            return decision
+
+        score_by_name = {item.diagnosis: item for item in decision.candidates}
+        pre_names = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in (
+                    requested_names
+                    if requested_names is not None
+                    else decision.final_diagnoses
+                )
+                if str(item).strip()
+            )
+        )
+        if not pre_names:
+            pre_names = list(decision.final_diagnoses or [])
+
+        eligible: List[CandidateScore] = []
+        blocked: List[Dict[str, Any]] = []
+        for name in pre_names:
+            candidate = score_by_name.get(name)
+            reason = self._authorization_ineligible_reason(
+                candidate,
+                respect_differential_only=respect_differential_only,
+            )
+            if reason:
+                if candidate:
+                    self._mark_differential_only(candidate, reason)
+                blocked.append(self._authorization_block_record(name, candidate, reason))
+                continue
+            if candidate and candidate not in eligible:
+                eligible.append(candidate)
+
+        if not eligible:
+            decision.pre_authorization_diagnoses = pre_names
+            decision.authorized_diagnoses = []
+            decision.blocked_diagnoses = blocked
+            decision.submission_override_count = len(pre_names)
+            decision.final_diagnoses = []
+            decision.trusted_diagnoses = []
+            decision.confidence = 0.0
+            decision.differential_only_diagnoses = self.differential_only_details(
+                decision.candidates
+            )
+            self._annotate_causal_relations(decision.candidates, [])
+            return decision
+
+        primary = self._choose_authorized_primary(eligible, decision)
+        authorized: List[CandidateScore] = [primary]
+        for candidate in eligible:
+            if candidate.diagnosis == primary.diagnosis:
+                continue
+            reason = self._secondary_authorization_block_reason(
+                candidate,
+                primary,
+                authorized,
+            )
+            if reason:
+                self._mark_differential_only(candidate, reason)
+                blocked.append(
+                    self._authorization_block_record(
+                        candidate.diagnosis,
+                        candidate,
+                        reason,
+                    )
+                )
+                continue
+            authorized.append(candidate)
+            if len(authorized) >= self.max_final_diagnoses:
+                break
+
+        authorized_names = [item.diagnosis for item in authorized]
+        requested_set = set(pre_names)
+        authorized_set = set(authorized_names)
+        for name in pre_names:
+            if name in authorized_set or not score_by_name.get(name):
+                continue
+            if any(item.get("diagnosis") == name for item in blocked):
+                continue
+            candidate = score_by_name[name]
+            reason = "not selected by final diagnosis authorization gate"
+            self._mark_differential_only(candidate, reason)
+            blocked.append(self._authorization_block_record(name, candidate, reason))
+
+        decision.pre_authorization_diagnoses = pre_names
+        decision.authorized_diagnoses = authorized_names
+        decision.blocked_diagnoses = blocked
+        decision.submission_override_count = max(
+            0,
+            len(requested_set.symmetric_difference(authorized_set)),
+        )
+        decision.final_diagnoses = authorized_names
+        decision.trusted_diagnoses = [
+            item.diagnosis
+            for item in authorized
+            if item.score >= self.trusted_threshold
+            or getattr(item, "required_gap_authorized", False)
+        ]
+        decision.confidence = authorized[0].score if authorized else 0.0
+        self._annotate_causal_relations(decision.candidates, authorized)
+        decision.differential_only_diagnoses = self.differential_only_details(
+            decision.candidates
+        )
+        return decision
+
+    def _authorization_ineligible_reason(
+        self,
+        candidate: Optional[CandidateScore],
+        respect_differential_only: bool = True,
+    ) -> str:
+        if candidate is None:
+            return "not present in evidence-first candidate table"
+        if respect_differential_only and candidate.differential_only:
+            return candidate.differential_only_reason or "differential only"
+        if candidate.hard_contradiction:
+            return "hard contradiction present"
+        gap_authorized = bool(getattr(candidate, "required_gap_authorized", False))
+        if gap_authorized and not candidate.matched_evidence:
+            return "required gap authorization has no supporting evidence"
+        if not candidate.matched_evidence:
+            return "no matched supporting evidence"
+        if not candidate.trusted and not gap_authorized and candidate.score <= 0:
+            return "not trusted by evidence-first decision"
+        return ""
+
+    def _choose_authorized_primary(
+        self,
+        eligible: Sequence[CandidateScore],
+        decision: DiagnosisDecision,
+    ) -> CandidateScore:
+        current_names = list(decision.final_diagnoses or [])
+        for name in current_names:
+            for candidate in eligible:
+                if candidate.diagnosis == name:
+                    return candidate
+        return self._sort_candidates(eligible)[0]
+
+    def _secondary_authorization_block_reason(
+        self,
+        candidate: CandidateScore,
+        primary: CandidateScore,
+        selected: Sequence[CandidateScore],
+    ) -> str:
+        if candidate.hard_contradiction:
+            return "secondary diagnosis has hard contradiction"
+        if self._is_generic_parent_of_selected(candidate, selected):
+            return "generic parent suppressed by a more specific primary diagnosis"
+        if self._is_suppressed_by_selected(candidate, selected):
+            return "suppressed by selected primary diagnosis"
+        if self._diagnosis_causes(primary.diagnosis, candidate.diagnosis):
+            if (
+                self._is_secondary_manifestation(candidate)
+                and self._has_independent_state_evidence(candidate)
+            ):
+                return ""
+            return "downstream manifestation is fully explained by primary diagnosis"
+        if self._diagnosis_causes(candidate.diagnosis, primary.diagnosis):
+            if self._has_authorized_independent_objective_evidence(candidate):
+                return ""
+            return "upstream etiology remains audit-only without independent objective evidence"
+        if self._diagnoses_submission_related(candidate.diagnosis, primary.diagnosis):
+            if self._has_authorized_independent_objective_evidence(candidate):
+                return ""
+            return "related diagnosis lacks independent objective evidence"
+        if self._explains_selected_residual(candidate, selected) and (
+            self._has_authorized_independent_objective_evidence(candidate)
+        ):
+            return ""
+        return "differential-only or low-explainability companion diagnosis"
+
+    def _is_structural_comorbidity_candidate(
+        self,
+        candidate: CandidateScore,
+        selected: Sequence[CandidateScore],
+    ) -> bool:
+        if not selected:
+            return False
+        dtype = candidate.diagnosis_type.lower()
+        if dtype not in {"structural", "etiology", "metabolic"} and candidate.specificity < 0.88:
+            return False
+        return any(
+            self._same_family_or_explicit_related(candidate.diagnosis, item.diagnosis)
+            for item in selected
+        )
+
+    def _same_family_or_explicit_related(self, left: str, right: str) -> bool:
+        if left == right:
+            return True
+        left_entry = self.knowledge.get(left)
+        right_entry = self.knowledge.get(right)
+        left_related = set(str(item) for item in left_entry.get("related_complications", []) or [])
+        right_related = set(str(item) for item in right_entry.get("related_complications", []) or [])
+        if right in left_related or left in right_related:
+            return True
+        left_system = str(left_entry.get("body_system") or "")
+        right_system = str(right_entry.get("body_system") or "")
+        left_family = str(left_entry.get("disease_family") or left_entry.get("family") or "")
+        right_family = str(right_entry.get("disease_family") or right_entry.get("family") or "")
+        return bool(left_system and left_system == right_system and left_family and left_family == right_family)
+
+    def _is_suppressed_by_selected(
+        self,
+        candidate: CandidateScore,
+        selected: Sequence[CandidateScore],
+    ) -> bool:
+        selected_names = {item.diagnosis for item in selected}
+        for item in selected:
+            entry = self.knowledge.get(item.diagnosis)
+            suppressed = set(str(value) for value in entry.get("suppress_diagnoses", []) or [])
+            suppressed.update(
+                str(value) for value in entry.get("generalization_suppressions", []) or []
+            )
+            if candidate.diagnosis in suppressed:
+                return True
+            if candidate.parent_diagnosis and candidate.parent_diagnosis in selected_names:
+                return True
+        return False
+
+    def _has_authorized_independent_objective_evidence(
+        self,
+        candidate: CandidateScore,
+    ) -> bool:
+        if f"diagnosis:{candidate.diagnosis}" in set(candidate.matched_evidence or []):
+            return True
+        return self._has_independent_state_evidence(candidate) or bool(
+            candidate.component_scores.get("objective_evidence", 0.0) >= 1.0
+        )
+
+    @staticmethod
+    def _authorization_block_record(
+        name: str,
+        candidate: Optional[CandidateScore],
+        reason: str,
+    ) -> Dict[str, Any]:
+        record: Dict[str, Any] = {"diagnosis": name, "reason": reason}
+        if candidate is not None:
+            record.update(
+                {
+                    "score": candidate.score,
+                    "coverage_score": candidate.coverage_score,
+                    "residual_score": candidate.residual_score,
+                    "required_met": candidate.required_met,
+                    "required_gap_authorized": bool(
+                        getattr(candidate, "required_gap_authorized", False)
+                    ),
+                    "hard_contradiction": candidate.hard_contradiction,
+                    "matched_evidence": list(candidate.matched_evidence[:6]),
+                    "contradicted_evidence": list(candidate.contradicted_evidence[:6]),
+                    "soft_contradicted_evidence": list(
+                        candidate.soft_contradicted_evidence[:6]
+                    ),
+                    "hard_contradicted_evidence": list(
+                        candidate.hard_contradicted_evidence[:6]
+                    ),
+                }
+            )
+        return record
 
     def apply_to_result(
         self,
@@ -466,9 +962,23 @@ class DiagnosisDecisionEngine:
         evidence: EvidenceBundle,
     ) -> Dict[str, Any]:
         fixed = dict(result or {})
+        self.authorize_final_diagnoses(
+            decision,
+            decision.final_diagnoses,
+            respect_differential_only=True,
+        )
         decision.differential_only_diagnoses = self.differential_only_details(decision.candidates)
         fixed["diagnosis"] = list(decision.final_diagnoses)
         fixed["_trusted_diagnoses"] = list(decision.trusted_diagnoses)
+        fixed["_authorized_diagnoses"] = list(decision.authorized_diagnoses or decision.final_diagnoses)
+        fixed["_blocked_diagnoses"] = list(decision.blocked_diagnoses)
+        fixed["_retriever_top1"] = decision.retriever_top1
+        fixed["_judge_primary"] = decision.judge_primary
+        fixed["_submitter_final"] = list(decision.submitter_final or decision.final_diagnoses)
+        fixed["_required_gap_authorized_diagnoses"] = list(
+            decision.required_gap_authorized_diagnoses
+        )
+        fixed["_authorization_locked"] = True
         fixed["_diagnosis_decision"] = decision.to_dict()
         fixed["_diagnosis_name_resolution"] = list(decision.name_resolutions)
         fixed["_unresolved_diagnosis_candidates"] = list(decision.unresolved_candidates)
@@ -484,10 +994,16 @@ class DiagnosisDecisionEngine:
     ) -> List[CandidateScore]:
         return sorted(candidates, key=self._candidate_sort_key, reverse=True)
 
-    def _candidate_sort_key(self, candidate: CandidateScore) -> Tuple[float, int, float, float, float]:
+    def _candidate_sort_key(self, candidate: CandidateScore) -> Tuple[float, int, float, float, float, float]:
+        audit_visibility_bonus = 0.0
+        if candidate.source_prior >= 0.5 and candidate.matched_evidence:
+            audit_visibility_bonus += 0.04
+        if self._is_secondary_manifestation(candidate) and candidate.matched_evidence:
+            audit_visibility_bonus += 0.10
         return (
-            self._adjudication_score(candidate),
+            self._adjudication_score(candidate) + audit_visibility_bonus,
             self._diagnosis_type_rank(candidate),
+            candidate.source_prior,
             1.0 - candidate.residual_score,
             candidate.specificity,
             candidate.score,
@@ -561,6 +1077,7 @@ class DiagnosisDecisionEngine:
         for item in scores:
             item.differential_only = False
             item.differential_only_reason = ""
+            item.required_gap_authorized = False
 
     def differential_only_details(
         self,
@@ -632,7 +1149,8 @@ class DiagnosisDecisionEngine:
                 required_gaps.append(_render_required_group(group))
         required_met = not required_gaps
 
-        contradicted: List[str] = []
+        soft_contradicted: List[str] = []
+        hard_contradicted: List[str] = []
         contradiction_penalty = 0.0
         hard_contradiction = False
         direct_negative = [
@@ -640,16 +1158,26 @@ class DiagnosisDecisionEngine:
             if item.finding == f"diagnosis:{entry['name']}" and item.polarity == "negative"
         ]
         if direct_negative:
-            contradicted.append(f"diagnosis:{entry['name']}")
-            contradiction_penalty += 0.65
-            hard_contradiction = True
+            direct_name = f"diagnosis:{entry['name']}"
+            direct_positive = any(
+                item.finding == direct_name and item.polarity == "positive"
+                for item in evidence.observations
+            )
+            if direct_positive or (required_met and support_score >= 0.5):
+                soft_contradicted.append(direct_name)
+                contradiction_penalty += 0.25
+            else:
+                hard_contradicted.append(direct_name)
+                contradiction_penalty += 0.65
+                hard_contradiction = True
 
         for spec in entry.get("contradictions", []) or []:
             spec = _coerce_spec(spec)
             hits = _matching_observations(spec, evidence.observations, polarity=spec.get("polarity", "positive"))
             if not hits:
                 continue
-            contradicted.extend(item.finding for item in hits)
+            target = hard_contradicted if bool(spec.get("hard", False)) else soft_contradicted
+            target.extend(item.finding for item in hits)
             contradiction_penalty += float(spec.get("penalty", 0.35) or 0.35)
             hard_contradiction = hard_contradiction or bool(spec.get("hard", False))
 
@@ -659,13 +1187,20 @@ class DiagnosisDecisionEngine:
         for item in evidence.observations:
             if item.polarity == "negative" and item.finding in supporting_findings:
                 contradiction_penalty += 0.2
-                contradicted.append(item.finding)
+                soft_contradicted.append(item.finding)
 
-        coverage_score, residual_score, residual_evidence = self._explainability(
+        explainability = self._explainability(
             support_specs,
             evidence,
             bool(matched),
         )
+        coverage_score = explainability["coverage"]
+        residual_score = explainability["residual_score"]
+        core_coverage = explainability["core_coverage"]
+        residual_evidence_score = explainability["residual_evidence_score"]
+        residual_core_evidence = explainability["unexplained_core_evidence"]
+        explained_evidence = explainability["explained_evidence"]
+        residual_evidence = explainability["residual_evidence"]
         explanation = coverage_score
         specificity = float(entry.get("specificity", 0.5) or 0.5)
         has_signal = bool(matched or prior > 0)
@@ -686,17 +1221,30 @@ class DiagnosisDecisionEngine:
             + self.weights["prior"] * max(0.0, min(1.0, prior))
             + self.weights["specificity"] * specificity_score
             + self.weights["explain"] * explanation
+            + self.weights["core_explain"] * core_coverage
             + self.weights["exam_match"] * exam_match
             + self.weights["temporal"] * temporal
             + self.weights["age"] * age
             + self.weights["risk"] * risk
             - self.weights["residual"] * residual_score
+            - self.weights["core_residual"] * min(1.0, 0.20 * len(residual_core_evidence))
             - self.weights["contradiction"] * contradiction_penalty
             - gap_penalty
         )
         if not required_met and self.required_group_policy != "gap_only":
             raw_score = min(raw_score, self.differential_threshold - 0.01)
         score = max(0.0, min(1.0, raw_score))
+        required_gap_state = self._required_gap_state(
+            entry=entry,
+            required_met=required_met,
+            hard_contradiction=hard_contradiction,
+            matched_evidence=matched,
+            required_gaps=required_gaps,
+            coverage_score=coverage_score,
+            core_coverage=core_coverage,
+            residual_score=residual_score,
+            residual_core_count=len(residual_core_evidence),
+        )
         return CandidateScore(
             diagnosis=entry["name"],
             score=round(score, 4),
@@ -705,11 +1253,28 @@ class DiagnosisDecisionEngine:
             explanation_score=round(explanation, 4),
             coverage_score=round(coverage_score, 4),
             residual_score=round(residual_score, 4),
+            explanatory_coverage=round(coverage_score, 4),
+            core_explanatory_coverage=round(core_coverage, 4),
+            residual_evidence_score=round(residual_evidence_score, 4),
+            residual_core_evidence_count=len(residual_core_evidence),
+            explained_evidence=list(dict.fromkeys(explained_evidence))[:12],
+            unexplained_core_evidence=list(dict.fromkeys(residual_core_evidence))[:12],
+            explanatory_rank_reason=self._explanatory_rank_reason(
+                coverage_score,
+                core_coverage,
+                residual_evidence_score,
+                residual_core_evidence,
+            ),
             contradiction_penalty=round(contradiction_penalty, 4),
             required_met=required_met,
             hard_contradiction=hard_contradiction,
+            required_gap_state=required_gap_state,
             matched_evidence=list(dict.fromkeys(matched)),
-            contradicted_evidence=list(dict.fromkeys(contradicted)),
+            contradicted_evidence=list(
+                dict.fromkeys(hard_contradicted + soft_contradicted)
+            ),
+            soft_contradicted_evidence=list(dict.fromkeys(soft_contradicted)),
+            hard_contradicted_evidence=list(dict.fromkeys(hard_contradicted)),
             required_gaps=list(dict.fromkeys(required_gaps)),
             residual_evidence=list(dict.fromkeys(residual_evidence))[:12],
             component_scores={
@@ -718,13 +1283,24 @@ class DiagnosisDecisionEngine:
                 "specificity": round(specificity_score, 4),
                 "explain": round(explanation, 4),
                 "coverage": round(coverage_score, 4),
+                "explanatory_coverage": round(coverage_score, 4),
+                "core_explanatory_coverage": round(core_coverage, 4),
                 "residual": round(residual_score, 4),
+                "residual_evidence_score": round(residual_evidence_score, 4),
+                "residual_core_evidence_count": float(len(residual_core_evidence)),
                 "exam_match": round(exam_match, 4),
                 "temporal": round(temporal, 4),
                 "age": round(age, 4),
                 "risk": round(risk, 4),
                 "contradiction": round(contradiction_penalty, 4),
+                "soft_contradiction_count": float(
+                    len(set(soft_contradicted))
+                ),
+                "hard_contradiction_count": float(
+                    len(set(hard_contradicted))
+                ),
                 "required_gap_penalty": round(gap_penalty, 4),
+                "required_gap_state": required_gap_state,
                 "objective_evidence": 1.0 if objective_evidence else 0.0,
             },
             candidate_sources=list(candidate_sources or []),
@@ -733,33 +1309,196 @@ class DiagnosisDecisionEngine:
             specificity=specificity,
         )
 
+    @staticmethod
+    def _required_gap_state(
+        entry: Dict[str, Any],
+        required_met: bool,
+        hard_contradiction: bool,
+        matched_evidence: Sequence[str],
+        required_gaps: Sequence[str],
+        coverage_score: float,
+        core_coverage: float,
+        residual_score: float,
+        residual_core_count: int,
+    ) -> str:
+        if hard_contradiction:
+            return "hard_contradiction"
+        if required_met and not required_gaps:
+            return "satisfied"
+        if not matched_evidence:
+            return "unsupported_gap"
+        if required_gaps:
+            has_actionable_exam = bool(
+                entry.get("discriminating_exams")
+                or entry.get("strong_verification_exams")
+                or entry.get("required_exams")
+            )
+            if has_actionable_exam:
+                return "actionable_gap"
+            if core_coverage >= 0.40 or (
+                coverage_score >= 0.52 and residual_score <= 0.48
+            ):
+                return "nonblocking_gap"
+            if coverage_score >= 0.28 or residual_core_count <= 2:
+                return "partially_satisfied"
+            return "unsupported_gap"
+        if core_coverage >= 0.40 or coverage_score >= 0.52:
+            return "nonblocking_gap"
+        return "partially_satisfied"
+
+    def _apply_competitive_specificity(self, scores: Sequence[CandidateScore]) -> None:
+        by_name = {item.diagnosis: item for item in scores}
+        for specific in scores:
+            if specific.hard_contradiction or not specific.matched_evidence:
+                continue
+            if not (
+                specific.required_met
+                or specific.source_prior >= 0.45
+                or specific.coverage_score >= self.evidence_gap_coverage_threshold
+            ):
+                continue
+            entry = self.knowledge.get(specific.diagnosis)
+            generic_names = set(str(item) for item in entry.get("generalization_suppressions", []) or [])
+            generic_names.update(str(item) for item in entry.get("suppress_diagnoses", []) or [])
+            if specific.parent_diagnosis:
+                generic_names.add(specific.parent_diagnosis)
+            for generic_name in generic_names:
+                generic = by_name.get(generic_name)
+                if not generic or generic.hard_contradiction:
+                    continue
+                if generic.specificity > specific.specificity and generic.parent_diagnosis != specific.diagnosis:
+                    continue
+                penalty = 0.14 if specific.required_met else 0.08
+                generic.score = round(max(0.0, generic.score - penalty), 4)
+                generic.component_scores["generalization_penalty"] = round(
+                    generic.component_scores.get("generalization_penalty", 0.0) + penalty,
+                    4,
+                )
+
+        av_block = by_name.get("二度房室传导阻滞")
+        low_mag = by_name.get("低镁血症")
+        if av_block and low_mag and av_block.matched_evidence:
+            conduction_signal = {
+                "second_degree_av_block",
+                "av_block",
+                "bradycardia",
+                "pr_prolongation",
+                "dropped_beats",
+            }
+            low_mag_direct = {"low_magnesium", "magnesium_depletion", "magnesium_load_retention_high"}
+            if (
+                conduction_signal & set(av_block.matched_evidence)
+                and not (low_mag_direct & set(low_mag.matched_evidence))
+            ):
+                low_mag.score = round(max(0.0, low_mag.score - 0.16), 4)
+                low_mag.component_scores["anchoring_penalty"] = round(
+                    low_mag.component_scores.get("anchoring_penalty", 0.0) + 0.16,
+                    4,
+                )
+
     def _explainability(
         self,
         support_specs: Sequence[Dict[str, Any]],
         evidence: EvidenceBundle,
         has_matched_signal: bool,
-    ) -> Tuple[float, float, List[str]]:
+    ) -> Dict[str, Any]:
         major = evidence.major()
         if not major:
             coverage = 0.5 if has_matched_signal else 0.0
-            return coverage, 0.0, []
+            return {
+                "coverage": coverage,
+                "core_coverage": coverage,
+                "residual_score": 0.0,
+                "residual_evidence_score": 0.0,
+                "residual_evidence": [],
+                "explained_evidence": [],
+                "unexplained_core_evidence": [],
+            }
 
         total_weight = 0.0
         explained_weight = 0.0
+        core_weight = 0.0
+        explained_core_weight = 0.0
         residual: List[str] = []
+        explained: List[str] = []
+        core_residual: List[str] = []
         for observation in major:
             weight = self._observation_explainability_weight(observation)
             total_weight += weight
+            is_core = self._is_core_explanatory_observation(observation)
+            if is_core:
+                core_weight += weight
             if any(_observation_matches(spec, observation) for spec in support_specs):
                 explained_weight += weight
+                explained.append(observation.finding)
+                if is_core:
+                    explained_core_weight += weight
             else:
                 residual.append(observation.finding)
+                if is_core:
+                    core_residual.append(observation.finding)
 
         if total_weight <= 0:
-            return 0.0, 0.0, []
+            return {
+                "coverage": 0.0,
+                "core_coverage": 0.0,
+                "residual_score": 0.0,
+                "residual_evidence_score": 0.0,
+                "residual_evidence": [],
+                "explained_evidence": [],
+                "unexplained_core_evidence": [],
+            }
         coverage = max(0.0, min(1.0, explained_weight / total_weight))
         residual_score = max(0.0, min(1.0, 1.0 - coverage))
-        return coverage, residual_score, residual
+        core_coverage = (
+            max(0.0, min(1.0, explained_core_weight / core_weight))
+            if core_weight > 0
+            else coverage
+        )
+        return {
+            "coverage": coverage,
+            "core_coverage": core_coverage,
+            "residual_score": residual_score,
+            "residual_evidence_score": residual_score,
+            "residual_evidence": list(dict.fromkeys(residual)),
+            "explained_evidence": list(dict.fromkeys(explained)),
+            "unexplained_core_evidence": list(dict.fromkeys(core_residual)),
+        }
+
+    @staticmethod
+    def _is_core_explanatory_observation(observation: Observation) -> bool:
+        finding = str(observation.finding or "")
+        if not finding or finding.startswith("field:"):
+            return False
+        if finding.startswith("diagnosis:"):
+            return True
+        if finding in _CORE_EXPLANATORY_FINDINGS:
+            return True
+        if finding in _GENERIC_EXPLANATORY_FINDINGS:
+            return False
+        if observation.value is not None or observation.direction:
+            return True
+        if observation.source != "问诊" and not finding.startswith("symptom:"):
+            return True
+        return not finding.startswith("symptom:")
+
+    @staticmethod
+    def _explanatory_rank_reason(
+        coverage: float,
+        core_coverage: float,
+        residual_score: float,
+        core_residual: Sequence[str],
+    ) -> str:
+        if core_residual:
+            return (
+                "core residual evidence remains: "
+                + ", ".join(str(item) for item in core_residual[:4])
+            )
+        if core_coverage >= 0.75 and coverage >= 0.55:
+            return "high explanatory coverage with low core residual evidence"
+        if residual_score >= 0.55:
+            return "low explanatory coverage with high residual evidence"
+        return "moderate explanatory coverage"
 
     @staticmethod
     def _observation_explainability_weight(observation: Observation) -> float:
@@ -896,6 +1635,8 @@ class DiagnosisDecisionEngine:
         selected: List[CandidateScore] = []
         suppressed: Set[str] = set()
         for candidate in pool:
+            if candidate.differential_only:
+                continue
             if not candidate.trusted:
                 continue
             if candidate.diagnosis in suppressed:
@@ -905,17 +1646,15 @@ class DiagnosisDecisionEngine:
             if parent:
                 selected = [
                     item for item in selected
-                    if item.diagnosis != parent or self._has_independent_state_evidence(item)
+                    if item.diagnosis != parent
+                    or self._can_keep_parent_with_specific_child(item)
                 ]
-            # If a more specific selected child already points to this candidate as parent,
-            # retain the parent only when it has independent state evidence.
-            if any(item.parent_diagnosis == candidate.diagnosis for item in selected):
-                if not self._has_independent_state_evidence(candidate):
-                    self._mark_differential_only(
-                        candidate,
-                        "作为更泛化的父诊断保留鉴别，但已有更具体诊断且缺少独立状态证据，不作为最终诊断提交。",
-                    )
-                    continue
+            if self._is_generic_parent_of_selected(candidate, selected):
+                self._mark_differential_only(
+                    candidate,
+                    "作为更泛化的父诊断保留鉴别，但已有更具体诊断且缺少独立状态证据，不作为最终诊断提交。",
+                )
+                continue
             if self._is_explained_secondary_manifestation(candidate, selected):
                 self._mark_differential_only(
                     candidate,
@@ -952,7 +1691,15 @@ class DiagnosisDecisionEngine:
             return result
         selected_names = {item.diagnosis for item in result}
         for candidate in scores:
+            if candidate.differential_only:
+                continue
             if candidate.diagnosis in selected_names:
+                continue
+            if self._is_generic_parent_of_selected(candidate, result):
+                self._mark_differential_only(
+                    candidate,
+                    "作为更泛化的父诊断保留鉴别，但已有更具体诊断且缺少独立状态证据，不作为最终诊断提交。",
+                )
                 continue
             if not candidate.trusted:
                 continue
@@ -964,7 +1711,13 @@ class DiagnosisDecisionEngine:
                 continue
             if not self._is_final_companion_eligible(candidate, result):
                 continue
-            if not self._has_independent_state_evidence(candidate):
+            if not (
+                self._has_independent_state_evidence(candidate)
+                or (
+                    self._is_structural_comorbidity_candidate(candidate, result)
+                    and self._has_authorized_independent_objective_evidence(candidate)
+                )
+            ):
                 continue
             result.append(candidate)
             selected_names.add(candidate.diagnosis)
@@ -1087,6 +1840,7 @@ class DiagnosisDecisionEngine:
             return False
         return not any(
             self._diagnoses_causally_related(candidate.diagnosis, item.diagnosis)
+            or self._same_family_or_explicit_related(candidate.diagnosis, item.diagnosis)
             for item in selected
         )
 
@@ -1097,6 +1851,23 @@ class DiagnosisDecisionEngine:
             dtype in {"syndrome", "state", "complication"}
             or candidate.diagnosis in _SECONDARY_MANIFESTATION_DIAGNOSES
         )
+
+    def _can_keep_parent_with_specific_child(self, candidate: CandidateScore) -> bool:
+        return (
+            self._is_secondary_manifestation(candidate)
+            and self._has_independent_state_evidence(candidate)
+        )
+
+    def _is_generic_parent_of_selected(
+        self,
+        candidate: CandidateScore,
+        selected: Sequence[CandidateScore],
+    ) -> bool:
+        if not selected:
+            return False
+        if not any(item.parent_diagnosis == candidate.diagnosis for item in selected):
+            return False
+        return not self._can_keep_parent_with_specific_child(candidate)
 
     @staticmethod
     def _is_causal_primary(candidate: CandidateScore) -> bool:
@@ -1112,10 +1883,22 @@ class DiagnosisDecisionEngine:
             )
         if f"diagnosis:{candidate.diagnosis}" in candidate.matched_evidence:
             return True
-        return (
-            candidate.diagnosis == "心力衰竭"
-            and "heart_failure_state" in candidate.matched_evidence
+        if candidate.diagnosis != "心力衰竭":
+            return False
+        matched = set(candidate.matched_evidence or [])
+        if "heart_failure_state" in matched:
+            return True
+        congestion = bool(matched & {"leg_edema", "symptom:下肢水肿", "symptom:脚踝水肿"})
+        positional_dyspnea = bool(
+            matched
+            & {
+                "orthopnea",
+                "paroxysmal_nocturnal_dyspnea",
+                "symptom:端坐呼吸",
+                "symptom:夜间阵发性呼吸困难",
+            }
         )
+        return congestion and positional_dyspnea
 
     def _diagnosis_causes(self, cause: str, effect: str) -> bool:
         cause_entry = self.knowledge.get(cause)
@@ -1135,6 +1918,16 @@ class DiagnosisDecisionEngine:
             return True
         left_entry = self.knowledge.get(left)
         right_entry = self.knowledge.get(right)
+        left_related = set(str(item) for item in left_entry.get("related_complications", []) or [])
+        right_related = set(str(item) for item in right_entry.get("related_complications", []) or [])
+        if right in left_related or left in right_related:
+            return True
+        left_system = str(left_entry.get("body_system") or "")
+        right_system = str(right_entry.get("body_system") or "")
+        left_family = str(left_entry.get("disease_family") or left_entry.get("family") or "")
+        right_family = str(right_entry.get("disease_family") or right_entry.get("family") or "")
+        if left_system and left_system == right_system and left_family and left_family == right_family:
+            return True
         left_parent = str(left_entry.get("parent_diagnosis") or "")
         right_parent = str(right_entry.get("parent_diagnosis") or "")
         return (
@@ -1160,6 +1953,9 @@ class DiagnosisDecisionEngine:
                     break
                 if self._diagnosis_causes(candidate.diagnosis, name):
                     relation = f"causes:{name}"
+                    break
+                if self._diagnoses_submission_related(candidate.diagnosis, name):
+                    relation = f"related:{name}"
                     break
             candidate.causal_relation_to_selected = relation or (
                 "unrelated_to_selected" if selected_names else ""
@@ -1234,6 +2030,20 @@ def _observation_matches(spec: Dict[str, Any], item: Observation) -> bool:
         if item.value is None or item.value > float(spec["max_value"]):
             return False
     return bool(finding or direction or source_contains or terms or spec.get("min_value") is not None or spec.get("max_value") is not None)
+
+
+def _coerce_profile_evidence_spec(value: Any, default_weight: float) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        spec = dict(value)
+    else:
+        text = str(value or "").strip()
+        spec = {"terms": [text]} if text else {}
+    if not spec:
+        return {}
+    if not (spec.get("finding") or spec.get("terms") or spec.get("source_contains")):
+        return {}
+    spec["weight"] = float(spec.get("weight", default_weight) or default_weight)
+    return spec
 
 
 def _coerce_spec(value: Any) -> Dict[str, Any]:

@@ -92,16 +92,29 @@ class QualityAgent:
 
         fixed = dict(result)
         raw_diagnosis = fixed.get("diagnosis") or fixed.get("diagnoses")
+        authorization_locked = bool(fixed.get("_authorization_locked"))
+        authorized_diagnoses = [
+            str(item).strip()
+            for item in (fixed.get("_authorized_diagnoses") or [])
+            if str(item).strip()
+        ]
         trusted_diagnoses = [
             str(item).strip()
             for item in (fixed.get("_trusted_diagnoses") or [])
             if str(item).strip()
         ]
-        diagnosis = self.normalize_diagnoses(
-            raw_diagnosis,
-            collected_info=collected_info,
-            trusted_diagnoses=trusted_diagnoses,
-        )
+        if authorization_locked:
+            diagnosis = [
+                item for item in authorized_diagnoses
+                if item in self.allowed_diagnoses
+            ]
+            raw_diagnosis = list(authorized_diagnoses)
+        else:
+            diagnosis = self.normalize_diagnoses(
+                raw_diagnosis,
+                collected_info=collected_info,
+                trusted_diagnoses=trusted_diagnoses,
+            )
         raw_items = raw_diagnosis if isinstance(raw_diagnosis, list) else [raw_diagnosis]
         for item in raw_items:
             item_text = str(item) if item else ""

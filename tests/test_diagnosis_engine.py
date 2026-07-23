@@ -25,16 +25,29 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
 
     def test_allowed_namespace_is_official_plus_controlled_extensions(self):
         self.assertEqual(len(self.engine.knowledge.official_names), 50)
-        self.assertEqual(len(self.engine.knowledge.extension_names), 25)
-        self.assertEqual(len(self.engine.knowledge.allowed_names), 75)
+        self.assertGreaterEqual(len(self.engine.knowledge.extension_names), 48)
+        self.assertEqual(
+            len(self.engine.knowledge.allowed_names),
+            len(self.engine.knowledge.official_names) + len(self.engine.knowledge.extension_names),
+        )
         self.assertIn("肺隐球菌病", self.engine.knowledge.extension_names)
         self.assertIn("霰粒肿", self.engine.knowledge.extension_names)
         self.assertIn("支原体肺炎", self.engine.knowledge.extension_names)
+        self.assertIn("二度房室传导阻滞", self.engine.knowledge.extension_names)
+        self.assertIn("克里格勒-纳贾尔综合征", self.engine.knowledge.extension_names)
+        self.assertIn("慢性鼻咽炎", self.engine.knowledge.extension_names)
+        self.assertIn("小耳畸形", self.engine.knowledge.extension_names)
+        self.assertIn("急性细菌性前列腺炎", self.engine.knowledge.extension_names)
         self.assertIn("先天性心脏病", self.engine.knowledge.extension_names)
         self.assertIn("终末期肾病", self.engine.knowledge.extension_names)
         self.assertIn("卵巢过度刺激综合征", self.engine.knowledge.extension_names)
         self.assertIn("门静脉高压", self.engine.knowledge.extension_names)
-        self.assertEqual(self.engine.knowledge.knowledge_version, "2026-07-16")
+        self.assertIn("创伤后骨关节炎", self.engine.knowledge.extension_names)
+        self.assertIn("右位心", self.engine.knowledge.extension_names)
+        self.assertIn("室间隔缺损（VSD）", self.engine.knowledge.extension_names)
+        self.assertIn("压力性尿失禁", self.engine.knowledge.extension_names)
+        self.assertIn("急性鼓膜炎", self.engine.knowledge.extension_names)
+        self.assertEqual(self.engine.knowledge.knowledge_version, "2026-07-21-graph-v2")
         self.assertIn("acr_vasculitis_2021", self.engine.knowledge.source_registry)
         self.assertEqual(
             self.engine.knowledge.source_registry["esc_valvular_2025"]["role"],
@@ -52,6 +65,8 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
             "contraindications",
             "causes",
             "caused_by",
+            "category",
+            "generalization_suppressions",
             "sources",
             "source_version",
         }
@@ -125,7 +140,7 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertTrue(low_mag.required_met)
         self.assertEqual(decision.final_diagnoses[0], "低镁血症")
 
-    def test_unmet_etiology_candidate_is_not_submitted_without_key_evidence(self):
+    def test_unmet_etiology_candidate_uses_gap_state_not_required_gate(self):
         _, decision = self.decide(
             {"symptoms": ["腹泻", "手足抽筋", "心悸"]},
             {},
@@ -138,7 +153,10 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         )
         low_mag = next(item for item in decision.candidates if item.diagnosis == "低镁血症")
         self.assertFalse(low_mag.required_met)
-        self.assertNotIn("低镁血症", decision.final_diagnoses)
+        self.assertFalse(low_mag.hard_contradiction)
+        self.assertEqual(low_mag.required_gap_state, "actionable_gap")
+        self.assertIn("低镁血症", decision.final_diagnoses)
+        self.assertIn("低镁血症", decision.judge_decision["evidence_gap_targets"])
 
     def test_pulmonary_renal_evidence_promotes_microscopic_polyangiitis(self):
         _, decision = self.decide(
@@ -184,7 +202,8 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertFalse(vasculitis.hard_contradiction)
         self.assertGreater(vasculitis.coverage_score, cad.coverage_score)
         self.assertLess(vasculitis.residual_score, cad.residual_score)
-        self.assertNotIn("显微镜下多血管炎", decision.final_diagnoses)
+        self.assertIn("显微镜下多血管炎", decision.final_diagnoses)
+        self.assertIn("显微镜下多血管炎", decision.required_gap_authorized_diagnoses)
 
     def test_vitamin_d_biochemistry_and_bone_findings_promote_rickets(self):
         _, decision = self.decide(
@@ -328,7 +347,8 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
             },
             llm={"diagnosis": ["大型室间隔缺损伴艾森门格综合征早期表现"]},
         )
-        self.assertEqual(decision.final_diagnoses[0], "先天性心脏病")
+        self.assertEqual(decision.final_diagnoses[0], "室间隔缺损（VSD）")
+        self.assertNotIn("先天性心脏病", decision.final_diagnoses)
         self.assertNotIn("肺不张", decision.final_diagnoses)
 
     def test_renal_failure_evidence_promotes_esrd_and_suppresses_bone_diagnosis(self):
