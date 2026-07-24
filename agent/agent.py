@@ -695,7 +695,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         self.exam_agent = ExamStrategyAgent(
             self.knowledge,
             discriminating_exam_max_items=int(
-                diagnosis_config.get("discriminating_exam_max_items", 4) or 4
+                diagnosis_config.get("discriminating_exam_max_items", 6) or 6
             ),
         )
         self.inquiry_agent = InquiryStrategyAgent(self.knowledge)
@@ -1555,6 +1555,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "exam_authorization_details": list(
                         strategy.get("exam_authorization_details") or []
                     ),
+                    "generic_exam_suppression_count": int(
+                        strategy.get("generic_exam_suppression_count", 0) or 0
+                    ),
                 }
             )
         exam_items = self.exam_agent.prepare_order_items(
@@ -1890,12 +1893,49 @@ class MyDoctorAgent(BaseDoctorAgent):
             for finding in positive_findings
             if not finding.startswith(("field:", "symptom:"))
         }
+        high_information_observations = [
+            item
+            for item in observations
+            if item.get("polarity", "positive") == "positive"
+            and not item.get("shadowed_by")
+            and float(item.get("information_value") or 0.0) >= 0.75
+        ]
+        shadowed_observations = [
+            item for item in observations if item.get("shadowed_by")
+        ]
+        information_values = [
+            float(item.get("information_value") or 0.0)
+            for item in observations
+            if item.get("polarity", "positive") == "positive"
+        ]
+        high_information_findings = {
+            str(item.get("finding"))
+            for item in high_information_observations
+            if item.get("finding")
+        }
+        shadowed_findings = [
+            {
+                "finding": str(item.get("finding") or ""),
+                "shadowed_by": str(item.get("shadowed_by") or ""),
+            }
+            for item in shadowed_observations
+            if item.get("finding")
+        ]
         finding_extraction_summary = {
             "observation_count": len(observations),
             "positive_finding_count": len(positive_findings),
             "negative_finding_count": len(negative_findings),
             "diagnostic_finding_count": len(diagnostic_findings),
             "diagnostic_findings": sorted(diagnostic_findings)[:24],
+            "high_information_finding_count": len(high_information_findings),
+            "high_information_findings": sorted(high_information_findings)[:24],
+            "generic_finding_shadowed_count": len(shadowed_observations),
+            "shadowed_findings": shadowed_findings[:24],
+            "evidence_information_value_mean": (
+                round(sum(information_values) / max(1, len(information_values)), 4)
+                if information_values
+                else None
+            ),
         }
         top_candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
         matched_count = len(top_candidate.get("matched_evidence") or [])
@@ -1948,6 +1988,44 @@ class MyDoctorAgent(BaseDoctorAgent):
             for detail in (record.get("exam_authorization_details") or [])
             if isinstance(detail, dict)
         ]
+        ordered_exam_set = set(ordered_exam_names)
+        ordered_authorization_details = [
+            detail
+            for detail in exam_authorization_details
+            if str(detail.get("exam") or "") in ordered_exam_set
+        ]
+        special_discriminator_rate = (
+            sum(
+                1
+                for detail in ordered_authorization_details
+                if str(detail.get("exam_type") or "") == "special_discriminator"
+            )
+            / max(1, len(ordered_authorization_details))
+            if ordered_authorization_details
+            else None
+        )
+        multi_candidate_exam_rate = (
+            sum(
+                1
+                for detail in ordered_authorization_details
+                if len(detail.get("target_candidates") or []) >= 2
+            )
+            / max(1, len(ordered_authorization_details))
+            if ordered_authorization_details
+            else None
+        )
+        generic_exam_suppression_count = sum(
+            int(record.get("generic_exam_suppression_count", 0) or 0)
+            for record in exam_authorization_records
+            if isinstance(record, dict)
+        )
+        post_exam_primary_recomputed_rate = bool(
+            any(
+                isinstance(item, dict)
+                and str(item.get("stage") or "") == "after_discriminating_exams"
+                for item in dynamic_trace
+            )
+        )
         differential_source_items = {
             str(detail.get("exam") or "")
             for detail in exam_authorization_details
@@ -2011,6 +2089,71 @@ class MyDoctorAgent(BaseDoctorAgent):
             ),
             top_candidate,
         ) or {}
+
+        def _component_value(candidate: Dict[str, Any], key: str) -> float:
+            try:
+                return float(
+                    ((candidate.get("component_scores") or {}).get(key, 0.0))
+                    or 0.0
+                )
+            except (AttributeError, TypeError, ValueError):
+                return 0.0
+
+        generic_penalized_candidates = [
+            item
+            for item in candidates
+            if isinstance(item, dict)
+            and _component_value(item, "generic_parent_penalty") > 0.0
+        ]
+        generic_primary_block_count = sum(
+            1
+            for item in generic_penalized_candidates
+            if str(item.get("diagnosis") or "") not in set(authorized)
+        )
+        primary_core_evidence_score = _component_value(
+            primary_candidate, "core_evidence_score"
+        )
+        primary_diagnostic_evidence_score = _component_value(
+            primary_candidate, "diagnostic_evidence_score"
+        )
+        try:
+            primary_core_coverage_value = float(
+                primary_candidate.get(
+                    "core_explanatory_coverage",
+                    (primary_candidate.get("component_scores") or {}).get(
+                        "core_explanatory_coverage", 0.0
+                    ),
+                )
+                or 0.0
+            )
+        except (AttributeError, TypeError, ValueError):
+            primary_core_coverage_value = 0.0
+        specific_over_generic_preference_count = int(
+            bool(primary_candidate)
+            and (primary_core_evidence_score > 0.0 or primary_diagnostic_evidence_score > 0.0)
+            and any(
+                bool(item.get("required_met"))
+                and str(item.get("diagnosis") or "") not in set(authorized)
+                for item in generic_penalized_candidates
+            )
+        )
+        core_evidence_primary_alignment = (
+            primary_core_evidence_score > 0.0
+            or primary_core_coverage_value >= 0.40
+            if primary_candidate
+            else None
+        )
+        diagnostic_evidence_primary_alignment = (
+            primary_diagnostic_evidence_score > 0.0
+            if primary_candidate
+            else None
+        )
+        residual_core_penalty_applied_count = sum(
+            1
+            for item in candidates
+            if isinstance(item, dict)
+            and _component_value(item, "residual_core_penalty") > 0.0
+        )
         explanatory_coverage = (
             judge_payload.get("explanatory_coverage")
             if judge_payload.get("explanatory_coverage") is not None
@@ -2147,6 +2290,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "differential_exam_precision": differential_exam_precision,
                 "discriminating_exam_recall": discriminating_exam_recall,
                 "exam_information_gain": exam_information_gain,
+                "special_discriminator_rate": special_discriminator_rate,
+                "multi_candidate_exam_rate": multi_candidate_exam_rate,
+                "generic_exam_suppression_count": generic_exam_suppression_count,
+                "post_exam_primary_recomputed_rate": post_exam_primary_recomputed_rate,
                 "discriminating_gap_closed_rate": discriminating_gap_closed_rate,
                 "gap_closure_rate": gap_closure_rate,
                 "dynamic_rerank_changed_primary": dynamic_rerank_changed_primary,
@@ -2171,6 +2318,11 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "pairwise_judge_accuracy": pairwise_judge_accuracy,
                 "differential_pool_precision": differential_pool_precision,
                 "differential_pool_expected_included": differential_pool_expected_included,
+                "generic_primary_block_count": generic_primary_block_count,
+                "specific_over_generic_preference_count": specific_over_generic_preference_count,
+                "core_evidence_primary_alignment": core_evidence_primary_alignment,
+                "diagnostic_evidence_primary_alignment": diagnostic_evidence_primary_alignment,
+                "residual_core_penalty_applied_count": residual_core_penalty_applied_count,
                 "pairwise_noise_rejection_count": pairwise_noise_rejection_count,
                 "cluster_gate_rejection_count": cluster_gate_rejection_count,
                 "core_evidence_coverage": core_evidence_coverage,
@@ -2181,6 +2333,14 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "required_evidence_coverage": required_evidence_coverage,
                 "soft_contradiction_count": soft_contradiction_count,
                 "hard_contradiction_count": hard_contradiction_count,
+                "high_information_finding_count": len(high_information_findings),
+                "generic_finding_shadowed_count": len(shadowed_observations),
+                "evidence_information_value_mean": finding_extraction_summary[
+                    "evidence_information_value_mean"
+                ],
+                "generic_only_candidate_count": pool_filter_summary.get(
+                    "generic_only_candidate_count"
+                ),
             },
             "top_candidates": top_twenty,
             "retriever_top1": retriever_top1,
@@ -2236,6 +2396,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                 ),
                 "pool_filter_summary": pool_filter_summary,
                 "discriminating_exams": discriminating_exams,
+                "discriminating_exam_tasks": list(
+                    judge_payload.get("discriminating_exam_tasks") or []
+                ),
                 "discriminating_findings": discriminating_findings,
                 "primary_unlock_reason": primary_unlock_reason,
                 "explanation_score_changed_ranking": explanation_score_changed_ranking,
@@ -2596,6 +2759,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                         "blocked_items": list(strategy.get("blocked_items") or []),
                         "exam_authorization_details": list(
                             strategy.get("exam_authorization_details") or []
+                        ),
+                        "generic_exam_suppression_count": int(
+                            strategy.get("generic_exam_suppression_count", 0) or 0
                         ),
                     }
                 )
@@ -3555,6 +3721,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             return []
         if targets:
             targets = self._prioritize_evidence_gap_exam_targets(decision, targets)
+        differential_names = [
+            str(item).strip()
+            for item in judge_payload.get("differential_candidates") or []
+            if str(item).strip()
+        ]
+        if needs_discriminating and differential_names:
+            differential_set = set(differential_names)
+            targets = [name for name in targets if name in differential_set]
 
         target_proposed: List[str] = []
         for name in targets:
@@ -3570,11 +3744,6 @@ class MyDoctorAgent(BaseDoctorAgent):
             if text and text not in judge_proposed:
                 judge_proposed.append(text)
 
-        differential_names = [
-            str(item).strip()
-            for item in judge_payload.get("differential_candidates") or []
-            if str(item).strip()
-        ]
         if needs_discriminating:
             proposed = list(dict.fromkeys(judge_proposed + target_proposed))
             strategy_judge_payload = dict(judge_payload)
@@ -3656,6 +3825,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "blocked_items": list(strategy.get("blocked_items") or []),
                     "exam_authorization_details": list(
                         strategy.get("exam_authorization_details") or []
+                    ),
+                    "generic_exam_suppression_count": int(
+                        strategy.get("generic_exam_suppression_count", 0) or 0
                     ),
                 }
             )

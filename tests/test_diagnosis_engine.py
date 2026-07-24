@@ -2,7 +2,8 @@ import unittest
 
 import yaml
 
-from agent.clinical_evidence import ClinicalEvidenceNormalizer
+from agent.clinical_evidence import ClinicalEvidenceNormalizer, EvidenceBundle, Observation
+from agent.candidate_generator import CandidatePool
 from agent.diagnosis_engine import DiagnosisDecisionEngine
 from agent.replay import DiagnosticReplay
 
@@ -157,6 +158,58 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertEqual(low_mag.required_gap_state, "actionable_gap")
         self.assertIn("低镁血症", decision.final_diagnoses)
         self.assertIn("低镁血症", decision.judge_decision["evidence_gap_targets"])
+
+    def test_core_evidence_tiers_promote_specific_over_generic_pulmonary_candidate(self):
+        tb = "\u80ba\u7ed3\u6838"
+        bronchopneumonia = "\u652f\u6c14\u7ba1\u80ba\u708e"
+        evidence = EvidenceBundle(
+            observations=[
+                Observation("cough", "\u95ee\u8bca", evidence_level="generic", information_value=0.18),
+                Observation("fever", "\u95ee\u8bca", evidence_level="generic", information_value=0.18),
+                Observation("hemoptysis", "\u95ee\u8bca", evidence_level="specific", information_value=0.84),
+                Observation("tuberculosis_exposure", "\u95ee\u8bca", evidence_level="specific", information_value=0.92),
+                Observation("night_sweats", "\u95ee\u8bca", evidence_level="specific", information_value=0.84),
+            ]
+        )
+        pool = CandidatePool()
+        pool.add(bronchopneumonia, bronchopneumonia, "test", prior=0.85)
+        pool.add(tb, tb, "test", prior=0.70)
+        decision = self.engine.rank(pool, evidence)
+        self.assertEqual(decision.candidates[0].diagnosis, tb)
+        tb_score = next(item for item in decision.candidates if item.diagnosis == tb)
+        generic_score = next(
+            item for item in decision.candidates if item.diagnosis == bronchopneumonia
+        )
+        self.assertGreater(tb_score.core_evidence_score, generic_score.core_evidence_score)
+        self.assertGreater(
+            generic_score.component_scores.get("specific_over_generic_penalty", 0.0),
+            0.0,
+        )
+
+    def test_required_group_hits_count_as_core_evidence_for_urachal_cyst(self):
+        urachal = "\u8110\u5c3f\u7ba1\u56ca\u80bf"
+        urethral = "\u5c3f\u9053\u7efc\u5408\u5f81"
+        evidence = EvidenceBundle(
+            observations=[
+                Observation("umbilical_discharge", "\u95ee\u8bca", evidence_level="specific", information_value=0.94),
+                Observation("midline_suprapubic_pain", "\u95ee\u8bca", evidence_level="specific", information_value=0.88),
+                Observation("urachal_remnant_pattern", "\u5f71\u50cf", evidence_level="diagnostic_pattern", information_value=0.96),
+                Observation("dysuria", "\u95ee\u8bca", evidence_level="generic", information_value=0.20),
+            ]
+        )
+        pool = CandidatePool()
+        pool.add(urethral, urethral, "test", prior=0.86)
+        pool.add(urachal, urachal, "test", prior=0.66)
+        decision = self.engine.rank(pool, evidence)
+        self.assertEqual(decision.candidates[0].diagnosis, urachal)
+        urachal_score = next(item for item in decision.candidates if item.diagnosis == urachal)
+        urethral_score = next(item for item in decision.candidates if item.diagnosis == urethral)
+        self.assertIn("umbilical_discharge", urachal_score.core_matched_evidence)
+        self.assertGreater(urachal_score.diagnostic_evidence_score, 0.0)
+        self.assertGreater(
+            urethral_score.component_scores.get("specific_over_generic_penalty", 0.0),
+            0.0,
+        )
 
     def test_pulmonary_renal_evidence_promotes_microscopic_polyangiitis(self):
         _, decision = self.decide(

@@ -11,6 +11,22 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 
+_GENERIC_PARENT_DIAGNOSES = {
+    "\u80ba\u708e",
+    "\u652f\u6c14\u7ba1\u80ba\u708e",
+    "\u652f\u6c14\u7ba1\u708e",
+    "\u4e0a\u547c\u5438\u9053\u611f\u67d3",
+    "\u5c3f\u9053\u7efc\u5408\u5f81",
+    "\u6ccc\u5c3f\u7cfb\u611f\u67d3",
+    "\u6e7f\u75b9",
+    "\u76ae\u708e",
+    "\u5fc3\u5f8b\u5931\u5e38",
+    "\u5fc3\u529b\u8870\u7aed",
+    "\u9aa8\u6298",
+    "\u5148\u5929\u6027\u5fc3\u810f\u75c5",
+}
+
+
 _PRIORITY_TYPES = {"etiology", "metabolic", "structural", "systemic"}
 _MANIFESTATION_TYPES = {"syndrome", "state", "complication"}
 _MANIFESTATION_NAMES = {"心力衰竭", "心律失常", "肺动脉高压"}
@@ -24,6 +40,13 @@ _DIFFERENTIAL_EXAM_HINTS = {
     "肺炎": ["胸部X线检查（CXR）", "全血细胞计数（CBC）", "C反应蛋白（CRP）", "痰培养"],
     "支气管肺炎": ["胸部X线检查（CXR）", "全血细胞计数（CBC）", "C反应蛋白（CRP）", "痰培养"],
     "肺癌": ["胸部CT扫描（Chest CT）", "组织病理学检查", "支气管镜检查"],
+    "显微镜下多血管炎": [
+        "胸部CT扫描（Chest CT）",
+        "尿液分析（UA）",
+        "肾功能检查（RFTs）",
+        "抗中性粒细胞胞质抗体（ANCA）谱",
+        "MPO-ANCA",
+    ],
     "老视": ["视力检查", "屈光检查"],
     "晶状体脱位": ["裂隙灯检查", "眼压测量", "眼部B超检查"],
     "青光眼": ["眼压测量", "裂隙灯检查", "眼底镜检查"],
@@ -40,6 +63,18 @@ _DIFFERENTIAL_SET_EXAM_HINTS = [
     (
         {"肺结核", "支气管肺炎", "肺癌"},
         ["胸部CT扫描（Chest CT）", "痰培养", "抗酸杆菌染色（AFB）", "核酸扩增检测（NAAT）"],
+    ),
+    (
+        {"肺结核", "显微镜下多血管炎", "肺癌"},
+        [
+            "胸部CT扫描（Chest CT）",
+            "痰培养",
+            "抗酸杆菌染色（AFB）",
+            "核酸扩增检测（NAAT）",
+            "抗中性粒细胞胞质抗体（ANCA）谱",
+            "尿液分析（UA）",
+            "肾功能检查（RFTs）",
+        ],
     ),
     (
         {"老视", "晶状体脱位", "青光眼"},
@@ -85,6 +120,7 @@ _BROAD_EVIDENCE_TOKENS = {
     "pain",
     "pruritus",
     "rash",
+    "visual_blurring",
     "abdominal_pain",
     "symptom:发热",
     "symptom:咳嗽",
@@ -110,21 +146,30 @@ _CORE_EVIDENCE_TOKENS = _OBJECTIVE_GAP_FINDINGS | {
     "hemoptysis",
     "lens_dislocation",
     "midline_suprapubic_cyst",
+    "midline_suprapubic_pain",
     "near_vision_difficulty",
+    "night_vision_decline",
+    "nyctalopia_pattern",
     "optic_pressure_high",
     "periorbital_edema",
     "periostitis",
     "polydipsia",
     "postprandial_nausea",
     "presbyopia_refraction",
+    "presbyopia_pattern",
     "refractive_error",
+    "refractive_correction_improves_near_vision",
     "regional_lymphadenopathy",
     "rural_child_contact",
     "sex_development_disorder",
     "treponemal_disease_pattern",
     "tropical_exposure",
+    "tb_exposure",
+    "tuberculosis_pattern",
+    "tuberculosis_exposure",
     "umbilical_discharge",
     "umbilical_mass",
+    "urachal_remnant_pattern",
     "urachal_cyst_imaging",
     "vesicular_rash",
 }
@@ -143,6 +188,17 @@ _CONTEXTUAL_CORE_FINDINGS = {
     "magnesium_load_retention_high",
     "regional_lymphadenopathy",
     "rural_child_contact",
+    "near_vision_difficulty",
+    "age_related_near_blur",
+    "refractive_correction_improves_near_vision",
+    "presbyopia_pattern",
+    "night_vision_decline",
+    "nyctalopia_pattern",
+    "midline_suprapubic_pain",
+    "urachal_remnant_pattern",
+    "tb_exposure",
+    "tuberculosis_pattern",
+    "tuberculosis_exposure",
 }
 _CORE_SYMPTOM_KEYWORDS = (
     "脐部",
@@ -167,6 +223,37 @@ _CORE_SYMPTOM_KEYWORDS = (
     "疱疹",
 )
 _GENERIC_EVIDENCE_PREFIXES = ("field:",)
+_GENERIC_INFLAMMATION_EXAM_MARKERS = (
+    "CBC",
+    "CRP",
+    "ESR",
+    "PCT",
+    "全血细胞计数",
+    "C反应蛋白",
+    "红细胞沉降率",
+    "降钙素原",
+)
+_SPECIAL_DISCRIMINATOR_EXAM_MARKERS = (
+    "AFB",
+    "NAAT",
+    "Xpert",
+    "ANCA",
+    "MPO",
+    "p-ANCA",
+    "CT",
+    "MRI",
+    "血清学",
+    "涂片",
+    "病理",
+    "活检",
+    "支气管镜",
+    "尿液分析",
+    "肾功能",
+    "屈光",
+    "眼压",
+    "裂隙灯",
+    "痰培养",
+)
 _KNOWN_DIFFERENTIAL_GROUPS = (
     (
         "dermatology_eruptive_systemic",
@@ -278,6 +365,7 @@ class JudgeDecision:
     pool_filter_summary: Dict[str, Any] = field(default_factory=dict)
     discriminating_findings: List[str] = field(default_factory=list)
     discriminating_exams: List[str] = field(default_factory=list)
+    discriminating_exam_tasks: List[Dict[str, Any]] = field(default_factory=list)
     required_gap_by_candidate: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
     high_value_gap_candidates: List[str] = field(default_factory=list)
     explanatory_coverage: float = 0.0
@@ -690,6 +778,11 @@ class DifferentialPoolFilter:
             for item in excluded
             if item.get("reason") == "cross_system_no_shared_core_evidence"
         )
+        generic_only_candidates = sum(
+            1
+            for data in relevance.values()
+            if data.get("generic") and not data.get("core")
+        )
         core_hits = sum(
             1 for name in retained_names if relevance.get(name, {}).get("core")
         )
@@ -701,6 +794,7 @@ class DifferentialPoolFilter:
             "pairwise_blocked_count": sum(1 for item in matrix if not item.get("allowed")),
             "pairwise_noise_rejection_count": noise_rejections,
             "cluster_gate_rejection_count": cluster_rejections,
+            "generic_only_candidate_count": generic_only_candidates,
             "core_evidence_coverage": (
                 round(core_hits / max(1, len(retained)), 4) if retained else None
             ),
@@ -770,6 +864,37 @@ class DifferentialPoolFilter:
         entry = self._entry(candidate)
         body, family = self._metadata(candidate, entry)
         cluster = _KNOWN_CLUSTER_BY_NAME.get(name, "")
+        if text in {
+            "near_vision_difficulty",
+            "age_related_near_blur",
+            "refractive_correction_improves_near_vision",
+            "presbyopia_pattern",
+            "night_vision_decline",
+            "nyctalopia_pattern",
+        }:
+            return body == "ophthalmology" or cluster == "ophthalmology_visual"
+        if text in {
+            "umbilical_discharge",
+            "umbilical_mass",
+            "midline_suprapubic_pain",
+            "midline_suprapubic_cyst",
+            "urachal_remnant_pattern",
+            "urachal_cyst_imaging",
+        }:
+            return (
+                cluster == "urachal_midline_urinary"
+                or family == "urachal_remnant"
+                or body in {"urology", "genitourinary"}
+            )
+        if text in {
+            "chronic_cough_pattern",
+            "tb_exposure",
+            "tuberculosis_exposure",
+            "tuberculosis_pattern",
+            "night_sweats",
+            "hemoptysis",
+        }:
+            return body == "respiratory" or cluster == "pulmonary_infection_mass"
         if text in {
             "crusted_exudative_skin_ulcer",
             "regional_lymphadenopathy",
@@ -990,9 +1115,9 @@ class DiagnosisJudge:
         self.discriminating_exam_max_items = int(
             section.get(
                 "discriminating_exam_max_items",
-                diagnosis_section.get("discriminating_exam_max_items", 4),
+                diagnosis_section.get("discriminating_exam_max_items", 6),
             )
-            or 4
+            or 6
         )
         self.filtered_pool_max_size = int(
             section.get(
@@ -1073,9 +1198,14 @@ class DiagnosisJudge:
         discriminating_findings = self._discriminating_findings(
             differential_pool, required_gap_by_candidate
         )
-        discriminating_exams = self._discriminating_exams(
+        discriminating_exam_tasks = self._discriminating_exam_tasks(
             differential_pool, pairwise, discriminating_findings
         )
+        discriminating_exams = [
+            str(task.get("exam") or "").strip()
+            for task in discriminating_exam_tasks
+            if str(task.get("exam") or "").strip()
+        ]
         primary_pool_names = {item.diagnosis for item in differential_pool}
         primary_candidates = [
             item for item in differential_pool if item.diagnosis in primary_pool_names
@@ -1167,6 +1297,7 @@ class DiagnosisJudge:
         decision.pool_filter_summary = dict(pool_filter.summary)
         decision.discriminating_findings = discriminating_findings
         decision.discriminating_exams = discriminating_exams
+        decision.discriminating_exam_tasks = discriminating_exam_tasks
         decision.required_gap_by_candidate = required_gap_by_candidate
         decision.differential_pool_source = dict(pool_filter.pool_source)
         decision.dynamic_rerank_trace = [
@@ -1412,6 +1543,10 @@ class DiagnosisJudge:
             return False
         if self._core_coverage(primary) < 0.45 and contenders:
             return False
+        if self._component_score(primary, "generic_parent_penalty") > 0.0:
+            for item in contenders:
+                if self._core_or_diagnostic_signal(item):
+                    return False
         primary_score = self._judge_score(primary)
         if any(primary_score <= self._judge_score(item) + self.pairwise_close_margin for item in contenders):
             return False
@@ -1443,6 +1578,11 @@ class DiagnosisJudge:
         primary_score = self._judge_score(primary)
         if self._is_manifestation(primary) or self._generic_parent_of(contender, primary):
             return contender_score >= primary_score - 0.24
+        if (
+            self._component_score(primary, "generic_parent_penalty") > 0.0
+            and self._core_or_diagnostic_signal(contender)
+        ):
+            return contender_score >= primary_score - max(self.pairwise_close_margin, 0.30)
         if (
             self._coverage(contender)
             >= self._coverage(primary) - 0.12
@@ -1502,32 +1642,181 @@ class DiagnosisJudge:
         pairwise: Sequence[Dict[str, Any]],
         findings: Sequence[str],
     ) -> List[str]:
-        exams: List[str] = []
+        return [
+            str(task.get("exam") or "").strip()
+            for task in self._discriminating_exam_tasks(pool, pairwise, findings)
+            if str(task.get("exam") or "").strip()
+        ]
+
+    def _discriminating_exam_tasks(
+        self,
+        pool: Sequence[Any],
+        pairwise: Sequence[Dict[str, Any]],
+        findings: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        exam_targets: Dict[str, set] = {}
+        exam_findings: Dict[str, List[str]] = {}
+        exam_sources: Dict[str, set] = {}
         pool_names = {str(getattr(item, "diagnosis", "") or "") for item in pool}
+
+        def add_exam(
+            exam: str,
+            targets: Sequence[str],
+            source: str,
+            target_findings: Optional[Sequence[str]] = None,
+        ) -> None:
+            text = str(exam or "").strip()
+            if not text:
+                return
+            target_names = [
+                str(name).strip()
+                for name in targets
+                if str(name).strip() in pool_names
+            ]
+            if not target_names:
+                target_names = list(pool_names)
+            exam_targets.setdefault(text, set()).update(target_names)
+            exam_sources.setdefault(text, set()).add(source)
+            bucket = exam_findings.setdefault(text, [])
+            for finding in target_findings or []:
+                value = str(finding or "").strip()
+                if value and value not in bucket:
+                    bucket.append(value)
+
         high_prior_candidates = sorted(
             [item for item in pool if self._high_prior_specific_exam_candidate(item)],
             key=self._specific_exam_candidate_key,
             reverse=True,
         )
         for candidate in high_prior_candidates:
+            name = str(getattr(candidate, "diagnosis", "") or "")
+            candidate_findings = list(getattr(candidate, "required_gaps", []) or []) + list(
+                getattr(candidate, "residual_evidence", []) or []
+            )
             for item in self._candidate_discriminating_exams(candidate):
-                if item and item not in exams:
-                    exams.append(item)
+                add_exam(item, [name], "high_value_candidate", candidate_findings)
         for names, hinted_exams in _DIFFERENTIAL_SET_EXAM_HINTS:
             if names.issubset(pool_names):
                 for item in hinted_exams:
-                    if item and item not in exams:
-                        exams.append(item)
+                    add_exam(item, list(names), "differential_set_hint", findings)
         for comparison in pairwise:
             if not comparison.get("close_call"):
                 continue
+            targets = [
+                str(comparison.get("left") or "").strip(),
+                str(comparison.get("right") or "").strip(),
+            ]
             for item in comparison.get("discriminating_exams") or []:
-                if item and item not in exams:
-                    exams.append(item)
-        for item in self._candidate_exam_union(pool):
-            if item and item not in exams:
-                exams.append(item)
-        return exams[: self.discriminating_exam_max_items]
+                add_exam(
+                    item,
+                    targets,
+                    "pairwise_close_call",
+                    comparison.get("discriminating_findings") or findings,
+                )
+        for candidate in pool:
+            name = str(getattr(candidate, "diagnosis", "") or "")
+            candidate_findings = list(getattr(candidate, "required_gaps", []) or []) + list(
+                getattr(candidate, "residual_evidence", []) or []
+            )
+            for item in self._candidate_discriminating_exams(candidate):
+                add_exam(item, [name], "candidate_profile", candidate_findings)
+
+        pool_size = max(1, len(pool_names))
+        tasks: List[Dict[str, Any]] = []
+        for exam, targets in exam_targets.items():
+            target_names = sorted(targets)
+            exam_type = self._exam_task_type(exam, target_names, pool_size)
+            task_findings = list(dict.fromkeys(exam_findings.get(exam, []) + list(findings)))[:12]
+            tasks.append(
+                {
+                    "exam": exam,
+                    "target_candidates": target_names,
+                    "target_findings": task_findings,
+                    "exam_type": exam_type,
+                    "expected_effect": self._exam_expected_effect(exam_type, target_names),
+                    "source": sorted(exam_sources.get(exam, [])),
+                    "pool_candidate_count": pool_size,
+                    "target_candidate_count": len(target_names),
+                    "information_gain_hint": round(
+                        self._exam_task_score(exam, target_names, pool_size),
+                        4,
+                    ),
+                }
+            )
+
+        tasks.sort(
+            key=lambda task: (
+                self._exam_type_priority(str(task.get("exam_type") or "")),
+                float(task.get("information_gain_hint") or 0.0),
+                int(task.get("target_candidate_count") or 0),
+            ),
+            reverse=True,
+        )
+        return tasks[: self.discriminating_exam_max_items]
+
+    def _exam_task_type(
+        self,
+        exam: str,
+        target_names: Sequence[str],
+        pool_size: int,
+    ) -> str:
+        if self._generic_inflammation_exam(exam):
+            return "generic_inflammation"
+        if self._special_discriminator_exam(exam):
+            return "special_discriminator"
+        if len(set(target_names)) >= min(2, max(1, pool_size)):
+            return "shared_discriminator"
+        return "confirmatory"
+
+    @staticmethod
+    def _generic_inflammation_exam(exam: str) -> bool:
+        text = str(exam or "")
+        return any(marker in text for marker in _GENERIC_INFLAMMATION_EXAM_MARKERS)
+
+    @staticmethod
+    def _special_discriminator_exam(exam: str) -> bool:
+        text = str(exam or "")
+        return any(marker in text for marker in _SPECIAL_DISCRIMINATOR_EXAM_MARKERS)
+
+    @staticmethod
+    def _exam_type_priority(exam_type: str) -> int:
+        return {
+            "special_discriminator": 4,
+            "shared_discriminator": 3,
+            "confirmatory": 2,
+            "generic_inflammation": 1,
+        }.get(str(exam_type or ""), 0)
+
+    def _exam_task_score(
+        self,
+        exam: str,
+        target_names: Sequence[str],
+        pool_size: int,
+    ) -> float:
+        target_count = len(set(target_names))
+        coverage = target_count / max(1, pool_size)
+        multi_candidate = 1.0 if target_count >= 2 else 0.0
+        if 0 < target_count < pool_size:
+            separation = 1.0
+        elif target_count >= pool_size and pool_size > 1:
+            separation = 0.95
+        else:
+            separation = 0.25
+        exam_type = self._exam_task_type(exam, target_names, pool_size)
+        type_score = self._exam_type_priority(exam_type) / 4.0
+        score = 0.30 * separation + 0.25 * multi_candidate + 0.25 * type_score + 0.20 * coverage
+        if exam_type == "generic_inflammation" and target_count < 2:
+            score *= 0.55
+        return score
+
+    @staticmethod
+    def _exam_expected_effect(exam_type: str, target_names: Sequence[str]) -> str:
+        if exam_type in {"special_discriminator", "shared_discriminator"}:
+            return "shift_probabilities_across_differential_pool"
+        if exam_type == "confirmatory":
+            target = ", ".join(target_names[:2])
+            return f"close_confirmatory_gap:{target}" if target else "close_confirmatory_gap"
+        return "low_priority_generic_context"
 
     def _high_prior_specific_exam_candidate(self, candidate: Any) -> bool:
         if not candidate or getattr(candidate, "hard_contradiction", False):
@@ -2150,11 +2439,15 @@ class DiagnosisJudge:
         score = (
             0.32 * self._core_coverage(candidate)
             + 0.24 * self._coverage(candidate)
+            + 0.14 * self._component_score(candidate, "core_evidence_score")
+            + 0.22 * self._component_score(candidate, "diagnostic_evidence_score")
             + 0.14 * float(getattr(candidate, "specificity", 0.0) or 0.0)
             + 0.12 * float(getattr(candidate, "source_prior", 0.0) or 0.0)
             + 0.10 * float(getattr(candidate, "score", 0.0) or 0.0)
             - 0.18 * min(1.0, 0.25 * self._residual_core_count(candidate))
             - 0.14 * self._residual(candidate)
+            - 0.16 * self._component_score(candidate, "generic_parent_penalty")
+            - 0.08 * self._component_score(candidate, "specific_over_generic_penalty")
             - gap_penalty
             - 0.10 * float(getattr(candidate, "contradiction_penalty", 0.0) or 0.0)
         )
@@ -2172,11 +2465,15 @@ class DiagnosisJudge:
         score = float(getattr(candidate, "score", 0.0) or 0.0)
         score += self.coverage_bonus * self._coverage(candidate)
         score += self.core_coverage_bonus * self._core_coverage(candidate)
+        score += 0.10 * self._component_score(candidate, "core_evidence_score")
+        score += 0.16 * self._component_score(candidate, "diagnostic_evidence_score")
         score -= self.residual_penalty * self._residual(candidate)
         score -= self.residual_core_penalty * min(
             4,
             self._residual_core_count(candidate),
         )
+        score -= 0.14 * self._component_score(candidate, "generic_parent_penalty")
+        score -= 0.06 * self._component_score(candidate, "specific_over_generic_penalty")
         score += self.specificity_bonus * float(getattr(candidate, "specificity", 0.0) or 0.0)
         gap_state = self._required_gap_state(candidate)
         if gap_state == "satisfied":
@@ -2198,6 +2495,22 @@ class DiagnosisJudge:
         if getattr(candidate, "hard_contradiction", False):
             score -= 1.0
         return round(score, 4)
+
+    @staticmethod
+    def _component_score(candidate: Any, name: str) -> float:
+        try:
+            return float((getattr(candidate, "component_scores", {}) or {}).get(name, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _core_or_diagnostic_signal(self, candidate: Any) -> bool:
+        return bool(
+            getattr(candidate, "core_matched_evidence", None)
+            or getattr(candidate, "diagnostic_matched_evidence", None)
+            or self._component_score(candidate, "core_evidence_score") >= 0.20
+            or self._component_score(candidate, "diagnostic_evidence_score") > 0.0
+            or self._core_coverage(candidate) >= 0.50
+        )
 
     @staticmethod
     def _coverage(candidate: Any) -> float:
@@ -2294,12 +2607,19 @@ class DiagnosisJudge:
         return dtype in _MANIFESTATION_TYPES or getattr(candidate, "diagnosis", "") in _MANIFESTATION_NAMES
 
     def _generic_parent_name(self, candidate: Any) -> str:
-        if not self.knowledge or not candidate:
+        if not candidate:
             return ""
-        entry = self.knowledge.get(getattr(candidate, "diagnosis", ""))
+        diagnosis = getattr(candidate, "diagnosis", "")
+        if diagnosis in _GENERIC_PARENT_DIAGNOSES:
+            return diagnosis
+        if self._component_score(candidate, "generic_parent_penalty") > 0.0:
+            return diagnosis
+        if not self.knowledge:
+            return ""
+        entry = self.knowledge.get(diagnosis)
         for item in getattr(self.knowledge, "entries", {}).values():
-            if str(item.get("parent_diagnosis") or "") == getattr(candidate, "diagnosis", ""):
-                return getattr(candidate, "diagnosis", "")
+            if str(item.get("parent_diagnosis") or "") == diagnosis:
+                return diagnosis
         if entry.get("generic_suppressions") or entry.get("generalization_suppressions"):
             return ""
         return ""

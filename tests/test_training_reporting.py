@@ -45,6 +45,10 @@ class TrainingReportingTests(unittest.TestCase):
                     "residual_core_evidence_count": 1,
                     "discriminating_exam_recall": 0.5,
                     "exam_information_gain": 0.45,
+                    "special_discriminator_rate": 0.75,
+                    "multi_candidate_exam_rate": 0.8,
+                    "generic_exam_suppression_count": 3,
+                    "post_exam_primary_recomputed_rate": True,
                     "gap_closure_rate": 0.25,
                     "explanation_score_changed_ranking_rate": True,
                     "primary_unlock_rate": True,
@@ -55,6 +59,11 @@ class TrainingReportingTests(unittest.TestCase):
                     "gap_state_nonblocking_count": 1,
                     "gap_state_unsupported_count": 3,
                     "gap_state_hard_blocked_count": 0,
+                    "generic_primary_block_count": 2,
+                    "specific_over_generic_preference_count": 1,
+                    "core_evidence_primary_alignment": True,
+                    "diagnostic_evidence_primary_alignment": False,
+                    "residual_core_penalty_applied_count": 3,
                 },
                 "audit": {
                     "elapsed_seconds": 100,
@@ -104,6 +113,10 @@ class TrainingReportingTests(unittest.TestCase):
         self.assertEqual(summary["residual_core_evidence_count"], 1.0)
         self.assertEqual(summary["discriminating_exam_recall"], 0.5)
         self.assertEqual(summary["exam_information_gain"], 0.45)
+        self.assertEqual(summary["special_discriminator_rate"], 0.75)
+        self.assertEqual(summary["multi_candidate_exam_rate"], 0.8)
+        self.assertEqual(summary["generic_exam_suppression_count"], 3.0)
+        self.assertEqual(summary["post_exam_primary_recomputed_rate"], 1.0)
         self.assertEqual(summary["gap_closure_rate"], 0.25)
         self.assertEqual(summary["explanation_score_changed_ranking_rate"], 1.0)
         self.assertEqual(summary["primary_unlock_rate"], 1.0)
@@ -114,6 +127,11 @@ class TrainingReportingTests(unittest.TestCase):
         self.assertEqual(summary["gap_state_nonblocking_count"], 1.0)
         self.assertEqual(summary["gap_state_unsupported_count"], 3.0)
         self.assertEqual(summary["gap_state_hard_blocked_count"], 0.0)
+        self.assertEqual(summary["generic_primary_block_count"], 2.0)
+        self.assertEqual(summary["specific_over_generic_preference_count"], 1.0)
+        self.assertEqual(summary["core_evidence_primary_alignment"], 1.0)
+        self.assertEqual(summary["diagnostic_evidence_primary_alignment"], 0.0)
+        self.assertEqual(summary["residual_core_penalty_applied_count"], 3.0)
         self.assertEqual(summary["critic_issue_rate"], 0.5)
         self.assertEqual(summary["critic_llm_rate"], 0.5)
         self.assertEqual(summary["timeout_cases"], 1)

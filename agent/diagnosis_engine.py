@@ -30,6 +30,7 @@ _GENERIC_EXPLANATORY_FINDINGS = {
     "pain",
     "pruritus",
     "rash",
+    "visual_blurring",
     "weakness",
 }
 
@@ -51,8 +52,11 @@ _CORE_EXPLANATORY_FINDINGS = {
     "iris_coloboma",
     "lens_dislocation",
     "midline_suprapubic_cyst",
+    "midline_suprapubic_pain",
     "near_vision_difficulty",
+    "night_vision_decline",
     "night_sweats",
+    "nyctalopia_pattern",
     "orthopnea",
     "ovotesticular_tissue",
     "paroxysmal_nocturnal_dyspnea",
@@ -60,18 +64,83 @@ _CORE_EXPLANATORY_FINDINGS = {
     "periostitis",
     "polydipsia",
     "postprandial_nausea",
+    "presbyopia_pattern",
+    "refractive_correction_improves_near_vision",
     "regional_lymphadenopathy",
     "rural_child_contact",
     "sex_development_disorder",
+    "tb_exposure",
     "treponema_positive",
     "treponemal_disease_pattern",
     "treponemal_serology_positive",
     "treponemal_skin_lesion",
     "tropical_exposure",
+    "tuberculosis_pattern",
     "tuberculosis_exposure",
     "umbilical_discharge",
     "umbilical_mass",
+    "urachal_remnant_pattern",
     "urachal_cyst_imaging",
+}
+
+_DIAGNOSTIC_EXPLANATORY_FINDINGS = {
+    "afb_positive",
+    "tb_naat_positive",
+    "naat_positive",
+    "xpert_mtb_positive",
+    "ugt1a1_positive",
+    "echo_vsd",
+    "ventricular_septal_defect",
+    "left_to_right_shunt",
+    "anca_positive",
+    "mpo_anca_positive",
+    "mri_cavitary_lesion",
+    "cavitary_lesion",
+    "urachal_cyst_imaging",
+    "second_degree_av_block",
+    "av_block",
+    "treponema_positive",
+    "treponemal_serology_positive",
+    "treponemal_disease_pattern",
+}
+
+_SPECIFIC_GENERIC_SUPPRESSIONS = {
+    "\u80ba\u7ed3\u6838": {
+        "\u80ba\u708e",
+        "\u652f\u6c14\u7ba1\u80ba\u708e",
+        "\u652f\u6c14\u7ba1\u708e",
+    },
+    "\u96c5\u53f8\u75c5": {
+        "\u6e7f\u75b9",
+        "\u76ae\u708e",
+    },
+    "\u8110\u5c3f\u7ba1\u56ca\u80bf": {
+        "\u5c3f\u9053\u7efc\u5408\u5f81",
+        "\u6025\u6027\u7ec6\u83cc\u6027\u524d\u5217\u817a\u708e",
+    },
+    "\u4e8c\u5ea6\u623f\u5ba4\u4f20\u5bfc\u963b\u6ede": {
+        "\u5fc3\u5f8b\u5931\u5e38",
+    },
+    "\u5ba4\u95f4\u9694\u7f3a\u635f\uff08VSD\uff09": {
+        "\u5148\u5929\u6027\u5fc3\u810f\u75c5",
+        "\u4e09\u623f\u5fc3",
+        "\u5fc3\u5185\u819c\u57ab\u7f3a\u635f",
+    },
+}
+
+_GENERIC_PARENT_DIAGNOSES = {
+    "\u80ba\u708e",
+    "\u652f\u6c14\u7ba1\u80ba\u708e",
+    "\u652f\u6c14\u7ba1\u708e",
+    "\u4e0a\u547c\u5438\u9053\u611f\u67d3",
+    "\u5c3f\u9053\u7efc\u5408\u5f81",
+    "\u6ccc\u5c3f\u7cfb\u611f\u67d3",
+    "\u6e7f\u75b9",
+    "\u76ae\u708e",
+    "\u5fc3\u5f8b\u5931\u5e38",
+    "\u5fc3\u529b\u8870\u7aed",
+    "\u9aa8\u6298",
+    "\u5148\u5929\u6027\u5fc3\u810f\u75c5",
 }
 
 
@@ -110,6 +179,12 @@ class CandidateScore:
     explained_evidence: List[str] = field(default_factory=list)
     unexplained_core_evidence: List[str] = field(default_factory=list)
     explanatory_rank_reason: str = ""
+    generic_matched_evidence: List[str] = field(default_factory=list)
+    core_matched_evidence: List[str] = field(default_factory=list)
+    diagnostic_matched_evidence: List[str] = field(default_factory=list)
+    generic_coverage_score: float = 0.0
+    core_evidence_score: float = 0.0
+    diagnostic_evidence_score: float = 0.0
 
     @property
     def trusted(self) -> bool:
@@ -535,6 +610,11 @@ class DiagnosisDecisionEngine:
             "residual": 0.10,
             "core_explain": 0.12,
             "core_residual": 0.08,
+            "generic_evidence": 0.06,
+            "core_evidence": 0.24,
+            "diagnostic_evidence": 0.36,
+            "etiology_structural": 0.07,
+            "generic_parent": 0.16,
             "contradiction": 1.0,
         }
         for key, default in list(defaults.items()):
@@ -999,7 +1079,7 @@ class DiagnosisDecisionEngine:
         if candidate.source_prior >= 0.5 and candidate.matched_evidence:
             audit_visibility_bonus += 0.04
         if self._is_secondary_manifestation(candidate) and candidate.matched_evidence:
-            audit_visibility_bonus += 0.10
+            audit_visibility_bonus += 0.20
         return (
             self._adjudication_score(candidate) + audit_visibility_bonus,
             self._diagnosis_type_rank(candidate),
@@ -1011,6 +1091,14 @@ class DiagnosisDecisionEngine:
 
     def _adjudication_score(self, candidate: CandidateScore) -> float:
         score = candidate.score
+        score += 0.08 * candidate.core_evidence_score
+        score += 0.12 * candidate.diagnostic_evidence_score
+        score -= 0.08 * float(
+            (candidate.component_scores or {}).get("generic_parent_penalty", 0.0) or 0.0
+        )
+        score -= 0.05 * float(
+            (candidate.component_scores or {}).get("specific_over_generic_penalty", 0.0) or 0.0
+        )
         if (
             candidate.required_met
             and not candidate.hard_contradiction
@@ -1125,15 +1213,17 @@ class DiagnosisDecisionEngine:
     ) -> CandidateScore:
         support_specs = list(entry.get("supporting_evidence", []) or [])
         matched: List[str] = []
+        matched_observations: List[Observation] = []
         matched_weight = 0.0
         for spec in support_specs:
             hits = _matching_observations(spec, evidence.observations, polarity="positive")
             if not hits:
                 continue
             weight = float(spec.get("weight", 0.2) or 0.2)
-            best_confidence = max(item.confidence for item in hits)
+            best_confidence = max(item.confidence * _information_multiplier(item) for item in hits)
             matched_weight += weight * best_confidence
             matched.extend(item.finding for item in hits)
+            matched_observations.extend(hits)
 
         support_score = min(1.0, matched_weight)
         required_groups = entry.get("required_groups", []) or []
@@ -1141,13 +1231,26 @@ class DiagnosisDecisionEngine:
         for group in required_groups:
             if not isinstance(group, list) or not group:
                 continue
-            matched_group = any(
-                _matching_observations(_coerce_spec(spec), evidence.observations, polarity="positive")
-                for spec in group
-            )
-            if not matched_group:
+            group_hits: List[Observation] = []
+            for spec in group:
+                group_hits.extend(
+                    _matching_observations(
+                        _coerce_spec(spec),
+                        evidence.observations,
+                        polarity="positive",
+                    )
+                )
+            if group_hits:
+                matched_observations.extend(group_hits)
+                matched.extend(item.finding for item in group_hits)
+                matched_weight += 0.18 * max(
+                    item.confidence * _information_multiplier(item)
+                    for item in group_hits
+                )
+            else:
                 required_gaps.append(_render_required_group(group))
         required_met = not required_gaps
+        support_score = min(1.0, matched_weight)
 
         soft_contradicted: List[str] = []
         hard_contradicted: List[str] = []
@@ -1202,9 +1305,19 @@ class DiagnosisDecisionEngine:
         explained_evidence = explainability["explained_evidence"]
         residual_evidence = explainability["residual_evidence"]
         explanation = coverage_score
+        tiered = self._tiered_matched_evidence(matched_observations)
+        generic_evidence_score = tiered["generic_score"]
+        core_evidence_score = tiered["core_score"]
+        diagnostic_evidence_score = tiered["diagnostic_score"]
         specificity = float(entry.get("specificity", 0.5) or 0.5)
         has_signal = bool(matched or prior > 0)
         specificity_score = specificity if has_signal else 0.0
+        dtype = str(entry.get("diagnosis_type") or "disease").lower()
+        etiology_structural_score = (
+            specificity
+            if has_signal and (dtype in {"etiology", "metabolic", "structural", "systemic"} or specificity >= 0.85)
+            else 0.0
+        )
         exam_match = self._expected_exam_match(entry, evidence) if has_signal else 0.0
         temporal = self._temporal_consistency(matched, evidence) if has_signal else 0.0
         age = self._age_match(entry, evidence) if has_signal else 0.0
@@ -1216,18 +1329,30 @@ class DiagnosisDecisionEngine:
                 gap_penalty = min(0.12, 0.04 * len(required_gaps))
             else:
                 gap_penalty = min(0.28, 0.18 + 0.05 * (len(required_gaps) - 1))
+        generic_parent_penalty = self._generic_parent_penalty(
+            entry,
+            core_evidence_score=core_evidence_score,
+            diagnostic_evidence_score=diagnostic_evidence_score,
+            residual_core_count=len(residual_core_evidence),
+            required_met=required_met,
+        )
         raw_score = (
-            self.weights["evidence"] * support_score
+            self.weights["evidence"] * support_score * 0.45
             + self.weights["prior"] * max(0.0, min(1.0, prior))
             + self.weights["specificity"] * specificity_score
             + self.weights["explain"] * explanation
             + self.weights["core_explain"] * core_coverage
+            + self.weights["generic_evidence"] * generic_evidence_score
+            + self.weights["core_evidence"] * core_evidence_score
+            + self.weights["diagnostic_evidence"] * diagnostic_evidence_score
+            + self.weights["etiology_structural"] * etiology_structural_score
             + self.weights["exam_match"] * exam_match
             + self.weights["temporal"] * temporal
             + self.weights["age"] * age
             + self.weights["risk"] * risk
             - self.weights["residual"] * residual_score
-            - self.weights["core_residual"] * min(1.0, 0.20 * len(residual_core_evidence))
+            - self.weights["core_residual"] * min(1.0, 0.28 * len(residual_core_evidence))
+            - self.weights["generic_parent"] * generic_parent_penalty
             - self.weights["contradiction"] * contradiction_penalty
             - gap_penalty
         )
@@ -1270,6 +1395,12 @@ class DiagnosisDecisionEngine:
             hard_contradiction=hard_contradiction,
             required_gap_state=required_gap_state,
             matched_evidence=list(dict.fromkeys(matched)),
+            generic_matched_evidence=list(dict.fromkeys(tiered["generic_evidence"])),
+            core_matched_evidence=list(dict.fromkeys(tiered["core_evidence"])),
+            diagnostic_matched_evidence=list(dict.fromkeys(tiered["diagnostic_evidence"])),
+            generic_coverage_score=round(generic_evidence_score, 4),
+            core_evidence_score=round(core_evidence_score, 4),
+            diagnostic_evidence_score=round(diagnostic_evidence_score, 4),
             contradicted_evidence=list(
                 dict.fromkeys(hard_contradicted + soft_contradicted)
             ),
@@ -1285,9 +1416,18 @@ class DiagnosisDecisionEngine:
                 "coverage": round(coverage_score, 4),
                 "explanatory_coverage": round(coverage_score, 4),
                 "core_explanatory_coverage": round(core_coverage, 4),
+                "generic_coverage_score": round(generic_evidence_score, 4),
+                "core_evidence_score": round(core_evidence_score, 4),
+                "diagnostic_evidence_score": round(diagnostic_evidence_score, 4),
+                "etiology_structural_bonus": round(etiology_structural_score, 4),
+                "generic_parent_penalty": round(generic_parent_penalty, 4),
                 "residual": round(residual_score, 4),
                 "residual_evidence_score": round(residual_evidence_score, 4),
                 "residual_core_evidence_count": float(len(residual_core_evidence)),
+                "residual_core_penalty": round(
+                    min(1.0, 0.28 * len(residual_core_evidence)),
+                    4,
+                ),
                 "exam_match": round(exam_match, 4),
                 "temporal": round(temporal, 4),
                 "age": round(age, 4),
@@ -1308,6 +1448,89 @@ class DiagnosisDecisionEngine:
             parent_diagnosis=str(entry.get("parent_diagnosis") or ""),
             specificity=specificity,
         )
+
+    @classmethod
+    def _tiered_matched_evidence(
+        cls,
+        observations: Sequence[Observation],
+    ) -> Dict[str, Any]:
+        buckets = {
+            "generic": {},
+            "core": {},
+            "diagnostic": {},
+        }
+        for item in observations:
+            if item.polarity != "positive" or not item.finding:
+                continue
+            tier = cls._observation_evidence_tier(item)
+            value = max(0.0, min(1.0, item.confidence * _information_multiplier(item)))
+            existing = buckets[tier].get(item.finding, 0.0)
+            buckets[tier][item.finding] = max(existing, value)
+        return {
+            "generic_evidence": list(buckets["generic"].keys()),
+            "core_evidence": list(buckets["core"].keys()),
+            "diagnostic_evidence": list(buckets["diagnostic"].keys()),
+            "generic_score": min(1.0, sum(buckets["generic"].values()) / 4.0),
+            "core_score": min(1.0, sum(buckets["core"].values()) / 3.0),
+            "diagnostic_score": min(1.0, sum(buckets["diagnostic"].values()) / 2.0),
+        }
+
+    @classmethod
+    def _observation_evidence_tier(cls, observation: Observation) -> str:
+        finding = str(observation.finding or "")
+        evidence_level = str(getattr(observation, "evidence_level", "") or "")
+        if finding.startswith("diagnosis:"):
+            return "diagnostic"
+        if finding in _DIAGNOSTIC_EXPLANATORY_FINDINGS:
+            return "diagnostic"
+        if evidence_level == "diagnostic_pattern":
+            return "diagnostic"
+        if observation.value is not None or observation.direction:
+            return "diagnostic"
+        if finding in _CORE_EXPLANATORY_FINDINGS:
+            return "core"
+        if evidence_level == "specific":
+            return "core"
+        try:
+            information_value = float(getattr(observation, "information_value", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            information_value = 0.0
+        if information_value >= 0.75:
+            return "core"
+        if evidence_level == "generic" or finding in _GENERIC_EXPLANATORY_FINDINGS:
+            return "generic"
+        if finding.startswith(("field:", "symptom:")):
+            return "generic"
+        return "core"
+
+    @staticmethod
+    def _generic_parent_penalty(
+        entry: Dict[str, Any],
+        *,
+        core_evidence_score: float,
+        diagnostic_evidence_score: float,
+        residual_core_count: int,
+        required_met: bool,
+    ) -> float:
+        name = str(entry.get("name") or "")
+        dtype = str(entry.get("diagnosis_type") or "").lower()
+        specificity = float(entry.get("specificity", 0.5) or 0.5)
+        is_generic = (
+            name in _GENERIC_PARENT_DIAGNOSES
+            or dtype in {"syndrome", "state", "complication"}
+            or (specificity <= 0.55 and not entry.get("generalization_suppressions"))
+        )
+        if not is_generic:
+            return 0.0
+        penalty = 0.25
+        if core_evidence_score <= 0.05 and diagnostic_evidence_score <= 0.05:
+            penalty += 0.30
+        if diagnostic_evidence_score <= 0.05:
+            penalty += 0.10
+        if required_met:
+            penalty += 0.08
+        penalty += min(0.30, 0.10 * max(0, residual_core_count))
+        return round(min(1.0, penalty), 4)
 
     @staticmethod
     def _required_gap_state(
@@ -1351,27 +1574,52 @@ class DiagnosisDecisionEngine:
         for specific in scores:
             if specific.hard_contradiction or not specific.matched_evidence:
                 continue
+            has_core_or_diagnostic_signal = bool(
+                specific.core_matched_evidence
+                or specific.diagnostic_matched_evidence
+                or specific.core_evidence_score >= 0.20
+                or specific.diagnostic_evidence_score > 0.0
+            )
             if not (
                 specific.required_met
                 or specific.source_prior >= 0.45
                 or specific.coverage_score >= self.evidence_gap_coverage_threshold
+                or has_core_or_diagnostic_signal
             ):
                 continue
             entry = self.knowledge.get(specific.diagnosis)
+            explicit_generic_names = set(
+                _SPECIFIC_GENERIC_SUPPRESSIONS.get(specific.diagnosis, set())
+            )
             generic_names = set(str(item) for item in entry.get("generalization_suppressions", []) or [])
             generic_names.update(str(item) for item in entry.get("suppress_diagnoses", []) or [])
+            generic_names.update(explicit_generic_names)
             if specific.parent_diagnosis:
                 generic_names.add(specific.parent_diagnosis)
             for generic_name in generic_names:
                 generic = by_name.get(generic_name)
                 if not generic or generic.hard_contradiction:
                     continue
-                if generic.specificity > specific.specificity and generic.parent_diagnosis != specific.diagnosis:
+                if (
+                    generic_name not in explicit_generic_names
+                    and generic.specificity > specific.specificity
+                    and generic.parent_diagnosis != specific.diagnosis
+                ):
                     continue
-                penalty = 0.14 if specific.required_met else 0.08
+                penalty = 0.16 if specific.required_met else 0.12
+                if specific.diagnostic_evidence_score > 0.0:
+                    penalty += 0.10
+                elif specific.core_evidence_score >= 0.20:
+                    penalty += 0.06
+                if generic.residual_core_evidence_count > specific.residual_core_evidence_count:
+                    penalty += min(0.08, 0.03 * generic.residual_core_evidence_count)
                 generic.score = round(max(0.0, generic.score - penalty), 4)
                 generic.component_scores["generalization_penalty"] = round(
                     generic.component_scores.get("generalization_penalty", 0.0) + penalty,
+                    4,
+                )
+                generic.component_scores["specific_over_generic_penalty"] = round(
+                    generic.component_scores.get("specific_over_generic_penalty", 0.0) + penalty,
                     4,
                 )
 
@@ -1470,12 +1718,25 @@ class DiagnosisDecisionEngine:
         finding = str(observation.finding or "")
         if not finding or finding.startswith("field:"):
             return False
+        if getattr(observation, "shadowed_by", ""):
+            return False
+        evidence_level = str(getattr(observation, "evidence_level", "") or "")
+        if evidence_level == "generic":
+            return False
+        try:
+            information_value = float(getattr(observation, "information_value", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            information_value = 0.0
         if finding.startswith("diagnosis:"):
+            return True
+        if finding in _DIAGNOSTIC_EXPLANATORY_FINDINGS:
             return True
         if finding in _CORE_EXPLANATORY_FINDINGS:
             return True
         if finding in _GENERIC_EXPLANATORY_FINDINGS:
             return False
+        if evidence_level in {"specific", "diagnostic_pattern"} or information_value >= 0.75:
+            return True
         if observation.value is not None or observation.direction:
             return True
         if observation.source != "问诊" and not finding.startswith("symptom:"):
@@ -2004,7 +2265,9 @@ def _matching_observations(
 ) -> List[Observation]:
     return [
         item for item in observations
-        if item.polarity == polarity and _observation_matches(spec, item)
+        if item.polarity == polarity
+        and not (polarity == "positive" and getattr(item, "shadowed_by", ""))
+        and _observation_matches(spec, item)
     ]
 
 
@@ -2030,6 +2293,16 @@ def _observation_matches(spec: Dict[str, Any], item: Observation) -> bool:
         if item.value is None or item.value > float(spec["max_value"]):
             return False
     return bool(finding or direction or source_contains or terms or spec.get("min_value") is not None or spec.get("max_value") is not None)
+
+
+def _information_multiplier(item: Observation) -> float:
+    try:
+        value = float(getattr(item, "information_value", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value <= 0.0:
+        return 1.0
+    return max(0.35, min(1.45, 0.65 + value))
 
 
 def _coerce_profile_evidence_spec(value: Any, default_weight: float) -> Dict[str, Any]:

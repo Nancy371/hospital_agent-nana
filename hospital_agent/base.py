@@ -79,6 +79,10 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "differential_exam_precision": metric("differential_exam_precision"),
         "discriminating_exam_recall": metric("discriminating_exam_recall"),
         "exam_information_gain": metric("exam_information_gain"),
+        "special_discriminator_rate": metric("special_discriminator_rate"),
+        "multi_candidate_exam_rate": metric("multi_candidate_exam_rate"),
+        "generic_exam_suppression_count": metric("generic_exam_suppression_count"),
+        "post_exam_primary_recomputed_rate": metric("post_exam_primary_recomputed_rate"),
         "discriminating_gap_closed_rate": metric("discriminating_gap_closed_rate"),
         "gap_closure_rate": metric("gap_closure_rate"),
         "dynamic_rerank_changed_primary": metric("dynamic_rerank_changed_primary"),
@@ -108,6 +112,17 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "differential_pool_expected_included": metric(
             "differential_pool_expected_included"
         ),
+        "generic_primary_block_count": metric("generic_primary_block_count"),
+        "specific_over_generic_preference_count": metric(
+            "specific_over_generic_preference_count"
+        ),
+        "core_evidence_primary_alignment": metric("core_evidence_primary_alignment"),
+        "diagnostic_evidence_primary_alignment": metric(
+            "diagnostic_evidence_primary_alignment"
+        ),
+        "residual_core_penalty_applied_count": metric(
+            "residual_core_penalty_applied_count"
+        ),
         "pairwise_noise_rejection_count": metric("pairwise_noise_rejection_count"),
         "cluster_gate_rejection_count": metric("cluster_gate_rejection_count"),
         "core_evidence_coverage": metric("core_evidence_coverage"),
@@ -116,6 +131,10 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "required_evidence_coverage": metric("required_evidence_coverage"),
         "soft_contradiction_count": metric("soft_contradiction_count"),
         "hard_contradiction_count": metric("hard_contradiction_count"),
+        "high_information_finding_count": metric("high_information_finding_count"),
+        "generic_finding_shadowed_count": metric("generic_finding_shadowed_count"),
+        "generic_only_candidate_count": metric("generic_only_candidate_count"),
+        "evidence_information_value_mean": metric("evidence_information_value_mean"),
         "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,
         "critic_llm_rate": round(critic_llm_count / total, 4) if total else 0.0,
         "average_elapsed_seconds": _mean_training_value(

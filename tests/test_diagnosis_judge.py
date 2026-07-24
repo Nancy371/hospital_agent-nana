@@ -14,6 +14,7 @@ TB = "\u80ba\u7ed3\u6838"
 PNEUMONIA = "\u80ba\u708e"
 BRONCHOPNEUMONIA = "\u652f\u6c14\u7ba1\u80ba\u708e"
 LUNG_CANCER = "\u80ba\u764c"
+MPA = "\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e"
 URACHAL_CYST = "\u8110\u5c3f\u7ba1\u56ca\u80bf"
 FRACTURE = "\u9aa8\u6298"
 ZOSTER = "\u5e26\u72b6\u75b1\u75b9"
@@ -22,6 +23,9 @@ PULMONARY_STENOSIS = "\u80ba\u52a8\u8109\u74e3\u72ed\u7a84"
 HEART_FAILURE = "\u5fc3\u529b\u8870\u7aed"
 OHSS = "\u5375\u5de2\u8fc7\u5ea6\u523a\u6fc0\u7efc\u5408\u5f81"
 PANCREATITIS = "\u80f0\u817a\u708e"
+URETHRAL_SYNDROME = "\u5c3f\u9053\u7efc\u5408\u5f81"
+AV_BLOCK_2 = "\u4e8c\u5ea6\u623f\u5ba4\u4f20\u5bfc\u963b\u6ede"
+ARRHYTHMIA = "\u5fc3\u5f8b\u5931\u5e38"
 
 
 def load_config():
@@ -43,6 +47,9 @@ def candidate(
     matched=None,
     gaps=None,
     parent="",
+    core_score=0.0,
+    diagnostic_score=0.0,
+    generic_penalty=0.0,
 ):
     if core_coverage is None:
         core_coverage = coverage
@@ -66,7 +73,19 @@ def candidate(
         required_met=required,
         hard_contradiction=False,
         matched_evidence=list(matched or ["symptom:signal"]),
+        core_matched_evidence=[
+            item for item in list(matched or []) if item not in {"fever", "cough", "pain", "rash"}
+        ],
+        diagnostic_matched_evidence=[],
+        core_evidence_score=core_score,
+        diagnostic_evidence_score=diagnostic_score,
+        generic_coverage_score=0.0,
         required_gaps=list(gaps or []),
+        component_scores={
+            "core_evidence_score": core_score,
+            "diagnostic_evidence_score": diagnostic_score,
+            "generic_parent_penalty": generic_penalty,
+        },
         diagnosis_type=diagnosis_type,
         parent_diagnosis=parent,
         specificity=specificity,
@@ -204,6 +223,129 @@ class DiagnosisJudgeTests(unittest.TestCase):
         self.assertEqual(decision.final_diagnoses[0], TB)
         self.assertIn(TB, payload["differential_candidates"])
         self.assertIn(TB, decision.required_gap_authorized_diagnoses)
+
+    def test_urachal_cyst_core_evidence_beats_urethral_syndrome(self):
+        urethral = candidate(
+            URETHRAL_SYNDROME,
+            0.64,
+            required=True,
+            diagnosis_type="syndrome",
+            specificity=0.58,
+            coverage=0.38,
+            residual=0.62,
+            core_coverage=0.12,
+            residual_core=3,
+            matched=["dysuria", "urinary_frequency"],
+            generic_penalty=0.8,
+        )
+        urachal = candidate(
+            URACHAL_CYST,
+            0.50,
+            required=False,
+            diagnosis_type="structural",
+            specificity=0.93,
+            coverage=0.66,
+            residual=0.18,
+            core_coverage=0.78,
+            residual_core=0,
+            matched=[
+                "umbilical_discharge",
+                "midline_suprapubic_pain",
+                "urachal_remnant_pattern",
+            ],
+            gaps=["urachal_cyst_imaging"],
+            core_score=0.86,
+        )
+        decision = self.run_candidates([urethral, urachal])
+        self.assertEqual(decision.final_diagnoses[0], URACHAL_CYST)
+        self.assertIn(URACHAL_CYST, decision.required_gap_authorized_diagnoses)
+        self.assertTrue(decision.judge_decision["explanation_score_changed_ranking"])
+
+    def test_av_block_core_evidence_beats_arrhythmia_parent(self):
+        arrhythmia = candidate(
+            ARRHYTHMIA,
+            0.68,
+            required=True,
+            specificity=0.50,
+            coverage=0.40,
+            residual=0.55,
+            core_coverage=0.18,
+            residual_core=2,
+            matched=["palpitation", "dizziness"],
+            generic_penalty=0.75,
+        )
+        av_block = candidate(
+            AV_BLOCK_2,
+            0.52,
+            required=True,
+            diagnosis_type="structural",
+            specificity=0.94,
+            coverage=0.70,
+            residual=0.16,
+            core_coverage=0.82,
+            residual_core=0,
+            matched=["second_degree_av_block", "bradycardia", "presyncope"],
+            parent=ARRHYTHMIA,
+            core_score=0.74,
+            diagnostic_score=0.52,
+        )
+        decision = self.run_candidates([arrhythmia, av_block])
+        self.assertEqual(decision.final_diagnoses[0], AV_BLOCK_2)
+        self.assertNotIn(ARRHYTHMIA, decision.final_diagnoses)
+
+    def test_tb_mpa_lung_cancer_tasks_prioritize_special_discriminators(self):
+        lung_cancer = candidate(
+            LUNG_CANCER,
+            0.62,
+            required=True,
+            specificity=0.86,
+            coverage=0.50,
+            residual=0.36,
+            matched=["hemoptysis"],
+        )
+        mpa = candidate(
+            MPA,
+            0.59,
+            required=False,
+            diagnosis_type="systemic",
+            specificity=0.92,
+            coverage=0.62,
+            residual=0.26,
+            core_coverage=0.64,
+            residual_core=1,
+            matched=["hemoptysis", "microscopic_hematuria"],
+            gaps=["anca_positive", "renal_impairment"],
+        )
+        tb = candidate(
+            TB,
+            0.56,
+            required=False,
+            diagnosis_type="etiology",
+            specificity=0.92,
+            coverage=0.68,
+            residual=0.22,
+            core_coverage=0.70,
+            residual_core=0,
+            matched=["hemoptysis", "night_sweats", "tuberculosis_exposure"],
+            gaps=["afb_positive", "tb_naat_positive"],
+        )
+        decision = self.run_candidates([lung_cancer, mpa, tb])
+        payload = decision.judge_decision
+        tasks = payload["discriminating_exam_tasks"]
+        exams = [item["exam"] for item in tasks]
+        self.assertLessEqual(len(exams), 6)
+        self.assertLess(
+            exams.index("抗酸杆菌染色（AFB）"),
+            exams.index("全血细胞计数（CBC）") if "全血细胞计数（CBC）" in exams else len(exams),
+        )
+        self.assertIn("抗中性粒细胞胞质抗体（ANCA）谱", exams)
+        self.assertTrue(
+            all(item["target_candidates"] for item in tasks)
+        )
+        self.assertGreaterEqual(
+            sum(1 for item in tasks if len(item["target_candidates"]) >= 2),
+            4,
+        )
 
     def test_differential_pool_filters_cross_system_noise_from_yaws(self):
         waterpox = candidate(WATERPOX, 0.60, required=True, specificity=0.90, matched=["vesicular_rash"])
