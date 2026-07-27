@@ -99,6 +99,12 @@ rag:
   # 单个 chunk 注入 prompt 的最大字符数
   max_chunk_chars: 700
 
+external_medical_retrieval:
+  enabled: true
+  provider: offline_seed
+  top_k: 5
+  seed_path: data/ref_data/medical_knowledge/external_retrieval_seeds.json
+
 # Evidence-first diagnosis arbitration. The allowed namespace is the 50
 # official catalog labels plus the controlled extension file.
 diagnosis:

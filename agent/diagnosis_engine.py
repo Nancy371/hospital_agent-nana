@@ -11,6 +11,7 @@ from .candidate_generator import CandidateGenerator, CandidatePool
 from .clinical_evidence import EvidenceBundle, Observation
 from .diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter
 from .diagnosis_resolver import DiagnosisResolution, OpenWorldDiagnosisResolver
+from .mechanism_reasoner import MechanismReasoner
 
 
 _SECONDARY_MANIFESTATION_DIAGNOSES = {
@@ -45,9 +46,11 @@ _CORE_EXPLANATORY_FINDINGS = {
     "dark_urine",
     "deep_skin_ulcer",
     "dermatomal_vesicles",
+    "distance_vision_relatively_preserved",
     "dyspnea_on_exertion",
     "exercise_intolerance",
     "fluid_retention_pattern",
+    "gradual_onset",
     "hemoptysis",
     "iris_coloboma",
     "lens_dislocation",
@@ -57,6 +60,8 @@ _CORE_EXPLANATORY_FINDINGS = {
     "night_vision_decline",
     "night_sweats",
     "nyctalopia_pattern",
+    "ocular_pain",
+    "ocular_redness",
     "orthopnea",
     "ovotesticular_tissue",
     "paroxysmal_nocturnal_dyspnea",
@@ -81,6 +86,7 @@ _CORE_EXPLANATORY_FINDINGS = {
     "umbilical_mass",
     "urachal_remnant_pattern",
     "urachal_cyst_imaging",
+    "worse_in_dim_light",
 }
 
 _DIAGNOSTIC_EXPLANATORY_FINDINGS = {
@@ -102,6 +108,7 @@ _DIAGNOSTIC_EXPLANATORY_FINDINGS = {
     "treponema_positive",
     "treponemal_serology_positive",
     "treponemal_disease_pattern",
+    "accommodation_failure_pattern",
 }
 
 _SPECIFIC_GENERIC_SUPPRESSIONS = {
@@ -221,6 +228,9 @@ class DiagnosisDecision:
     decision_override: bool = False
     required_gap_authorized_diagnoses: List[str] = field(default_factory=list)
     judge_decision: Dict[str, Any] = field(default_factory=dict)
+    open_world_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    retrieval_views: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -247,6 +257,9 @@ class DiagnosisDecision:
                 self.required_gap_authorized_diagnoses
             ),
             "judge_decision": dict(self.judge_decision),
+            "open_world_candidates": list(self.open_world_candidates),
+            "mechanism_hypotheses": list(self.mechanism_hypotheses),
+            "retrieval_views": list(self.retrieval_views),
         }
 
 
@@ -593,6 +606,7 @@ class DiagnosisDecisionEngine:
         self.knowledge = DiagnosticKnowledgeBase(ref_dir=ref_dir)
         self.resolver = OpenWorldDiagnosisResolver(self.knowledge, config=config)
         self.candidate_generator = CandidateGenerator(self.knowledge, self.resolver)
+        self.mechanism_reasoner = MechanismReasoner()
         self.judge = DiagnosisJudge(config=config, knowledge=self.knowledge)
         self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
 
@@ -645,6 +659,12 @@ class DiagnosisDecisionEngine:
     ) -> DiagnosisDecision:
         priors = candidate_pool.priors()
         sources_by_name = candidate_pool.sources_by_name()
+        mechanism_hypotheses = list(candidate_pool.mechanism_hypotheses)
+        open_world_candidates = list(candidate_pool.open_world_candidates)
+        retrieval_views = [
+            item.to_dict()
+            for item in self.mechanism_reasoner.retrieval_views(evidence)
+        ]
         scores = [
             self._score_entry(
                 entry,
@@ -698,8 +718,12 @@ class DiagnosisDecisionEngine:
             or margin < self.margin_threshold
             or bool(unexplained)
             or any(item.hard_contradiction for item in selected)
+            or bool(self._strong_open_world_contenders(open_world_candidates))
         )
         reasoning = self._reasoning(selected, unexplained)
+        open_world_reason = self._open_world_reasoning(open_world_candidates, mechanism_hypotheses)
+        if open_world_reason:
+            reasoning = (reasoning.rstrip() + " " + open_world_reason).strip()
         decision = DiagnosisDecision(
             final_diagnoses=final_names,
             trusted_diagnoses=trusted_names,
@@ -715,6 +739,9 @@ class DiagnosisDecisionEngine:
             name_resolutions=list(candidate_pool.name_resolutions),
             unresolved_candidates=list(candidate_pool.unresolved_candidates),
             differential_only_diagnoses=differential_only,
+            open_world_candidates=open_world_candidates,
+            mechanism_hypotheses=mechanism_hypotheses,
+            retrieval_views=retrieval_views,
         )
         self.judge_and_submit(decision)
         return decision
@@ -801,6 +828,7 @@ class DiagnosisDecisionEngine:
             reason = self._authorization_ineligible_reason(
                 candidate,
                 respect_differential_only=respect_differential_only,
+                decision=decision,
             )
             if reason:
                 if candidate:
@@ -886,6 +914,7 @@ class DiagnosisDecisionEngine:
         self,
         candidate: Optional[CandidateScore],
         respect_differential_only: bool = True,
+        decision: Optional[DiagnosisDecision] = None,
     ) -> str:
         if candidate is None:
             return "not present in evidence-first candidate table"
@@ -894,8 +923,17 @@ class DiagnosisDecisionEngine:
         if candidate.hard_contradiction:
             return "hard contradiction present"
         gap_authorized = bool(getattr(candidate, "required_gap_authorized", False))
-        if gap_authorized and not candidate.matched_evidence:
-            return "required gap authorization has no supporting evidence"
+        if candidate.required_gaps and not self._gap_candidate_has_submission_evidence(candidate):
+            return "required evidence gap lacks objective confirmation"
+        if gap_authorized and not self._gap_candidate_has_submission_evidence(candidate):
+            return "required gap authorization lacks objective or diagnostic evidence"
+        if (
+            decision
+            and self._strong_open_world_contenders(decision.open_world_candidates)
+            and not candidate.required_met
+            and not self._gap_candidate_has_submission_evidence(candidate)
+        ):
+            return "strong open-world contender remains unresolved"
         if not candidate.matched_evidence:
             return "no matched supporting evidence"
         if not candidate.trusted and not gap_authorized and candidate.score <= 0:
@@ -1005,6 +1043,82 @@ class DiagnosisDecisionEngine:
             candidate.component_scores.get("objective_evidence", 0.0) >= 1.0
         )
 
+    def _gap_candidate_has_submission_evidence(self, candidate: CandidateScore) -> bool:
+        if candidate.required_met:
+            return True
+        components = candidate.component_scores or {}
+        try:
+            objective = float(components.get("objective_evidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            objective = 0.0
+        if objective >= 1.0:
+            return True
+        try:
+            diagnostic = float(candidate.diagnostic_evidence_score or 0.0)
+        except (TypeError, ValueError):
+            diagnostic = 0.0
+        if diagnostic >= 0.45:
+            return True
+        core_count = len(set(candidate.core_matched_evidence or []))
+        try:
+            core_coverage = float(candidate.core_explanatory_coverage or 0.0)
+        except (TypeError, ValueError):
+            core_coverage = 0.0
+        return bool(
+            core_count >= 3
+            and core_coverage >= 0.65
+            and int(candidate.residual_core_evidence_count or 0) <= 0
+        )
+
+    @staticmethod
+    def _strong_open_world_contenders(
+        open_world_candidates: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        contenders: List[Dict[str, Any]] = []
+        for item in open_world_candidates or []:
+            try:
+                prior = float(item.get("prior", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                prior = 0.0
+            metadata = item.get("metadata") or {}
+            source = str(item.get("source") or "")
+            if prior < 0.62:
+                continue
+            if source not in {"mechanism_reasoner", "external_retrieval", "llm_unresolved"}:
+                continue
+            if not (item.get("evidence_links") or metadata.get("mechanism_id") or metadata.get("unreviewed_external")):
+                continue
+            contenders.append(dict(item))
+        contenders.sort(key=lambda value: float(value.get("prior", 0.0) or 0.0), reverse=True)
+        return contenders
+
+    def _open_world_reasoning(
+        self,
+        open_world_candidates: Sequence[Dict[str, Any]],
+        mechanism_hypotheses: Sequence[Dict[str, Any]],
+    ) -> str:
+        contenders = self._strong_open_world_contenders(open_world_candidates)
+        if not contenders and not mechanism_hypotheses:
+            return ""
+        parts: List[str] = []
+        if mechanism_hypotheses:
+            names = [
+                str(item.get("mechanism_id") or "")
+                for item in mechanism_hypotheses[:3]
+                if str(item.get("mechanism_id") or "")
+            ]
+            if names:
+                parts.append("机制/疾病家族假设: " + ", ".join(names))
+        if contenders:
+            names = [
+                str(item.get("raw_name") or "")
+                for item in contenders[:3]
+                if str(item.get("raw_name") or "")
+            ]
+            if names:
+                parts.append("未映射开放候选仅用于鉴别和检查，不直接提交: " + ", ".join(names))
+        return " ".join(parts)
+
     @staticmethod
     def _authorization_block_record(
         name: str,
@@ -1062,6 +1176,9 @@ class DiagnosisDecisionEngine:
         fixed["_diagnosis_decision"] = decision.to_dict()
         fixed["_diagnosis_name_resolution"] = list(decision.name_resolutions)
         fixed["_unresolved_diagnosis_candidates"] = list(decision.unresolved_candidates)
+        fixed["_open_world_diagnosis_candidates"] = list(decision.open_world_candidates)
+        fixed["_mechanism_hypotheses"] = list(decision.mechanism_hypotheses)
+        fixed["_retrieval_views"] = list(decision.retrieval_views)
         fixed["_evidence_items"] = [item.to_dict() for item in evidence.observations]
         reasoning = str(fixed.get("reasoning") or "").strip()
         if decision.evidence_reasoning and decision.evidence_reasoning not in reasoning:
@@ -1203,6 +1320,13 @@ class DiagnosisDecisionEngine:
 
     def resolve_open_candidates(self, result: Any) -> List[DiagnosisResolution]:
         return self.resolver.resolve_result(result)
+
+    def build_retrieval_views(self, evidence: EvidenceBundle) -> List[Dict[str, Any]]:
+        mechanisms = self.mechanism_reasoner.evaluate(evidence)
+        return [
+            item.to_dict()
+            for item in self.mechanism_reasoner.retrieval_views(evidence, mechanisms)
+        ]
 
     def _score_entry(
         self,
@@ -1796,11 +1920,14 @@ class DiagnosisDecisionEngine:
         for item in evidence.observations:
             if item.finding not in matched_set or item.polarity != "positive":
                 continue
-            if item.source != "问诊":
-                return True
             if item.finding.startswith("diagnosis:"):
                 return True
-            if item.finding not in {"palpitation", "muscle_cramp", "dyspnea", "weakness", "dizziness"} and not item.finding.startswith("symptom:"):
+            if str(item.source or "").strip() not in {
+                "\u95ee\u8bca",
+                "raw_case_finding",
+                "evidence_interpreter",
+                "reasoning_inference",
+            }:
                 return True
         return False
 

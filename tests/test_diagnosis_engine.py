@@ -156,8 +156,15 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertFalse(low_mag.required_met)
         self.assertFalse(low_mag.hard_contradiction)
         self.assertEqual(low_mag.required_gap_state, "actionable_gap")
-        self.assertIn("低镁血症", decision.final_diagnoses)
+        self.assertNotIn("低镁血症", decision.final_diagnoses)
         self.assertIn("低镁血症", decision.judge_decision["evidence_gap_targets"])
+        self.assertTrue(
+            any(
+                item.get("diagnosis") == "低镁血症"
+                and "objective confirmation" in item.get("reason", "")
+                for item in decision.blocked_diagnoses
+            )
+        )
 
     def test_core_evidence_tiers_promote_specific_over_generic_pulmonary_candidate(self):
         tb = "\u80ba\u7ed3\u6838"
@@ -255,8 +262,15 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertFalse(vasculitis.hard_contradiction)
         self.assertGreater(vasculitis.coverage_score, cad.coverage_score)
         self.assertLess(vasculitis.residual_score, cad.residual_score)
-        self.assertIn("显微镜下多血管炎", decision.final_diagnoses)
+        self.assertNotIn("显微镜下多血管炎", decision.final_diagnoses)
         self.assertIn("显微镜下多血管炎", decision.required_gap_authorized_diagnoses)
+        self.assertTrue(
+            any(
+                item.get("diagnosis") == "显微镜下多血管炎"
+                and "objective confirmation" in item.get("reason", "")
+                for item in decision.blocked_diagnoses
+            )
+        )
 
     def test_vitamin_d_biochemistry_and_bone_findings_promote_rickets(self):
         _, decision = self.decide(

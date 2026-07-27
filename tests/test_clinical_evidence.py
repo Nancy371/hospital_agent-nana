@@ -461,6 +461,47 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
         self.assertEqual(visual.evidence_level, "generic")
         self.assertLessEqual(visual.information_value, 0.2)
 
+    def test_colloquial_near_vision_language_decomposes_into_high_value_findings(self):
+        bundle = self.normalizer.normalize(
+            {
+                "symptoms": [
+                    "\u6700\u8fd1\u770b\u624b\u673a\u603b\u8981\u62ff\u8fdc\u4e00\u70b9\uff0c\u5149\u7ebf\u6697\u7684\u65f6\u5019\u66f4\u660e\u663e\uff0c"
+                    "\u4f46\u662f\u770b\u8fdc\u5904\u8fd8\u53ef\u4ee5\uff0c\u4e5f\u4e0d\u75bc\u4e0d\u7ea2\u3002"
+                ]
+            },
+            {},
+        )
+        positives = bundle.findings("positive")
+        negatives = bundle.findings("negative")
+        for finding in {
+            "near_vision_difficulty",
+            "distance_vision_relatively_preserved",
+            "worse_in_dim_light",
+            "gradual_onset",
+            "accommodation_failure_pattern",
+        }:
+            self.assertIn(finding, positives)
+        self.assertIn("ocular_pain", negatives)
+        self.assertIn("ocular_redness", negatives)
+        near = next(item for item in bundle.observations if item.finding == "near_vision_difficulty")
+        self.assertEqual(near.clinical_pattern, "accommodation_failure_pattern")
+        self.assertIn("accommodation_failure", near.mechanism_ids)
+
+    def test_eye_uncertain_and_unknown_are_not_merged_with_negative(self):
+        bundle = self.normalizer.normalize(
+            {
+                "symptoms": [
+                    "\u8bf4\u4e0d\u6e05\u662f\u5426\u773c\u75db\uff0c\u5c1a\u672a\u8be2\u95ee\u773c\u7ea2\uff0c\u89c6\u7269\u6a21\u7cca"
+                ]
+            },
+            {},
+        )
+        polarities = {(item.finding, item.polarity) for item in bundle.observations}
+        self.assertIn(("ocular_pain", "uncertain"), polarities)
+        self.assertIn(("ocular_redness", "unknown"), polarities)
+        self.assertNotIn(("ocular_pain", "negative"), polarities)
+        self.assertNotIn(("ocular_redness", "negative"), polarities)
+
     def test_interpreter_v2_maps_night_vision_and_urachal_language(self):
         bundle = self.normalizer.normalize(
             {

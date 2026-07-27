@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from .medical_retrieval import ExternalMedicalKnowledgeRetriever
+
 
 def _positive_int(value: Any, default: int) -> int:
     try:
@@ -130,6 +132,10 @@ class HybridRAGRetriever:
         self.memory = memory
         self.policy_store = policy_store
         self.allowed_diagnoses = self._load_allowed_diagnoses(config)
+        self.external_medical = ExternalMedicalKnowledgeRetriever(
+            config=config,
+            ref_dir=str((config or {}).get("ref_data_dir") or "data/ref_data"),
+        )
 
     def search(
         self,
@@ -142,6 +148,7 @@ class HybridRAGRetriever:
         mqe_expansions: Optional[int] = None,
         candidate_pool_multiplier: Optional[int] = None,
         include_policy_shadow: Optional[bool] = None,
+        retrieval_views: Optional[Sequence[Any]] = None,
     ) -> List[Dict[str, Any]]:
         """统一检索，返回按 score 降序排序的 chunk 字典。"""
         collected_info = collected_info or {}
@@ -175,6 +182,8 @@ class HybridRAGRetriever:
             enable_mqe=use_mqe,
             mqe_expansions=expansions,
         )
+        view_terms = self._retrieval_view_terms(retrieval_views or [])
+        expanded_terms = _dedupe(expanded_terms + view_terms)
         candidate_names = self._candidate_names(candidate_diseases, expanded_terms, pool)
         augmented_info = self._augment_collected_info(collected_info, expanded_terms)
 
@@ -184,6 +193,7 @@ class HybridRAGRetriever:
         chunks.extend(self._standard_exam_chunks(expanded_terms, candidate_names, chunks, pool))
         chunks.extend(self._experience_chunks(augmented_info, pool))
         chunks.extend(self._policy_chunks(augmented_info, candidate_names, include_shadow))
+        chunks.extend(self._external_medical_chunks(retrieval_views or [], expanded_terms, pool))
 
         merged = self._merge_chunks(chunks)
         if threshold is not None:
@@ -199,6 +209,7 @@ class HybridRAGRetriever:
         candidate_diseases: Optional[List[Any]] = None,
         top_k: Optional[int] = None,
         score_threshold: Optional[float] = None,
+        retrieval_views: Optional[Sequence[Any]] = None,
     ) -> str:
         """构建可注入 prompt 的统一 RAG 上下文。"""
         chunks = self.search(
@@ -207,6 +218,7 @@ class HybridRAGRetriever:
             candidate_diseases=candidate_diseases,
             top_k=top_k,
             score_threshold=score_threshold,
+            retrieval_views=retrieval_views,
         )
         return self.render_chunks(chunks)
 
@@ -217,11 +229,12 @@ class HybridRAGRetriever:
 
         groups = [
             ("disease_profile", "疾病画像"),
+            ("external_medical_knowledge", "外部医学检索"),
             ("standard_exam", "标准检查"),
             ("case_experience", "历史病例经验"),
             ("policy_patch", "策略补丁"),
         ]
-        lines = ["【Hybrid RAG 统一检索】以下内容来自疾病画像、标准检查、历史病例和策略补丁，请结合当前病例判断："]
+        lines = ["【Hybrid RAG 统一检索】以下内容来自疾病画像、外部待审核检索、标准检查、历史病例和策略补丁，请结合当前病例判断："]
         for chunk_type, label in groups:
             selected = [chunk for chunk in chunks if chunk.get("type") == chunk_type]
             if not selected:
@@ -491,6 +504,65 @@ class HybridRAGRetriever:
             )
         return chunks
 
+    def _external_medical_chunks(
+        self,
+        retrieval_views: Sequence[Any],
+        expanded_terms: List[str],
+        pool: int,
+    ) -> List[RagChunk]:
+        try:
+            results = self.external_medical.search(
+                retrieval_views=retrieval_views,
+                query_terms=expanded_terms,
+                top_k=min(pool, 8),
+            )
+        except Exception:
+            results = []
+        chunks: List[RagChunk] = []
+        for result in results or []:
+            title = str(result.title or "").strip()
+            if not title:
+                continue
+            candidates = ", ".join(result.candidate_diseases[:4])
+            exams = ", ".join(result.recommended_exams[:6])
+            text_parts = [result.summary]
+            if candidates:
+                text_parts.append(f"候选: {candidates}")
+            if exams:
+                text_parts.append(f"建议检查: {exams}")
+            chunks.append(
+                RagChunk(
+                    chunk_id=f"external:{title}",
+                    chunk_type="external_medical_knowledge",
+                    title=title,
+                    text="; ".join(part for part in text_parts if part),
+                    score=max(0.0, min(0.95, float(result.score or 0.0))),
+                    metadata={
+                        **dict(result.metadata or {}),
+                        "candidate_diseases": list(result.candidate_diseases),
+                        "recommended_exams": list(result.recommended_exams),
+                        "source_label": result.source_label,
+                        "submittable": False,
+                    },
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _retrieval_view_terms(retrieval_views: Sequence[Any]) -> List[str]:
+        terms: List[str] = []
+        for view in retrieval_views or []:
+            if isinstance(view, dict):
+                terms.extend(str(item) for item in view.get("terms", []) or [] if str(item))
+                if view.get("query"):
+                    terms.append(str(view.get("query")))
+                continue
+            terms.extend(str(item) for item in getattr(view, "terms", []) or [] if str(item))
+            query = getattr(view, "query", "")
+            if query:
+                terms.append(str(query))
+        return _dedupe(terms)
+
     def _candidate_names(
         self,
         candidate_diseases: Optional[List[Any]],
@@ -668,6 +740,7 @@ class HybridRAGRetriever:
 
         quotas = {
             "policy_patch": 1,
+            "external_medical_knowledge": max(1, top_k // 5),
             "disease_profile": max(3, top_k // 2),
             "standard_exam": max(2, top_k // 4),
             "case_experience": max(1, top_k // 5),
@@ -708,6 +781,7 @@ class HybridRAGRetriever:
     def _type_priority(chunk_type: str) -> int:
         return {
             "policy_patch": 4,
+            "external_medical_knowledge": 4,
             "disease_profile": 3,
             "standard_exam": 2,
             "case_experience": 1,

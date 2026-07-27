@@ -41,6 +41,11 @@ __all__ = [
     "HybridRAGRetriever",
     "HybridRAGConfig",
     "RagChunk",
+    "MechanismReasoner",
+    "MechanismHypothesis",
+    "RetrievalView",
+    "ExternalMedicalKnowledgeRetriever",
+    "ExternalMedicalResult",
     "ShadowReplay",
     "DiagnosticReplay",
     "heuristic_plan_score",
@@ -106,6 +111,12 @@ def __getattr__(name: str):
     if name in ("HybridRAGRetriever", "HybridRAGConfig", "RagChunk"):
         from . import rag_retriever as _rag_retriever
         return getattr(_rag_retriever, name)
+    if name in ("MechanismReasoner", "MechanismHypothesis", "RetrievalView"):
+        from . import mechanism_reasoner as _mechanism_reasoner
+        return getattr(_mechanism_reasoner, name)
+    if name in ("ExternalMedicalKnowledgeRetriever", "ExternalMedicalResult"):
+        from . import medical_retrieval as _medical_retrieval
+        return getattr(_medical_retrieval, name)
     if name in ("ShadowReplay", "DiagnosticReplay", "heuristic_plan_score"):
         from . import replay as _replay
         return getattr(_replay, name)

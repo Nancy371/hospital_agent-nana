@@ -296,10 +296,12 @@ class DoctorAgentMemory:
         self,
         collected_info: Dict[str, Any],
         candidate_diseases: Optional[List[Any]] = None,
+        retrieval_views: Optional[List[Any]] = None,
     ) -> str:
         context = self.hybrid_rag.build_context(
             collected_info=collected_info,
             candidate_diseases=candidate_diseases,
+            retrieval_views=retrieval_views,
         )
         if context:
             return context
@@ -312,6 +314,7 @@ class DoctorAgentMemory:
         candidate_diseases: Optional[List[Any]] = None,
         top_k: Optional[int] = None,
         score_threshold: Optional[float] = None,
+        retrieval_views: Optional[List[Any]] = None,
     ) -> List[Dict[str, Any]]:
         return self.hybrid_rag.search(
             collected_info=collected_info,
@@ -319,6 +322,7 @@ class DoctorAgentMemory:
             candidate_diseases=candidate_diseases,
             top_k=top_k,
             score_threshold=score_threshold,
+            retrieval_views=retrieval_views,
         )
 
     def render_rag_chunks(self, chunks: Optional[List[Dict[str, Any]]]) -> str:

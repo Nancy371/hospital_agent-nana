@@ -55,12 +55,20 @@ _INTERPRETER_RULES: Tuple[Dict[str, Any], ...] = (
             "\u9605\u8bfb\u56f0\u96be",
             "\u770b\u624b\u673a\u8d39\u52b2",
             "\u770b\u624b\u673a\u5c0f\u5b57\u8d39\u52b2",
+            "\u770b\u624b\u673a\u603b\u8981\u62ff\u8fdc\u4e00\u70b9",
+            "\u624b\u673a\u8981\u62ff\u8fdc",
+            "\u624b\u673a\u62ff\u8fdc\u624d\u80fd\u770b\u6e05",
+            "\u770b\u4e66\u65f6\u95f4\u957f\u4e86\u5b57\u4f1a\u7cca",
+            "\u5c0f\u5b57\u8d8a\u6765\u8d8a\u770b\u4e0d\u6e05",
+            "\u770b\u8fd1\u5f88\u5403\u529b",
             "\u586b\u8868\u56f0\u96be",
         ),
         "confidence": 0.94,
         "evidence_level": "specific",
         "information_value": 0.94,
         "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
     },
     {
         "finding": "age_related_near_blur",
@@ -76,6 +84,37 @@ _INTERPRETER_RULES: Tuple[Dict[str, Any], ...] = (
         "evidence_level": "specific",
         "information_value": 0.92,
         "generic_parents": ("visual_blurring",),
+    },
+    {
+        "finding": "distance_vision_relatively_preserved",
+        "terms": (
+            "\u770b\u8fdc\u5904\u8fd8\u53ef\u4ee5",
+            "\u770b\u8fdc\u8fd8\u53ef\u4ee5",
+            "\u770b\u8fdc\u5c1a\u53ef",
+            "\u8fdc\u5904\u6ca1\u95ee\u9898",
+            "\u770b\u8fdc\u6ca1\u95ee\u9898",
+        ),
+        "confidence": 0.86,
+        "evidence_level": "specific",
+        "information_value": 0.74,
+        "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
+    },
+    {
+        "finding": "worse_in_dim_light",
+        "terms": (
+            "\u5149\u7ebf\u6697\u7684\u65f6\u5019\u66f4\u660e\u663e",
+            "\u5149\u7ebf\u6697\u65f6\u66f4\u660e\u663e",
+            "\u6697\u5904\u9605\u8bfb\u56f0\u96be",
+            "\u6697\u5149\u4e0b\u770b\u8fd1\u66f4\u7cca",
+        ),
+        "confidence": 0.84,
+        "evidence_level": "specific",
+        "information_value": 0.72,
+        "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
     },
     {
         "finding": "refractive_correction_improves_near_vision",
@@ -266,6 +305,34 @@ _FINDING_METADATA: Dict[str, Dict[str, Any]] = {
         "evidence_level": "specific",
         "information_value": 0.94,
         "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
+    },
+    "distance_vision_relatively_preserved": {
+        "evidence_level": "specific",
+        "information_value": 0.74,
+        "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
+    },
+    "worse_in_dim_light": {
+        "evidence_level": "specific",
+        "information_value": 0.72,
+        "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
+    },
+    "ocular_pain": {
+        "evidence_level": "specific",
+        "information_value": 0.78,
+    },
+    "ocular_redness": {
+        "evidence_level": "specific",
+        "information_value": 0.70,
+    },
+    "gradual_onset": {
+        "evidence_level": "supportive",
+        "information_value": 0.55,
     },
     "age_related_near_blur": {
         "evidence_level": "specific",
@@ -281,6 +348,15 @@ _FINDING_METADATA: Dict[str, Dict[str, Any]] = {
         "evidence_level": "diagnostic_pattern",
         "information_value": 0.96,
         "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
+    },
+    "accommodation_failure_pattern": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.86,
+        "generic_parents": ("visual_blurring",),
+        "clinical_pattern": "accommodation_failure_pattern",
+        "mechanism_ids": ("accommodation_failure",),
     },
     "night_vision_decline": {
         "evidence_level": "specific",
@@ -336,6 +412,8 @@ _FINDING_METADATA: Dict[str, Dict[str, Any]] = {
 _GENERIC_SHADOWS: Dict[str, Tuple[str, ...]] = {
     "visual_blurring": (
         "near_vision_difficulty",
+        "distance_vision_relatively_preserved",
+        "worse_in_dim_light",
         "age_related_near_blur",
         "refractive_correction_improves_near_vision",
         "presbyopia_pattern",
@@ -557,6 +635,32 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "photophobia": ("畏光", "怕光"),
     "night_vision_decline": ("夜视力下降", "夜间视力差"),
     "visual_blurring": ("视物模糊", "看东西模糊", "视力下降", "看不清"),
+    "distance_vision_relatively_preserved": (
+        "\u770b\u8fdc\u5904\u8fd8\u53ef\u4ee5",
+        "\u770b\u8fdc\u8fd8\u53ef\u4ee5",
+        "\u770b\u8fdc\u5c1a\u53ef",
+        "\u8fdc\u5904\u6ca1\u95ee\u9898",
+        "\u770b\u8fdc\u6ca1\u95ee\u9898",
+        "\u770b\u8fdc\u5904\u6ca1\u95ee\u9898",
+    ),
+    "worse_in_dim_light": (
+        "\u5149\u7ebf\u6697\u7684\u65f6\u5019\u66f4\u660e\u663e",
+        "\u5149\u7ebf\u6697\u65f6\u66f4\u660e\u663e",
+        "\u5149\u7ebf\u6697\u65f6\u9605\u8bfb\u66f4\u56f0\u96be",
+        "\u6697\u5904\u9605\u8bfb\u56f0\u96be",
+        "\u6697\u5149\u4e0b\u770b\u8fd1\u66f4\u7cca",
+    ),
+    "ocular_pain": (
+        "\u773c\u75db",
+        "\u773c\u775b\u75bc",
+        "\u773c\u775b\u75db",
+        "\u773c\u90e8\u75bc\u75db",
+    ),
+    "ocular_redness": (
+        "\u773c\u7ea2",
+        "\u773c\u775b\u7ea2",
+        "\u7ed3\u819c\u5145\u8840",
+    ),
     "lens_dislocation": ("晶状体脱位", "晶状体半脱位", "晶状体位置异常"),
     "dermatomal_pain": ("沿神经分布疼痛", "带状疼痛", "烧灼样皮痛"),
     "renal_colic": ("肾绞痛", "腰腹部绞痛", "阵发性绞痛"),
@@ -570,7 +674,18 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "cortisol_low": ("皮质醇降低", "血清皮质醇低", "8AM皮质醇低"),
     "acth_high": ("ACTH升高", "促肾上腺皮质激素升高"),
     "hyponatremia": ("低钠血症", "血钠降低", "钠降低"),
-    "near_vision_difficulty": ("看近模糊", "近距离看不清", "阅读困难", "填表困难", "看手机费劲"),
+    "near_vision_difficulty": (
+        "看近模糊",
+        "近距离看不清",
+        "阅读困难",
+        "填表困难",
+        "看手机费劲",
+        "\u770b\u624b\u673a\u603b\u8981\u62ff\u8fdc\u4e00\u70b9",
+        "\u624b\u673a\u8981\u62ff\u8fdc",
+        "\u624b\u673a\u62ff\u8fdc\u624d\u80fd\u770b\u6e05",
+        "\u5c0f\u5b57\u8d8a\u6765\u8d8a\u770b\u4e0d\u6e05",
+        "\u770b\u8fd1\u5f88\u5403\u529b",
+    ),
     "age_related_near_blur": ("老花", "老视", "年龄相关调节不足", "中老年看近模糊"),
     "refractive_error": ("屈光不正", "屈光异常", "验光异常", "需要阅读眼镜", "+1.50D"),
     "ambiguous_genitalia": ("外生殖器发育异常", "性别发育异常", "生殖器不典型", "阴蒂肥大", "尿道下裂"),
@@ -684,6 +799,9 @@ class Observation:
     evidence_level: str = ""
     information_value: float = 0.0
     shadowed_by: str = ""
+    specificity_level: str = ""
+    clinical_pattern: str = ""
+    mechanism_ids: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -691,6 +809,12 @@ class Observation:
             data.pop("value", None)
         if not self.source_text:
             data.pop("source_text", None)
+        if not self.specificity_level:
+            data.pop("specificity_level", None)
+        if not self.clinical_pattern:
+            data.pop("clinical_pattern", None)
+        if not self.mechanism_ids:
+            data.pop("mechanism_ids", None)
         return data
 
 
@@ -909,6 +1033,9 @@ class ClinicalEvidenceInterpreter:
                     field_path=f"{field_prefix}.{finding}",
                     evidence_level=metadata["evidence_level"],
                     information_value=metadata["information_value"],
+                    specificity_level=metadata["specificity_level"],
+                    clinical_pattern=metadata["clinical_pattern"],
+                    mechanism_ids=list(metadata["mechanism_ids"]),
                 )
             )
             for implied in rule.get("implied_findings", ()) or ():
@@ -928,8 +1055,15 @@ class ClinicalEvidenceInterpreter:
                         field_path=f"{field_prefix}.{implied_finding}",
                         evidence_level=implied_metadata["evidence_level"],
                         information_value=implied_metadata["information_value"],
+                        specificity_level=implied_metadata["specificity_level"],
+                        clinical_pattern=implied_metadata["clinical_pattern"],
+                        mechanism_ids=list(implied_metadata["mechanism_ids"]),
                     )
                 )
+
+        contextual = self._contextual_eye_observations(text, source, field_prefix)
+        observations.extend(contextual)
+        matched_findings.update(item.finding for item in contextual)
 
         # Composite interpretations are deliberately conservative: they describe
         # a clinical pattern, not a diagnosis, and still require the Judge to decide.
@@ -983,6 +1117,26 @@ class ClinicalEvidenceInterpreter:
                     information_value=0.96,
                 )
             )
+        if "near_vision_difficulty" in matched_findings and (
+            "distance_vision_relatively_preserved" in matched_findings
+            or "worse_in_dim_light" in matched_findings
+        ):
+            observations.append(
+                Observation(
+                    finding="accommodation_failure_pattern",
+                    source=source,
+                    polarity="positive",
+                    confidence=0.88,
+                    raw_text="near vision difficulty pattern",
+                    source_text="near vision difficulty pattern",
+                    field_path=f"{field_prefix}.accommodation_failure_pattern",
+                    evidence_level="diagnostic_pattern",
+                    information_value=0.86,
+                    specificity_level="high",
+                    clinical_pattern="accommodation_failure_pattern",
+                    mechanism_ids=["accommodation_failure"],
+                )
+            )
         if "night_vision_decline" in matched_findings:
             observations.append(
                 Observation(
@@ -1027,6 +1181,96 @@ class ClinicalEvidenceInterpreter:
                     field_path=f"{field_prefix}.tuberculosis_pattern",
                     evidence_level="diagnostic_pattern",
                     information_value=0.96,
+                )
+            )
+        return observations
+
+    @staticmethod
+    def _contextual_eye_observations(
+        text: str,
+        source: str,
+        field_prefix: str,
+    ) -> List[Observation]:
+        target = str(text or "")
+        if not any(token in target for token in ("\u773c", "\u89c6", "\u770b", "\u9605\u8bfb", "\u624b\u673a", "\u5c0f\u5b57")):
+            return []
+
+        specs = (
+            (
+                "ocular_pain",
+                "negative",
+                ("\u4e0d\u75bc\u4e0d\u7ea2", "\u4e0d\u75db\u4e0d\u7ea2", "\u65e0\u773c\u75db", "\u6ca1\u6709\u773c\u75db", "\u4e0d\u773c\u75db", "\u773c\u775b\u4e0d\u75db", "\u773c\u775b\u4e0d\u75bc"),
+                0.92,
+            ),
+            (
+                "ocular_redness",
+                "negative",
+                ("\u4e0d\u75bc\u4e0d\u7ea2", "\u4e0d\u75db\u4e0d\u7ea2", "\u65e0\u773c\u7ea2", "\u6ca1\u6709\u773c\u7ea2", "\u773c\u775b\u4e0d\u7ea2", "\u4e0d\u7ea2"),
+                0.90,
+            ),
+            (
+                "ocular_pain",
+                "uncertain",
+                ("\u4e0d\u786e\u5b9a\u662f\u5426\u773c\u75db", "\u4e0d\u786e\u5b9a\u6709\u6ca1\u6709\u773c\u75db", "\u8bf4\u4e0d\u6e05\u662f\u5426\u773c\u75db"),
+                0.60,
+            ),
+            (
+                "ocular_redness",
+                "uncertain",
+                ("\u4e0d\u786e\u5b9a\u662f\u5426\u773c\u7ea2", "\u4e0d\u786e\u5b9a\u6709\u6ca1\u6709\u773c\u7ea2", "\u8bf4\u4e0d\u6e05\u662f\u5426\u773c\u7ea2"),
+                0.60,
+            ),
+            (
+                "ocular_pain",
+                "unknown",
+                ("\u5c1a\u672a\u8be2\u95ee\u773c\u75db", "\u672a\u8be2\u95ee\u773c\u75db", "\u6ca1\u6709\u8be2\u95ee\u773c\u75db"),
+                0.50,
+            ),
+            (
+                "ocular_redness",
+                "unknown",
+                ("\u5c1a\u672a\u8be2\u95ee\u773c\u7ea2", "\u672a\u8be2\u95ee\u773c\u7ea2", "\u6ca1\u6709\u8be2\u95ee\u773c\u7ea2"),
+                0.50,
+            ),
+        )
+        observations: List[Observation] = []
+        for finding, polarity, terms, confidence in specs:
+            term = next((item for item in terms if item in target), "")
+            if not term:
+                continue
+            metadata = _finding_metadata(finding)
+            observations.append(
+                Observation(
+                    finding=finding,
+                    source=source,
+                    polarity=polarity,
+                    confidence=confidence,
+                    raw_text=term,
+                    source_text=term,
+                    field_path=f"{field_prefix}.{finding}.{polarity}",
+                    evidence_level=metadata["evidence_level"],
+                    information_value=metadata["information_value"],
+                    specificity_level=metadata["specificity_level"],
+                )
+            )
+        if (
+            "\u9010\u6e10" in target
+            or "\u8d8a\u6765\u8d8a" in target
+            or ("\u6700\u8fd1" in target and ("\u603b\u8981\u62ff\u8fdc" in target or "\u5c0f\u5b57" in target))
+        ):
+            metadata = _finding_metadata("gradual_onset")
+            observations.append(
+                Observation(
+                    finding="gradual_onset",
+                    source=source,
+                    polarity="positive",
+                    confidence=0.78,
+                    raw_text="gradual eye symptom course",
+                    source_text="gradual eye symptom course",
+                    field_path=f"{field_prefix}.gradual_onset",
+                    evidence_level=metadata["evidence_level"],
+                    information_value=metadata["information_value"],
+                    specificity_level=metadata["specificity_level"],
                 )
             )
         return observations
@@ -1689,9 +1933,16 @@ class ClinicalEvidenceNormalizer:
                 item.evidence_level = metadata["evidence_level"]
             if not item.information_value:
                 item.information_value = metadata["information_value"]
+            if not item.specificity_level:
+                item.specificity_level = metadata["specificity_level"]
+            if not item.clinical_pattern:
+                item.clinical_pattern = metadata["clinical_pattern"]
+            if not item.mechanism_ids:
+                item.mechanism_ids = list(metadata["mechanism_ids"])
             if item.finding.startswith(("field:", "symptom:")):
                 item.evidence_level = item.evidence_level or "generic"
                 item.information_value = item.information_value or 0.08
+                item.specificity_level = item.specificity_level or "low"
 
         positive_findings = {
             item.finding
@@ -2245,7 +2496,7 @@ def _contains_raw_case_leakage(text: str) -> bool:
 def _finding_metadata(finding: str, override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     data = dict(_FINDING_METADATA.get(str(finding or ""), {}))
     if override:
-        for key in ("evidence_level", "information_value", "generic_parents"):
+        for key in ("evidence_level", "information_value", "generic_parents", "specificity_level", "clinical_pattern", "mechanism_ids"):
             if key in override:
                 data[key] = override[key]
     level = str(data.get("evidence_level") or "")
@@ -2268,7 +2519,24 @@ def _finding_metadata(finding: str, override: Optional[Dict[str, Any]] = None) -
         "evidence_level": level,
         "information_value": max(0.0, min(1.0, information_value)),
         "generic_parents": tuple(data.get("generic_parents") or ()),
+        "specificity_level": str(data.get("specificity_level") or _specificity_from_information_value(information_value)),
+        "clinical_pattern": str(data.get("clinical_pattern") or ""),
+        "mechanism_ids": tuple(data.get("mechanism_ids") or ()),
     }
+
+
+def _specificity_from_information_value(value: float) -> str:
+    try:
+        score = float(value or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score >= 0.90:
+        return "hallmark"
+    if score >= 0.75:
+        return "high"
+    if score >= 0.35:
+        return "medium"
+    return "low"
 
 
 def _negated_near(text: str, term: str, window: int = 8) -> bool:

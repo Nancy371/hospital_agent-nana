@@ -81,6 +81,8 @@ class OpenWorldDiagnosisResolverTests(unittest.TestCase):
         )
         self.assertEqual(decision.final_diagnoses, [])
         self.assertEqual(decision.unresolved_candidates, ["不存在的星际肺病"])
+        self.assertEqual(decision.open_world_candidates[0]["raw_name"], "不存在的星际肺病")
+        self.assertFalse(decision.open_world_candidates[0]["submittable"])
 
     def test_prompt_allows_open_candidates_but_keeps_closed_submission(self):
         prompt = DoctorPrompt().build_diagnosis_prompt(

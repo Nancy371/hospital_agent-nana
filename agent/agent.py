@@ -2922,6 +2922,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             )
             evidence = evidence_graph.bundle
             planner_candidates = self._planner_candidate_names()
+            retrieval_views = self.diagnosis_engine.build_retrieval_views(evidence)
             rag_query = evidence.to_query()
             if planner_candidates:
                 rag_query += " 当前鉴别诊断 " + " ".join(planner_candidates)
@@ -2929,6 +2930,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 collected_info=collected_info,
                 query=rag_query,
                 candidate_diseases=planner_candidates or None,
+                retrieval_views=retrieval_views,
             )
             rag_context = self.memory_manager.render_rag_chunks(rag_chunks)
             preview = self.diagnosis_engine.decide({}, rag_chunks, evidence)
@@ -2955,6 +2957,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 raw_case_text=raw_case_text,
             )
             evidence_graph = evidence.to_graph()
+            retrieval_views = self.diagnosis_engine.build_retrieval_views(evidence)
             llm_resolutions = self.diagnosis_engine.resolve_open_candidates(diagnosis_result)
             llm_candidates = []
             for item in llm_resolutions:
@@ -2973,6 +2976,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 collected_info=collected_info,
                 query=final_query,
                 candidate_diseases=final_candidates or None,
+                retrieval_views=retrieval_views,
             )
             if final_rag_chunks:
                 rag_chunks = final_rag_chunks

@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .clinical_evidence import EvidenceBundle, EvidenceGraph, Observation
 from .disease_retrieval import DiseaseRetriever
+from .mechanism_reasoner import MechanismHypothesis, MechanismReasoner
 
 
 @dataclass
@@ -28,6 +29,8 @@ class CandidatePool:
     name_resolutions: List[Dict[str, Any]] = field(default_factory=list)
     unresolved_candidates: List[str] = field(default_factory=list)
     disease_categories: List[Dict[str, Any]] = field(default_factory=list)
+    open_world_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
 
     def add(
         self,
@@ -59,6 +62,34 @@ class CandidatePool:
             result[item.canonical_name] = max(result.get(item.canonical_name, 0.0), item.prior)
         return result
 
+    def add_open_world(
+        self,
+        raw_name: Any,
+        source: str,
+        prior: float = 0.0,
+        evidence_links: Optional[Iterable[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        raw = str(raw_name or "").strip()
+        if not raw:
+            return
+        record = {
+            "raw_name": raw,
+            "source": str(source or "unknown"),
+            "prior": max(0.0, min(1.0, float(prior or 0.0))),
+            "submittable": False,
+            "evidence_links": list(dict.fromkeys(str(item) for item in (evidence_links or []) if str(item))),
+            "metadata": dict(metadata or {}),
+        }
+        key = (record["raw_name"], record["source"])
+        existing_keys = {
+            (item.get("raw_name"), item.get("source"))
+            for item in self.open_world_candidates
+        }
+        if key in existing_keys:
+            return
+        self.open_world_candidates.append(record)
+
     def sources_by_name(self) -> Dict[str, List[Dict[str, Any]]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for item in self.items:
@@ -71,6 +102,8 @@ class CandidatePool:
             "name_resolutions": list(self.name_resolutions),
             "unresolved_candidates": list(self.unresolved_candidates),
             "disease_categories": list(self.disease_categories),
+            "open_world_candidates": list(self.open_world_candidates),
+            "mechanism_hypotheses": list(self.mechanism_hypotheses),
         }
 
 
@@ -81,6 +114,7 @@ class CandidateGenerator:
         self.knowledge = knowledge
         self.resolver = resolver
         self.disease_retriever = DiseaseRetriever(knowledge, resolver)
+        self.mechanism_reasoner = MechanismReasoner()
 
     def generate(
         self,
@@ -92,6 +126,9 @@ class CandidateGenerator:
     ) -> CandidatePool:
         bundle = evidence or _bundle_from_graph(evidence_graph)
         pool = CandidatePool()
+        mechanisms = self.mechanism_reasoner.evaluate(bundle)
+        pool.mechanism_hypotheses = [item.to_dict() for item in mechanisms]
+        self._from_mechanisms(pool, mechanisms)
         self._from_llm(pool, llm_result or {})
         self._from_rag(pool, rag_chunks or [])
         self._from_memory(pool, memory_hits or [])
@@ -104,10 +141,20 @@ class CandidateGenerator:
         pool.name_resolutions = [item.to_dict() for item in resolutions]
         pool.unresolved_candidates = [item.raw_name for item in resolutions if not item.resolved]
         for index, item in enumerate(resolutions):
-            if not item.canonical_name:
-                continue
             rank_prior = max(0.65, 1.0 - index * 0.10)
             prior = rank_prior * item.confidence * item.model_confidence
+            if not item.canonical_name:
+                pool.add_open_world(
+                    item.raw_name,
+                    "llm_unresolved",
+                    prior=prior,
+                    metadata={
+                        "method": item.method,
+                        "model_confidence": item.model_confidence,
+                        "submittable": False,
+                    },
+                )
+                continue
             pool.add(
                 item.raw_name,
                 item.canonical_name,
@@ -118,22 +165,104 @@ class CandidateGenerator:
 
     def _from_rag(self, pool: CandidatePool, rag_chunks: Sequence[Dict[str, Any]]) -> None:
         for chunk in rag_chunks:
-            if chunk.get("type") != "disease_profile":
+            chunk_type = chunk.get("type")
+            if chunk_type not in {"disease_profile", "external_medical_knowledge"}:
                 continue
-            resolution = self.resolver.resolve(chunk.get("title"))
-            if not resolution.canonical_name:
-                continue
-            try:
-                prior = float(chunk.get("score", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                prior = 0.0
-            pool.add(
-                chunk.get("title"),
-                resolution.canonical_name,
-                "rag",
-                prior=prior,
-                metadata={"chunk_id": chunk.get("id"), "chunk_type": chunk.get("type")},
-            )
+            raw_names = [chunk.get("title")]
+            metadata = dict(chunk.get("metadata") or {})
+            raw_names.extend(metadata.get("candidate_diseases") or [])
+            for raw_name in raw_names:
+                if not raw_name:
+                    continue
+                resolution = self.resolver.resolve(raw_name)
+                try:
+                    prior = float(chunk.get("score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    prior = 0.0
+                if not resolution.canonical_name:
+                    pool.add_open_world(
+                        raw_name,
+                        "external_retrieval" if chunk_type == "external_medical_knowledge" else "rag_unresolved",
+                        prior=prior,
+                        metadata={
+                            "chunk_id": chunk.get("id"),
+                            "chunk_type": chunk_type,
+                            "unreviewed_external": bool(metadata.get("unreviewed_external")),
+                            "submittable": False,
+                        },
+                    )
+                    continue
+                if chunk_type == "external_medical_knowledge":
+                    pool.add_open_world(
+                        raw_name,
+                        "external_retrieval",
+                        prior=prior,
+                        metadata={
+                            "chunk_id": chunk.get("id"),
+                            "chunk_type": chunk_type,
+                            "canonical_name": resolution.canonical_name,
+                            "unreviewed_external": True,
+                            "submittable": False,
+                        },
+                    )
+                    continue
+                pool.add(
+                    raw_name,
+                    resolution.canonical_name,
+                    "rag",
+                    prior=prior,
+                    metadata={"chunk_id": chunk.get("id"), "chunk_type": chunk.get("type")},
+                )
+
+    def _from_mechanisms(
+        self,
+        pool: CandidatePool,
+        mechanisms: Sequence[MechanismHypothesis],
+    ) -> None:
+        for hypothesis in mechanisms:
+            prior = min(0.86, 0.35 + 0.45 * float(hypothesis.confidence or 0.0))
+            evidence_links = list(hypothesis.supporting_findings or [])
+            for raw_name in list(hypothesis.candidate_diseases or []):
+                resolution = self.resolver.resolve(raw_name)
+                if resolution.canonical_name:
+                    pool.add(
+                        raw_name,
+                        resolution.canonical_name,
+                        "mechanism_reasoner",
+                        prior=prior,
+                        evidence_links=evidence_links,
+                        metadata={
+                            "mechanism_id": hypothesis.mechanism_id,
+                            "family_id": hypothesis.family_id,
+                            "body_system": hypothesis.body_system,
+                        },
+                    )
+                    continue
+                pool.add_open_world(
+                    raw_name,
+                    "mechanism_reasoner",
+                    prior=prior,
+                    evidence_links=evidence_links,
+                    metadata={
+                        "mechanism_id": hypothesis.mechanism_id,
+                        "family_id": hypothesis.family_id,
+                        "body_system": hypothesis.body_system,
+                        "submittable": False,
+                    },
+                )
+            for raw_name in list(hypothesis.open_world_candidates or []):
+                pool.add_open_world(
+                    raw_name,
+                    "mechanism_reasoner",
+                    prior=max(0.20, prior - 0.08),
+                    evidence_links=evidence_links,
+                    metadata={
+                        "mechanism_id": hypothesis.mechanism_id,
+                        "family_id": hypothesis.family_id,
+                        "body_system": hypothesis.body_system,
+                        "submittable": False,
+                    },
+                )
 
     def _from_memory(self, pool: CandidatePool, memory_hits: Sequence[Dict[str, Any]]) -> None:
         for hit in memory_hits:
