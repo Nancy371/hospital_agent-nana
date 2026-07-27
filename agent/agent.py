@@ -34,7 +34,13 @@ from .qc import QualityAgent
 from .treatment_strategy import TreatmentStrategyAgent
 from .structural_diagnosis import StructuralDiagnosisAgent
 from .evidence_engine import EvidenceDiagnosisEngine
-from .clinical_evidence import ClinicalEvidenceNormalizer, EvidenceAgent, EvidenceBundle, Observation
+from .clinical_evidence import (
+    ClinicalEvidenceNormalizer,
+    EvidenceAgent,
+    EvidenceBundle,
+    HybridEvidenceCompiler,
+    Observation,
+)
 from .diagnosis_engine import DiagnosisDecisionEngine
 from .diagnosis_critic import DiagnosisCritic
 from .diagnostic_learning import DiagnosticLearningStore
@@ -690,6 +696,10 @@ class MyDoctorAgent(BaseDoctorAgent):
         )
         self.clinical_normalizer = ClinicalEvidenceNormalizer(ref_dir=ref_dir)
         self.evidence_agent = EvidenceAgent(ref_dir=ref_dir, normalizer=self.clinical_normalizer)
+        self.evidence_compiler = HybridEvidenceCompiler(
+            normalizer=self.clinical_normalizer,
+            ref_dir=ref_dir,
+        )
         self.diagnosis_engine = DiagnosisDecisionEngine(config=config, ref_dir=ref_dir)
         diagnosis_config = config.get("diagnosis", {}) or {}
         self.exam_agent = ExamStrategyAgent(
@@ -719,7 +729,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         self.diagnostic_learning = DiagnosticLearningStore(
             path=diagnosis_config.get(
                 "learning_path",
-                os.path.join(ref_dir, "pending_diagnostic_rules.json"),
+                os.path.join("outputs", "runtime_state", "pending_diagnostic_rules.json"),
             )
         )
         self._case_started_at = 0.0
@@ -755,7 +765,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                     llm_chat=self._llm_chat if self.self_improve_use_llm_attribute else None,
                 )
                 policy_path = config.get(
-                    "policy_store_path", "data/memory_data/policies.json"
+                    "policy_store_path", "outputs/runtime_state/policies.json"
                 )
                 self.policy_store = PolicyStore(store_path=policy_path)
                 sanitation = self.policy_store.sanitize_shadow_patches()
@@ -1878,6 +1888,22 @@ class MyDoctorAgent(BaseDoctorAgent):
             for item in (evidence_payload.get("observations") or [])
             if isinstance(item, dict) and item.get("finding")
         ]
+        evidence_compiler_audit = dict(audit.get("evidence_compiler") or {})
+        reasoning_inference_findings = {
+            str(item.get("finding"))
+            for item in observations
+            if item.get("source") == "reasoning_inference"
+            and item.get("polarity", "positive") == "positive"
+        }
+        raw_case_findings = {
+            str(item.get("finding"))
+            for item in observations
+            if item.get("source") == "raw_case_finding"
+            and item.get("polarity", "positive") == "positive"
+        }
+        blocked_reasoning_inference_count = int(
+            evidence_compiler_audit.get("blocked_reasoning_inference_count", 0) or 0
+        )
         positive_findings = {
             str(item.get("finding"))
             for item in observations
@@ -1931,6 +1957,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             "high_information_findings": sorted(high_information_findings)[:24],
             "generic_finding_shadowed_count": len(shadowed_observations),
             "shadowed_findings": shadowed_findings[:24],
+            "reasoning_inference_finding_count": len(reasoning_inference_findings),
+            "reasoning_inference_findings": sorted(reasoning_inference_findings)[:24],
+            "raw_case_finding_count": len(raw_case_findings),
+            "raw_case_findings": sorted(raw_case_findings)[:24],
+            "blocked_reasoning_inference_count": blocked_reasoning_inference_count,
             "evidence_information_value_mean": (
                 round(sum(information_values) / max(1, len(information_values)), 4)
                 if information_values
@@ -2089,6 +2120,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             ),
             top_candidate,
         ) or {}
+        primary_matched_evidence = {
+            str(item)
+            for item in (primary_candidate.get("matched_evidence") or [])
+            if str(item)
+        }
+        reasoning_inference_used_by_primary = bool(
+            primary_matched_evidence & reasoning_inference_findings
+        )
 
         def _component_value(candidate: Dict[str, Any], key: str) -> float:
             try:
@@ -2335,6 +2374,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "hard_contradiction_count": hard_contradiction_count,
                 "high_information_finding_count": len(high_information_findings),
                 "generic_finding_shadowed_count": len(shadowed_observations),
+                "reasoning_inference_finding_count": len(reasoning_inference_findings),
+                "raw_case_finding_count": len(raw_case_findings),
+                "reasoning_inference_used_by_primary": reasoning_inference_used_by_primary,
+                "blocked_reasoning_inference_count": blocked_reasoning_inference_count,
                 "evidence_information_value_mean": finding_extraction_summary[
                     "evidence_information_value_mean"
                 ],
@@ -2371,6 +2414,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "exam_authorization": exam_authorization_records,
                 "exam_authorization_mode": exam_authorization_mode,
                 "finding_extraction_summary": finding_extraction_summary,
+                "evidence_compiler": evidence_compiler_audit,
                 "pairwise_comparison_count": len(pairwise_comparisons),
                 "judge_primary_status": str(judge_payload.get("primary_status") or ""),
                 "needs_discriminating_exams": bool(
@@ -2803,6 +2847,47 @@ class MyDoctorAgent(BaseDoctorAgent):
 
     # ============ 提交诊疗方案 ============
 
+    def _raw_case_text_from_state(
+        self,
+        collected_info: Dict[str, Any],
+        chat_history: List[Dict[str, str]],
+    ) -> str:
+        parts: List[str] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, str):
+                text = " ".join(value.split())
+                if text and text not in parts:
+                    parts.append(text)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    add(item)
+                return
+            if isinstance(value, dict):
+                for key in (
+                    "raw_case_text",
+                    "raw_text",
+                    "case_text",
+                    "patient_text",
+                    "original_case",
+                    "chief_complaint",
+                    "history",
+                    "history_present_illness",
+                    "physical_exam",
+                ):
+                    if key in value:
+                        add(value.get(key))
+
+        add(collected_info or {})
+        for message in chat_history or []:
+            if not isinstance(message, dict):
+                continue
+            sender = str(message.get("from") or message.get("role") or "").lower()
+            if sender in {"patient", "user", "患者", "病人"}:
+                add(message.get("content") or message.get("text") or "")
+        return "\n".join(parts)
+
     async def _prescribe(
         self,
         patient_id: str,
@@ -2827,9 +2912,14 @@ class MyDoctorAgent(BaseDoctorAgent):
         relevant_experience = self._get_cached_experience(collected_info)
         decision = None
         evidence = None
+        raw_case_text = self._raw_case_text_from_state(collected_info, chat_history)
 
         if self.diagnosis_chain_enabled:
-            evidence_graph = self.evidence_agent.build_graph(collected_info, exam_results)
+            evidence_graph = self.evidence_agent.build_graph(
+                collected_info,
+                exam_results,
+                raw_case_text=raw_case_text,
+            )
             evidence = evidence_graph.bundle
             planner_candidates = self._planner_candidate_names()
             rag_query = evidence.to_query()
@@ -2858,7 +2948,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 {"role": "user", "content": "请做出诊断并制定治疗方案，以 JSON 格式输出。"},
             ]
             diagnosis_result = await self._llm_generate_diagnosis(messages)
-            evidence = self._augment_evidence_from_reasoning(evidence, diagnosis_result)
+            evidence = self.evidence_compiler.compile(
+                collected_info,
+                exam_results,
+                diagnosis_result,
+                raw_case_text=raw_case_text,
+            )
             evidence_graph = evidence.to_graph()
             llm_resolutions = self.diagnosis_engine.resolve_open_candidates(diagnosis_result)
             llm_candidates = []
@@ -2931,9 +3026,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 exam_results.update(corrective_results)
                 self.memory_manager.update_exam_results(patient_id, corrective_results)
                 self._last_exam_results = dict(exam_results)
-                evidence_graph = self.evidence_agent.build_graph(collected_info, exam_results)
-                evidence = evidence_graph.bundle
-                evidence = self._augment_evidence_from_reasoning(evidence, diagnosis_result)
+                evidence = self.evidence_compiler.compile(
+                    collected_info,
+                    exam_results,
+                    diagnosis_result,
+                    raw_case_text=raw_case_text,
+                )
                 evidence_graph = evidence.to_graph()
                 rag_chunks = self.memory_manager.search_rag(
                     collected_info=collected_info,
@@ -3026,6 +3124,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "diagnosis_name_resolution": [
                     item.to_dict() for item in llm_resolutions
                 ],
+                "evidence_compiler": dict(self.evidence_compiler.last_audit),
             }
         else:
             diagnosis_prompt = self.prompt.build_diagnosis_prompt(
@@ -3171,30 +3270,16 @@ class MyDoctorAgent(BaseDoctorAgent):
     ) -> EvidenceBundle:
         if not isinstance(evidence, EvidenceBundle) or not isinstance(diagnosis_result, dict):
             return evidence
-        additions: List[Observation] = []
-        for index, text in enumerate(self._reasoning_evidence_texts(diagnosis_result)):
-            additions.extend(
-                self._reasoning_inference_observations(
-                    text,
-                    field_path=f"reasoning.{index}",
-                )
-            )
+        additions = self.evidence_compiler.reasoning_adapter.adapt(diagnosis_result)
         if not additions:
             return evidence
 
-        observations = list(evidence.observations)
-        seen = {
-            (item.finding, item.source, item.polarity)
-            for item in observations
-        }
-        added_findings: List[str] = []
-        for item in additions:
-            key = (item.finding, item.source, item.polarity)
-            if key in seen:
-                continue
-            observations.append(item)
-            seen.add(key)
-            added_findings.append(item.finding)
+        observations = self.evidence_compiler.merge_observations(
+            evidence.observations,
+            additions,
+        )
+        observations = self.clinical_normalizer._finalize_observations(observations)
+        added_findings = [item.finding for item in additions]
         if added_findings:
             logger.info(
                 "[诊断证据] reasoning 推论证据: %s",

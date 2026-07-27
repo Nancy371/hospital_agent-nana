@@ -45,7 +45,11 @@ class EvidenceDiagnosisEngine:
     def __init__(self, ref_dir: str = "data/ref_data"):
         self.ref_dir = ref_dir
         self.rules_path = os.path.join(ref_dir, "diagnostic_rules.json")
-        self.pending_rules_path = os.path.join(ref_dir, "pending_diagnostic_rules.json")
+        self.pending_rules_path = os.path.join(
+            "outputs",
+            "runtime_state",
+            "pending_diagnostic_rules.json",
+        )
         self.rules = self._load_rules()
 
     def review(

@@ -63,11 +63,11 @@ llm:
 # 记忆配置
 memory:
   # JSON 记忆文件路径
-  json_path: data/memory_data/memory.json
+  json_path: outputs/runtime_state/memory.json
   # Markdown 记忆文件路径（旧格式，自动迁移）
   md_path: data/memory_data/memory.md
   # Full evidence/candidate/evaluation traces for deterministic offline replay.
-  diagnostic_replay_path: data/memory_data/diagnostic_replay.jsonl
+  diagnostic_replay_path: outputs/runtime_state/diagnostic_replay.jsonl
   # 最大记忆条目数
   max_notes: 100
   # 单条记忆最大字符数
@@ -130,7 +130,7 @@ diagnosis:
   filtered_pool_max_size: 8
   differential_score_margin: 0.12
   pairwise_close_margin: 0.18
-  discriminating_exam_max_items: 4
+  discriminating_exam_max_items: 6
   dynamic_rerank_after_discriminating_exams: true
   etiology_priority_bonus: 0.08
   etiology_close_margin: 0.12
@@ -138,7 +138,7 @@ diagnosis:
   residual_drop_threshold: 0.58
   evidence_gap_coverage_threshold: 0.32
   evidence_gap_residual_threshold: 0.72
-  learning_path: data/ref_data/pending_diagnostic_rules.json
+  learning_path: outputs/runtime_state/pending_diagnostic_rules.json
 
 # 训练反馈只写入 pending/shadow。正式知识和 active 策略必须经独立回放或人工审核后晋级。
 learning:
@@ -196,4 +196,4 @@ log_llm_prompts: false
 # 自迭代配置：训练后把低分原因沉淀为策略补丁
 self_improve_enabled: true
 self_improve_use_llm_attribute: true
-policy_store_path: data/memory_data/policies.json
+policy_store_path: outputs/runtime_state/policies.json

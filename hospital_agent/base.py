@@ -133,6 +133,14 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "hard_contradiction_count": metric("hard_contradiction_count"),
         "high_information_finding_count": metric("high_information_finding_count"),
         "generic_finding_shadowed_count": metric("generic_finding_shadowed_count"),
+        "reasoning_inference_finding_count": metric("reasoning_inference_finding_count"),
+        "raw_case_finding_count": metric("raw_case_finding_count"),
+        "reasoning_inference_used_by_primary": metric(
+            "reasoning_inference_used_by_primary"
+        ),
+        "blocked_reasoning_inference_count": metric(
+            "blocked_reasoning_inference_count"
+        ),
         "generic_only_candidate_count": metric("generic_only_candidate_count"),
         "evidence_information_value_mean": metric("evidence_information_value_mean"),
         "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,

@@ -24,7 +24,7 @@ def main() -> int:
     parser.add_argument(
         "path",
         nargs="?",
-        default="data/memory_data/diagnostic_replay.jsonl",
+        default="outputs/runtime_state/diagnostic_replay.jsonl",
         help="JSONL replay trace path",
     )
     parser.add_argument("--config", default="config.yaml")

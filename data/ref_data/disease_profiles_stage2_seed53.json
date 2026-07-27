@@ -11,10 +11,10 @@
       "diagnosis_type": "specific",
       "specificity": 0.86,
       "common_symptoms": ["看近模糊", "阅读困难", "近距离工作困难", "远视力相对保留"],
-      "hallmark_findings": ["near_vision_difficulty", "age_related_near_blur", "refractive_error"],
+      "hallmark_findings": ["near_vision_difficulty", "age_related_near_blur", "refractive_correction_improves_near_vision", "presbyopia_pattern", "refractive_error"],
       "required_groups": [
         [{"finding": "near_vision_difficulty"}, {"finding": "diagnosis:老视"}],
-        [{"finding": "refractive_error"}, {"finding": "age_related_near_blur"}]
+        [{"finding": "refractive_correction_improves_near_vision"}, {"finding": "presbyopia_pattern"}, {"finding": "age_related_near_blur"}]
       ],
       "negative_features": ["iris_coloboma", "lens_dislocation", "intraocular_mass"],
       "common_confusions": ["晶状体脱位", "虹膜缺损", "青光眼", "白内障"],
@@ -115,10 +115,10 @@
       "diagnosis_type": "structural",
       "specificity": 0.93,
       "common_symptoms": ["脐部流液", "脐周或下腹痛", "脐下正中肿块", "反复脐部感染"],
-      "hallmark_findings": ["umbilical_discharge", "umbilical_mass", "midline_suprapubic_cyst", "urachal_cyst_imaging"],
+      "hallmark_findings": ["umbilical_discharge", "midline_suprapubic_pain", "umbilical_mass", "midline_suprapubic_cyst", "urachal_remnant_pattern", "urachal_cyst_imaging"],
       "required_groups": [
         [{"finding": "umbilical_discharge"}, {"finding": "umbilical_mass"}, {"finding": "diagnosis:脐尿管囊肿"}],
-        [{"finding": "urachal_cyst_imaging"}, {"finding": "midline_suprapubic_cyst"}]
+        [{"finding": "urachal_remnant_pattern"}, {"finding": "urachal_cyst_imaging"}, {"finding": "midline_suprapubic_cyst"}]
       ],
       "common_confusions": ["骨折", "带状疱疹", "急性细菌性前列腺炎", "肺结核"],
       "generalization_suppressions": ["骨折", "带状疱疹", "肺结核"],

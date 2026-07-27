@@ -36,10 +36,10 @@ class DoctorMemory:
         """
         self.config = config
         memory_config = config.get("memory", {})
-        self.json_path = memory_config.get("json_path", "data/memory_data/memory.json")
+        self.json_path = memory_config.get("json_path", "outputs/runtime_state/memory.json")
         self.replay_path = memory_config.get(
             "diagnostic_replay_path",
-            "data/memory_data/diagnostic_replay.jsonl",
+            "outputs/runtime_state/diagnostic_replay.jsonl",
         )
         self.max_notes = memory_config.get("max_notes", 200)
         self.max_note_chars = memory_config.get("max_note_chars", 1000)

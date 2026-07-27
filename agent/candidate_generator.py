@@ -181,7 +181,10 @@ class CandidateGenerator:
                 if not hits:
                     continue
                 spec_weight = float(spec.get("weight", 0.2) or 0.2)
-                confidence = max(item.confidence for item in hits)
+                confidence = max(
+                    item.confidence * _information_multiplier(item)
+                    for item in hits
+                )
                 weight += spec_weight * confidence
                 matched.extend(item.finding for item in hits)
             if matched:
@@ -214,7 +217,9 @@ def _bundle_from_graph(graph: Optional[EvidenceGraph]) -> EvidenceBundle:
 def _matching_observations(spec: Dict[str, Any], observations: Sequence[Observation]) -> List[Observation]:
     return [
         item for item in observations
-        if item.polarity == "positive" and _observation_matches(spec, item)
+        if item.polarity == "positive"
+        and not getattr(item, "shadowed_by", "")
+        and _observation_matches(spec, item)
     ]
 
 
@@ -240,3 +245,13 @@ def _observation_matches(spec: Dict[str, Any], item: Observation) -> bool:
         if item.value is None or item.value > float(spec["max_value"]):
             return False
     return bool(finding or direction or source_contains or terms or spec.get("min_value") is not None or spec.get("max_value") is not None)
+
+
+def _information_multiplier(item: Observation) -> float:
+    try:
+        value = float(getattr(item, "information_value", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value <= 0.0:
+        return 1.0
+    return max(0.35, min(1.45, 0.65 + value))

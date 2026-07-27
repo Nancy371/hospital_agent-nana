@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional
 class DiagnosticLearningStore:
     """Store evaluation-derived rule candidates without changing active knowledge."""
 
-    def __init__(self, path: str = "data/ref_data/pending_diagnostic_rules.json"):
+    def __init__(self, path: str = "outputs/runtime_state/pending_diagnostic_rules.json"):
         self.path = path
 
     def record_feedback(

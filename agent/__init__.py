@@ -1,7 +1,6 @@
-"""
-Agent 包。
+"""Agent package public API exports.
 
-使用懒加载避免 python -m agent.agent 时的 RuntimeWarning。
+Lazy loading avoids importing heavy modules before the package entrypoint runs.
 """
 
 __all__ = [
@@ -49,7 +48,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """懒加载：仅在访问时才导入符号。"""
+    """Import public symbols lazily on first access."""
     if name == "MyDoctorAgent":
         from .agent import MyDoctorAgent
         return MyDoctorAgent

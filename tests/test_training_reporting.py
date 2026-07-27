@@ -38,6 +38,10 @@ class TrainingReportingTests(unittest.TestCase):
                     "required_evidence_coverage": 0.75,
                     "soft_contradiction_count": 1,
                     "hard_contradiction_count": 0,
+                    "reasoning_inference_finding_count": 2,
+                    "raw_case_finding_count": 3,
+                    "reasoning_inference_used_by_primary": True,
+                    "blocked_reasoning_inference_count": 1,
                     "required_gap_authorized_count": 1,
                     "explanatory_coverage": 0.82,
                     "core_explanatory_coverage": 0.76,
@@ -106,6 +110,10 @@ class TrainingReportingTests(unittest.TestCase):
         self.assertEqual(summary["required_evidence_coverage"], 0.75)
         self.assertEqual(summary["soft_contradiction_count"], 1.0)
         self.assertEqual(summary["hard_contradiction_count"], 0.0)
+        self.assertEqual(summary["reasoning_inference_finding_count"], 2.0)
+        self.assertEqual(summary["raw_case_finding_count"], 3.0)
+        self.assertEqual(summary["reasoning_inference_used_by_primary"], 1.0)
+        self.assertEqual(summary["blocked_reasoning_inference_count"], 1.0)
         self.assertEqual(summary["required_gap_authorized_count"], 1.0)
         self.assertEqual(summary["explanatory_coverage"], 0.82)
         self.assertEqual(summary["core_explanatory_coverage"], 0.76)

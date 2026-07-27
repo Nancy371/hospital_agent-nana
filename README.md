@@ -36,7 +36,7 @@ baseline_example/
 ├── train.py              # 可选修改：本地训练入口，默认可直接使用
 ├── test.py               # 可选修改：本地测试和批量评估示例，默认可直接使用
 ├── requirements.txt      # 必须维护：新增第三方库需要写在这里
-├── Dockerfile            # 一般不需要修改：部署入口，默认启动 python3 -m agent.agent
+├── Dockerfile            # 一般不需要修改：部署入口，默认启动 python3 -m agent
 └── README.md
 ```
 
@@ -167,7 +167,7 @@ python tools/run_frozen_training.py --seeds 46 47 48 --patient-count 5
 ### 4. 启动测试服务
 
 ```bash
-python -m agent.agent
+python -m agent
 ```
 
 服务默认监听 `0.0.0.0:7860`，测试接口为 `POST /test`。

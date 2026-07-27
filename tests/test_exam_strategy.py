@@ -39,7 +39,7 @@ class ExamInformationGainTests(unittest.TestCase):
             },
         )
         self.assertTrue(result["differential_driven"])
-        self.assertLessEqual(len(result["items"]), 4)
+        self.assertLessEqual(len(result["items"]), 6)
         self.assertTrue(result["exam_authorization_details"])
         self.assertTrue(
             all(
@@ -70,17 +70,80 @@ class ExamInformationGainTests(unittest.TestCase):
             },
         )
         self.assertTrue(result["differential_driven"])
-        self.assertEqual(
-            result["items"],
-            [
-                "胸部CT扫描（Chest CT）",
-                "痰培养",
-                "抗酸杆菌染色（AFB）",
-                "核酸扩增检测（NAAT）",
-            ],
-        )
+        self.assertEqual(result["items"][0], "胸部CT扫描（Chest CT）")
+        self.assertIn("痰培养", result["items"])
+        self.assertIn("抗酸杆菌染色（AFB）", result["items"])
+        self.assertIn("核酸扩增检测（NAAT）", result["items"])
         self.assertNotIn("泌尿道超声", result["items"])
         self.assertNotIn("尿动力学检查（UDS）", result["items"])
+
+    def test_tb_mpa_lung_cancer_special_exams_beat_generic_inflammation(self):
+        result = self.strategy.recommend(
+            collected_info={"symptoms": ["咳嗽", "咯血", "夜汗", "尿色深"]},
+            candidate_diseases=["肺结核", "显微镜下多血管炎", "肺癌"],
+            proposed_items=["全血细胞计数（CBC）", "C反应蛋白（CRP）"],
+            existing_results={},
+            judge_decision={
+                "primary": "肺癌",
+                "primary_status": "deferred",
+                "needs_discriminating_exams": True,
+                "differential_candidates": ["肺结核", "显微镜下多血管炎", "肺癌"],
+                "discriminating_exam_tasks": [
+                    {
+                        "exam": "胸部CT扫描（Chest CT）",
+                        "target_candidates": ["肺结核", "显微镜下多血管炎", "肺癌"],
+                        "target_findings": ["cavitary_lesion", "pulmonary_hemorrhage", "lung_mass"],
+                        "exam_type": "special_discriminator",
+                    },
+                    {
+                        "exam": "抗酸杆菌染色（AFB）",
+                        "target_candidates": ["肺结核", "肺癌"],
+                        "target_findings": ["afb_positive"],
+                        "exam_type": "special_discriminator",
+                    },
+                    {
+                        "exam": "核酸扩增检测（NAAT）",
+                        "target_candidates": ["肺结核", "肺癌"],
+                        "target_findings": ["tb_naat_positive"],
+                        "exam_type": "special_discriminator",
+                    },
+                    {
+                        "exam": "抗中性粒细胞胞质抗体（ANCA）谱",
+                        "target_candidates": ["显微镜下多血管炎", "肺癌"],
+                        "target_findings": ["anca_positive"],
+                        "exam_type": "special_discriminator",
+                    },
+                    {
+                        "exam": "尿液分析（UA）",
+                        "target_candidates": ["显微镜下多血管炎", "肺癌"],
+                        "target_findings": ["microscopic_hematuria"],
+                        "exam_type": "special_discriminator",
+                    },
+                    {
+                        "exam": "全血细胞计数（CBC）",
+                        "target_candidates": ["肺结核", "显微镜下多血管炎", "肺癌"],
+                        "target_findings": ["anemia"],
+                        "exam_type": "generic_inflammation",
+                    },
+                ],
+            },
+        )
+        self.assertTrue(result["differential_driven"])
+        self.assertLessEqual(len(result["items"]), 6)
+        self.assertIn("抗酸杆菌染色（AFB）", result["items"][:4])
+        self.assertIn("抗中性粒细胞胞质抗体（ANCA）谱", result["items"][:4])
+        self.assertNotIn("C反应蛋白（CRP）", result["items"][:4])
+        self.assertTrue(
+            all(detail["target_candidates"] for detail in result["exam_authorization_details"])
+        )
+        self.assertGreaterEqual(
+            sum(
+                1
+                for detail in result["exam_authorization_details"]
+                if len(detail["target_candidates"]) >= 2
+            ),
+            4,
+        )
 
     def test_deferred_judge_state_takes_priority_over_strict_primary(self):
         result = self.strategy.recommend(
@@ -110,7 +173,6 @@ class ExamInformationGainTests(unittest.TestCase):
                 for item in result["exam_authorization_details"]
             )
         )
-        self.assertEqual(result["items"][0], "全血细胞计数（CBC）")
         self.assertIn("梅毒血清学检查", result["items"])
         self.assertNotIn("胸部X线检查（CXR）", result["items"])
 

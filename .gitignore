@@ -13,6 +13,7 @@ venv/
 
 # Test / smoke temp outputs
 outputs/
+outputs/runtime_state/
 *.log
 *.pid
 test_output.txt
@@ -33,6 +34,11 @@ outputs/test/_smoke_policies*.json*
 outputs/test/_smoke_policies_retire_*.json
 outputs/test/_smoke_mem*.json
 outputs/test/_*.json
+data/memory_data/diagnostic_replay.jsonl
+data/memory_data/policies.json
+data/memory_data/*.runtime.json
+data/ref_data/pending_diagnostic_rules.local.json
+data/ref_data/*_pending.local.json
 
 # IDE / OS
 .idea/

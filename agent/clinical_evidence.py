@@ -44,6 +44,123 @@ _INTERPRETER_RULES: Tuple[Dict[str, Any], ...] = (
         "confidence": 0.88,
     },
     {
+        "finding": "near_vision_difficulty",
+        "terms": (
+            "\u770b\u8fd1\u6a21\u7cca",
+            "\u770b\u8fd1\u5904\u6a21\u7cca",
+            "\u770b\u8fd1\u56f0\u96be",
+            "\u770b\u8fd1\u770b\u4e0d\u6e05",
+            "\u8fd1\u8ddd\u79bb\u770b\u4e0d\u6e05",
+            "\u8fd1\u8ddd\u79bb\u89c6\u7269\u6a21\u7cca",
+            "\u9605\u8bfb\u56f0\u96be",
+            "\u770b\u624b\u673a\u8d39\u52b2",
+            "\u770b\u624b\u673a\u5c0f\u5b57\u8d39\u52b2",
+            "\u586b\u8868\u56f0\u96be",
+        ),
+        "confidence": 0.94,
+        "evidence_level": "specific",
+        "information_value": 0.94,
+        "generic_parents": ("visual_blurring",),
+    },
+    {
+        "finding": "age_related_near_blur",
+        "terms": (
+            "\u8001\u82b1",
+            "\u8001\u89c6",
+            "\u4e2d\u8001\u5e74\u770b\u8fd1\u6a21\u7cca",
+            "\u5e74\u9f84\u76f8\u5173\u8c03\u8282\u4e0d\u8db3",
+            "\u8fd1\u7528\u955c",
+            "\u9605\u8bfb\u955c",
+        ),
+        "confidence": 0.92,
+        "evidence_level": "specific",
+        "information_value": 0.92,
+        "generic_parents": ("visual_blurring",),
+    },
+    {
+        "finding": "refractive_correction_improves_near_vision",
+        "terms": (
+            "+1.50D\u9605\u8bfb\u955c\u53ef\u6539\u5584",
+            "\u9605\u8bfb\u955c\u53ef\u6539\u5584",
+            "\u8001\u82b1\u955c\u53ef\u6539\u5584",
+            "\u52a0\u51f8\u900f\u955c\u540e\u770b\u8fd1\u6539\u5584",
+            "\u5c48\u5149\u68c0\u67e5\u63d0\u793a\u9605\u8bfb\u955c\u53ef\u6539\u5584",
+        ),
+        "confidence": 0.96,
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.98,
+        "generic_parents": ("visual_blurring", "refractive_error"),
+    },
+    {
+        "finding": "night_vision_decline",
+        "terms": (
+            "\u591c\u95f4\u770b\u4e0d\u6e05",
+            "\u591c\u95f4\u89c6\u529b\u5dee",
+            "\u591c\u89c6\u529b\u4e0b\u964d",
+            "\u591c\u76f2",
+            "\u6697\u9002\u5e94\u5dee",
+        ),
+        "confidence": 0.94,
+        "evidence_level": "specific",
+        "information_value": 0.94,
+        "generic_parents": ("visual_blurring",),
+    },
+    {
+        "finding": "midline_suprapubic_pain",
+        "terms": (
+            "\u4e0b\u8179\u6b63\u4e2d\u75bc\u75db",
+            "\u4e0b\u8179\u4e2d\u90e8\u75bc\u75db",
+            "\u8110\u4e0b\u75bc\u75db",
+            "\u8180\u80f1\u9876\u90e8\u75bc\u75db",
+            "\u8110\u90e8\u75bc\u75db\u5411\u4e0b\u8179\u5ef6\u4f38",
+        ),
+        "confidence": 0.9,
+        "evidence_level": "specific",
+        "information_value": 0.88,
+        "generic_parents": ("pain", "abdominal_pain"),
+    },
+    {
+        "finding": "umbilical_discharge",
+        "terms": (
+            "\u8110\u90e8\u5206\u6ccc\u7269",
+            "\u8110\u90e8\u6d41\u6db2",
+            "\u8110\u5b54\u6d41\u6db2",
+            "\u8110\u90e8\u6e17\u6db2",
+            "\u8110\u90e8\u6d41\u8113",
+        ),
+        "confidence": 0.94,
+        "evidence_level": "specific",
+        "information_value": 0.95,
+    },
+    {
+        "finding": "chronic_cough_pattern",
+        "terms": (
+            "\u6162\u6027\u54b3\u55fd",
+            "\u54b3\u55fd\u8d85\u8fc72\u5468",
+            "\u54b3\u55fd\u4e24\u5468\u4ee5\u4e0a",
+            "\u957f\u671f\u54b3\u55fd",
+            "\u8fc1\u5ef6\u54b3\u55fd",
+        ),
+        "confidence": 0.9,
+        "evidence_level": "specific",
+        "information_value": 0.86,
+        "generic_parents": ("cough", "chronic_course"),
+    },
+    {
+        "finding": "tb_exposure",
+        "terms": (
+            "\u63a5\u89e6\u80ba\u7ed3\u6838\u60a3\u8005",
+            "\u63a5\u89e6\u786e\u8bca\u80ba\u7ed3\u6838",
+            "\u7ed3\u6838\u63a5\u89e6\u53f2",
+            "\u540c\u4f4f\u8005\u80ba\u7ed3\u6838",
+        ),
+        "confidence": 0.94,
+        "evidence_level": "specific",
+        "information_value": 0.94,
+        "generic_parents": ("cough", "fever"),
+        "implied_findings": ("tuberculosis_exposure",),
+    },
+    {
         "finding": "postprandial_nausea",
         "terms": (
             "\u996d\u540e\u6076\u5fc3",
@@ -133,6 +250,115 @@ _INTERPRETER_RULES: Tuple[Dict[str, Any], ...] = (
         ),
         "confidence": 0.92,
     },
+)
+
+_FINDING_METADATA: Dict[str, Dict[str, Any]] = {
+    "visual_blurring": {
+        "evidence_level": "generic",
+        "information_value": 0.12,
+    },
+    "fever": {"evidence_level": "generic", "information_value": 0.18},
+    "cough": {"evidence_level": "generic", "information_value": 0.18},
+    "pain": {"evidence_level": "generic", "information_value": 0.12},
+    "abdominal_pain": {"evidence_level": "generic", "information_value": 0.12},
+    "rash": {"evidence_level": "generic", "information_value": 0.18},
+    "near_vision_difficulty": {
+        "evidence_level": "specific",
+        "information_value": 0.94,
+        "generic_parents": ("visual_blurring",),
+    },
+    "age_related_near_blur": {
+        "evidence_level": "specific",
+        "information_value": 0.92,
+        "generic_parents": ("visual_blurring",),
+    },
+    "refractive_correction_improves_near_vision": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.98,
+        "generic_parents": ("visual_blurring", "refractive_error"),
+    },
+    "presbyopia_pattern": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.96,
+        "generic_parents": ("visual_blurring",),
+    },
+    "night_vision_decline": {
+        "evidence_level": "specific",
+        "information_value": 0.94,
+        "generic_parents": ("visual_blurring",),
+    },
+    "nyctalopia_pattern": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.96,
+        "generic_parents": ("visual_blurring",),
+    },
+    "umbilical_discharge": {
+        "evidence_level": "specific",
+        "information_value": 0.95,
+    },
+    "midline_suprapubic_pain": {
+        "evidence_level": "specific",
+        "information_value": 0.88,
+        "generic_parents": ("pain", "abdominal_pain"),
+    },
+    "midline_suprapubic_cyst": {
+        "evidence_level": "specific",
+        "information_value": 0.9,
+    },
+    "urachal_remnant_pattern": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.96,
+    },
+    "chronic_cough_pattern": {
+        "evidence_level": "specific",
+        "information_value": 0.86,
+        "generic_parents": ("cough", "chronic_course"),
+    },
+    "tb_exposure": {
+        "evidence_level": "specific",
+        "information_value": 0.94,
+        "generic_parents": ("cough", "fever"),
+    },
+    "tuberculosis_exposure": {
+        "evidence_level": "specific",
+        "information_value": 0.92,
+        "generic_parents": ("cough", "fever"),
+    },
+    "hemoptysis": {"evidence_level": "specific", "information_value": 0.84},
+    "night_sweats": {"evidence_level": "specific", "information_value": 0.84},
+    "tuberculosis_pattern": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.96,
+        "generic_parents": ("cough", "fever", "chronic_course"),
+    },
+}
+
+_GENERIC_SHADOWS: Dict[str, Tuple[str, ...]] = {
+    "visual_blurring": (
+        "near_vision_difficulty",
+        "age_related_near_blur",
+        "refractive_correction_improves_near_vision",
+        "presbyopia_pattern",
+        "night_vision_decline",
+        "nyctalopia_pattern",
+        "iris_coloboma",
+        "lens_dislocation",
+    ),
+    "cough": ("chronic_cough_pattern", "tb_exposure", "tuberculosis_exposure", "tuberculosis_pattern"),
+    "fever": ("tb_exposure", "tuberculosis_exposure", "tuberculosis_pattern"),
+    "chronic_course": ("chronic_cough_pattern", "tuberculosis_pattern", "urachal_remnant_pattern"),
+    "pain": ("midline_suprapubic_pain",),
+    "abdominal_pain": ("midline_suprapubic_pain",),
+}
+
+_NEGATION_TERMS = (
+    "\u65e0",
+    "\u672a\u89c1",
+    "\u672a\u53d1\u73b0",
+    "\u5426\u8ba4",
+    "\u6392\u9664",
+    "\u4e0d\u652f\u6301",
+    "\u6ca1\u6709",
 )
 
 
@@ -416,6 +642,28 @@ _NEGATIVE_FACT_FINDINGS = {
     "normal_postvoid_residual",
 }
 
+_RAW_CASE_LEAKAGE_TERMS = (
+    "expected",
+    "expected_diagnosis",
+    "expected diagnosis",
+    "finalDiagnosis",
+    "final_diagnosis",
+    "final diagnosis",
+    "correct diagnosis",
+    "ground_truth",
+    "\u6b63\u786e\u8bca\u65ad",
+    "\u6807\u51c6\u7b54\u6848",
+    "\u671f\u671b\u8bca\u65ad",
+    "\u8bc4\u6d4b\u8bca\u65ad",
+)
+_RAW_CASE_FIELD_KEYS = {
+    "raw_case_text",
+    "raw_text",
+    "case_text",
+    "patient_text",
+    "original_case",
+}
+
 
 @dataclass
 class Observation:
@@ -431,12 +679,18 @@ class Observation:
     temporality: str = ""
     confidence: float = 0.8
     raw_text: str = ""
+    source_text: str = ""
     field_path: str = ""
+    evidence_level: str = ""
+    information_value: float = 0.0
+    shadowed_by: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         if self.value is None:
             data.pop("value", None)
+        if not self.source_text:
+            data.pop("source_text", None)
         return data
 
 
@@ -474,11 +728,13 @@ class EvidenceBundle:
             (item.source, item.field_path)
             for item in self.positive()
             if not item.finding.startswith(("field:", "symptom:"))
+            and not item.shadowed_by
         }
         return [
             item
             for item in self.positive()
             if item.confidence >= 0.75
+            and not item.shadowed_by
             and not item.finding.startswith("field:")
             and not (
                 item.finding.startswith("symptom:")
@@ -497,7 +753,12 @@ class EvidenceBundle:
         lines = ["【结构化临床证据】"]
         ranked = sorted(
             self.observations,
-            key=lambda item: (item.polarity == "positive", item.confidence),
+            key=lambda item: (
+                item.polarity == "positive",
+                not bool(item.shadowed_by),
+                item.information_value,
+                item.confidence,
+            ),
             reverse=True,
         )
         for item in ranked[:limit]:
@@ -513,7 +774,18 @@ class EvidenceBundle:
 
     def to_query(self, limit: int = 30) -> str:
         terms: List[str] = []
-        for item in sorted(self.positive(), key=lambda x: x.confidence, reverse=True):
+        ranked = sorted(
+            self.positive(),
+            key=lambda x: (
+                not bool(x.shadowed_by),
+                x.information_value,
+                x.confidence,
+            ),
+            reverse=True,
+        )
+        for item in ranked:
+            if item.shadowed_by and item.information_value <= 0.2:
+                continue
             terms.extend((item.finding, item.source))
             if item.value is not None:
                 terms.append(f"{item.finding}={item.value:g}{item.unit}")
@@ -591,8 +863,13 @@ class EvidenceAgent:
         self,
         collected_info: Optional[Dict[str, Any]],
         exam_results: Optional[Dict[str, Any]],
+        raw_case_text: str = "",
     ) -> EvidenceGraph:
-        return self.normalizer.normalize(collected_info, exam_results).to_graph()
+        return self.normalizer.normalize(
+            collected_info,
+            exam_results,
+            raw_case_text=raw_case_text,
+        ).to_graph()
 
 
 class ClinicalEvidenceInterpreter:
@@ -602,6 +879,9 @@ class ClinicalEvidenceInterpreter:
         self,
         collected_info: Optional[Dict[str, Any]],
         exam_results: Optional[Dict[str, Any]],
+        *,
+        source: str = "evidence_interpreter",
+        field_prefix: str = "interpreter",
     ) -> List[Observation]:
         text = self._case_text(collected_info, exam_results)
         if not text:
@@ -614,17 +894,42 @@ class ClinicalEvidenceInterpreter:
             term = next((item for item in terms if item and item in text), "")
             if not finding or not term:
                 continue
+            if _negated_near(text, term):
+                continue
             matched_findings.add(finding)
+            metadata = _finding_metadata(finding, rule)
             observations.append(
                 Observation(
                     finding=finding,
-                    source="evidence_interpreter",
+                    source=source,
                     polarity="positive",
                     confidence=float(rule.get("confidence", 0.86) or 0.86),
                     raw_text=term,
-                    field_path=f"interpreter.{finding}",
+                    source_text=term,
+                    field_path=f"{field_prefix}.{finding}",
+                    evidence_level=metadata["evidence_level"],
+                    information_value=metadata["information_value"],
                 )
             )
+            for implied in rule.get("implied_findings", ()) or ():
+                implied_finding = str(implied or "").strip()
+                if not implied_finding:
+                    continue
+                matched_findings.add(implied_finding)
+                implied_metadata = _finding_metadata(implied_finding)
+                observations.append(
+                    Observation(
+                        finding=implied_finding,
+                        source=source,
+                        polarity="positive",
+                        confidence=max(0.82, float(rule.get("confidence", 0.86) or 0.86) - 0.02),
+                        raw_text=term,
+                        source_text=term,
+                        field_path=f"{field_prefix}.{implied_finding}",
+                        evidence_level=implied_metadata["evidence_level"],
+                        information_value=implied_metadata["information_value"],
+                    )
+                )
 
         # Composite interpretations are deliberately conservative: they describe
         # a clinical pattern, not a diagnosis, and still require the Judge to decide.
@@ -634,22 +939,94 @@ class ClinicalEvidenceInterpreter:
             observations.append(
                 Observation(
                     finding="treponemal_skin_lesion",
-                    source="evidence_interpreter",
+                    source=source,
                     polarity="positive",
                     confidence=0.9,
                     raw_text="skin ulcer pattern with compatible exposure or periostitis",
-                    field_path="interpreter.treponemal_skin_lesion",
+                    source_text="skin ulcer pattern with compatible exposure or periostitis",
+                    field_path=f"{field_prefix}.treponemal_skin_lesion",
+                    evidence_level="diagnostic_pattern",
+                    information_value=0.95,
                 )
             )
         if "dyspnea_on_exertion" in matched_findings:
             observations.append(
                 Observation(
                     finding="cardiopulmonary_exertional_pattern",
-                    source="evidence_interpreter",
+                    source=source,
                     polarity="positive",
                     confidence=0.82,
                     raw_text="dyspnea on exertion",
-                    field_path="interpreter.cardiopulmonary_exertional_pattern",
+                    source_text="dyspnea on exertion",
+                    field_path=f"{field_prefix}.cardiopulmonary_exertional_pattern",
+                    evidence_level="specific",
+                    information_value=0.82,
+                )
+            )
+        if (
+            "near_vision_difficulty" in matched_findings
+            and (
+                "age_related_near_blur" in matched_findings
+                or "refractive_correction_improves_near_vision" in matched_findings
+            )
+        ):
+            observations.append(
+                Observation(
+                    finding="presbyopia_pattern",
+                    source=source,
+                    polarity="positive",
+                    confidence=0.94,
+                    raw_text="near vision difficulty with age or refractive correction pattern",
+                    source_text="near vision difficulty with age or refractive correction pattern",
+                    field_path=f"{field_prefix}.presbyopia_pattern",
+                    evidence_level="diagnostic_pattern",
+                    information_value=0.96,
+                )
+            )
+        if "night_vision_decline" in matched_findings:
+            observations.append(
+                Observation(
+                    finding="nyctalopia_pattern",
+                    source=source,
+                    polarity="positive",
+                    confidence=0.92,
+                    raw_text="night vision decline pattern",
+                    source_text="night vision decline pattern",
+                    field_path=f"{field_prefix}.nyctalopia_pattern",
+                    evidence_level="diagnostic_pattern",
+                    information_value=0.96,
+                )
+            )
+        if "umbilical_discharge" in matched_findings and (
+            {"midline_suprapubic_pain", "midline_suprapubic_cyst", "urachal_cyst_imaging"} & matched_findings
+        ):
+            observations.append(
+                Observation(
+                    finding="urachal_remnant_pattern",
+                    source=source,
+                    polarity="positive",
+                    confidence=0.94,
+                    raw_text="umbilical discharge with midline suprapubic involvement",
+                    source_text="umbilical discharge with midline suprapubic involvement",
+                    field_path=f"{field_prefix}.urachal_remnant_pattern",
+                    evidence_level="diagnostic_pattern",
+                    information_value=0.96,
+                )
+            )
+        if {"chronic_cough_pattern", "tb_exposure", "tuberculosis_exposure"} & matched_findings and (
+            {"night_sweats", "hemoptysis"} & matched_findings
+        ):
+            observations.append(
+                Observation(
+                    finding="tuberculosis_pattern",
+                    source=source,
+                    polarity="positive",
+                    confidence=0.92,
+                    raw_text="chronic respiratory symptoms with tuberculosis-specific clues",
+                    source_text="chronic respiratory symptoms with tuberculosis-specific clues",
+                    field_path=f"{field_prefix}.tuberculosis_pattern",
+                    evidence_level="diagnostic_pattern",
+                    information_value=0.96,
                 )
             )
         return observations
@@ -676,15 +1053,61 @@ class ClinicalEvidenceNormalizer:
         self.ref_dir = ref_dir
         self.diagnosis_aliases = self._load_diagnosis_aliases()
         self.interpreter = ClinicalEvidenceInterpreter()
+        self.last_raw_case_audit: Dict[str, Any] = {}
 
     def normalize(
         self,
         collected_info: Optional[Dict[str, Any]],
         exam_results: Optional[Dict[str, Any]],
+        raw_case_text: str = "",
     ) -> EvidenceBundle:
         observations: List[Observation] = []
         info = collected_info or {}
         exams = exam_results or {}
+        raw_case = str(raw_case_text or "").strip() or _extract_raw_case_text(info)
+        info = _without_raw_case_fields(info)
+        self.last_raw_case_audit = {
+            "raw_case_text_supplied": bool(str(raw_case_text or "").strip()),
+            "raw_case_blocked": False,
+            "raw_case_blocked_reason": "",
+            "raw_case_finding_count": 0,
+        }
+
+        if raw_case:
+            self.last_raw_case_audit["raw_case_text_supplied"] = True
+            if _contains_raw_case_leakage(raw_case):
+                self.last_raw_case_audit.update(
+                    {
+                        "raw_case_blocked": True,
+                        "raw_case_blocked_reason": "raw_case_contains_answer_leakage",
+                    }
+                )
+            else:
+                raw_observations: List[Observation] = []
+                raw_observations.extend(
+                    self._leaf_observations(
+                        "raw_case_finding",
+                        "raw_case_text",
+                        raw_case,
+                    )
+                )
+                raw_observations.extend(
+                    self.interpreter.interpret(
+                        {"raw_case_text": raw_case},
+                        {},
+                        source="raw_case_finding",
+                        field_prefix="raw_case",
+                    )
+                )
+                observations.extend(raw_observations)
+                self.last_raw_case_audit["raw_case_finding_count"] = len(
+                    [
+                        item
+                        for item in raw_observations
+                        if item.polarity == "positive"
+                        and not item.finding.startswith("field:")
+                    ]
+                )
 
         for index, symptom in enumerate(_as_text_list(info.get("symptoms"))):
             field_path = f"symptoms.{index}"
@@ -725,7 +1148,7 @@ class ClinicalEvidenceNormalizer:
                     )
 
         observations.extend(self.interpreter.interpret(info, exams))
-        return EvidenceBundle(self._dedupe(observations))
+        return EvidenceBundle(self._finalize_observations(observations))
 
     def _leaf_observations(
         self,
@@ -775,6 +1198,8 @@ class ClinicalEvidenceNormalizer:
             if not term:
                 continue
             if _is_reference_only_mention(text, term):
+                continue
+            if _negated_near(text, term):
                 continue
             polarity, confidence = self._polarity(text, term)
             if finding in _NEGATIVE_FACT_FINDINGS:
@@ -1173,7 +1598,10 @@ class ClinicalEvidenceNormalizer:
                 right_positions = [pos for pos in right_positions if pos >= 0]
                 right = min(right_positions) if right_positions else len(target)
                 clause = target[left + 1:right]
-                if _NEGATION_RE.search(clause):
+                weakness_term = any(
+                    marker in term for marker in ("\u65e0\u529b", "\u4e4f\u529b")
+                )
+                if _NEGATION_RE.search(clause) and not weakness_term:
                     return "negative", 0.94
                 if _UNCERTAINTY_RE.search(clause):
                     return "uncertain", 0.6
@@ -1251,6 +1679,508 @@ class ClinicalEvidenceNormalizer:
                 best[key] = item
         return list(best.values())
 
+    def _finalize_observations(self, items: Sequence[Observation]) -> List[Observation]:
+        observations = self._dedupe(items)
+        for item in observations:
+            if not item.source_text:
+                item.source_text = item.raw_text
+            metadata = _finding_metadata(item.finding)
+            if not item.evidence_level:
+                item.evidence_level = metadata["evidence_level"]
+            if not item.information_value:
+                item.information_value = metadata["information_value"]
+            if item.finding.startswith(("field:", "symptom:")):
+                item.evidence_level = item.evidence_level or "generic"
+                item.information_value = item.information_value or 0.08
+
+        positive_findings = {
+            item.finding
+            for item in observations
+            if item.polarity == "positive" and not item.shadowed_by
+        }
+        shadow_source = {
+            generic: next((specific for specific in specifics if specific in positive_findings), "")
+            for generic, specifics in _GENERIC_SHADOWS.items()
+        }
+        for item in observations:
+            if item.polarity != "positive" or item.shadowed_by:
+                continue
+            shadowed_by = shadow_source.get(item.finding, "")
+            if not shadowed_by:
+                continue
+            item.shadowed_by = shadowed_by
+            item.evidence_level = "generic"
+            item.information_value = min(item.information_value or 0.12, 0.12)
+        return observations
+
+
+class ReasoningEvidenceAdapter:
+    """Convert LLM reasoning into low-weight, auditable clinical findings.
+
+    This adapter is intentionally separate from ClinicalEvidenceInterpreter:
+    interpreter rules extract deterministic facts from case text/results, while
+    reasoning inference only supplies soft evidence that still goes through the
+    Diagnosis Engine and Judge.
+    """
+
+    def __init__(self):
+        self.last_audit: Dict[str, Any] = {
+            "added": [],
+            "blocked": [],
+            "blocked_reasoning_inference_count": 0,
+        }
+
+    def adapt(self, diagnosis_result: Optional[Dict[str, Any]]) -> List[Observation]:
+        self.last_audit = {
+            "added": [],
+            "blocked": [],
+            "blocked_reasoning_inference_count": 0,
+        }
+        if not isinstance(diagnosis_result, dict):
+            return []
+        observations: List[Observation] = []
+        seen: set = set()
+        for index, text in enumerate(self.reasoning_texts(diagnosis_result)):
+            field_path = f"reasoning.{index}"
+            for item in self._observations_for_text(text, field_path):
+                key = (item.finding, item.polarity)
+                if key in seen:
+                    continue
+                seen.add(key)
+                observations.append(item)
+                self.last_audit["added"].append(item.to_dict())
+        self.last_audit["blocked_reasoning_inference_count"] = len(
+            self.last_audit["blocked"]
+        )
+        return observations
+
+    def reasoning_texts(self, result: Dict[str, Any]) -> List[str]:
+        texts: List[str] = []
+
+        def add_text(value: Any) -> None:
+            if isinstance(value, str):
+                text = " ".join(value.split())
+                if text:
+                    texts.append(text)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    add_text(item)
+                return
+            if isinstance(value, dict):
+                for key in (
+                    "supporting_evidence",
+                    "evidence",
+                    "evidence_summary",
+                    "reasoning",
+                    "reason",
+                    "rationale",
+                ):
+                    if key in value:
+                        add_text(value.get(key))
+
+        add_text(result.get("reasoning"))
+        for key in (
+            "diagnosis_candidates",
+            "candidate_diagnoses",
+            "open_diagnosis_candidates",
+        ):
+            add_text(result.get(key))
+        return list(dict.fromkeys(texts))
+
+    def _observations_for_text(self, text: str, field_path: str) -> List[Observation]:
+        raw_text = " ".join(str(text or "").split())
+        if not raw_text:
+            return []
+        findings: List[Tuple[str, float, str, str]] = []
+
+        def add(
+            finding: str,
+            confidence: float,
+            *,
+            term: str = "",
+            direction: str = "",
+            source_text: str = "",
+        ) -> None:
+            if any(item[0] == finding for item in findings):
+                return
+            clipped_confidence = min(float(confidence or 0.65), 0.78)
+            support = source_text or self._support_text(raw_text, term)
+            findings.append((finding, clipped_confidence, direction, support))
+
+        if self._has_assertive_term(
+            raw_text,
+            (
+                "\u8179\u6cfb\u5bfc\u81f4\u9541\u4e22\u5931",
+                "\u8179\u6cfb\u81f4\u9541\u4e22\u5931",
+                "\u9541\u4e22\u5931",
+                "\u9541\u50a8\u5907\u4e0d\u8db3",
+                "\u9541\u50a8\u5907\u7f3a\u4e4f",
+                "\u9541\u7f3a\u4e4f",
+                "闀佸偍澶囦笉瓒?",
+                "闀佸偍澶囩己涔?",
+                "闀佺己涔?",
+            ),
+        ):
+            add("magnesium_depletion", 0.76, term="\u9541\u4e22\u5931")
+        if (
+            self._has_assertive_term(
+                raw_text,
+                (
+                    "\u9541\u8d1f\u8377\u4fdd\u7559\u7387\u5347\u9ad8",
+                    "\u9541\u4fdd\u7559\u7387\u5347\u9ad8",
+                    "闀佽礋鑽蜂繚鐣欑巼鍗囬珮",
+                    "闀佷繚鐣欑巼鍗囬珮",
+                ),
+            )
+            or self._regex_assertive(
+                raw_text,
+                r"(?:\u9541|闀).{0,16}(?:\u4fdd\u7559\u7387|淇濈暀).{0,16}(?:\u5347\u9ad8|\u589e\u9ad8|\u504f\u9ad8|\u9ad8\u4e8e|>|[3-9]\d(?:\.\d+)?%)",
+            )
+        ):
+            add("magnesium_load_retention_high", 0.78, direction="high")
+            add("magnesium_depletion", 0.76)
+        if (
+            self._has_assertive_term(
+                raw_text,
+                (
+                    "24\u5c0f\u65f6\u5c3f\u9541\u964d\u4f4e",
+                    "\u5c3f\u9541\u964d\u4f4e",
+                    "\u5c3f\u9541\u504f\u4f4e",
+                    "24灏忔椂灏块晛闄嶄綆",
+                    "灏块晛闄嶄綆",
+                    "灏块晛鍋忎綆",
+                ),
+            )
+            or self._regex_assertive(
+                raw_text,
+                r"(?:24\u5c0f\u65f6)?\u5c3f\u9541.{0,16}(?:\u964d\u4f4e|\u51cf\u4f4e|\u504f\u4f4e|\u4f4e\u4e8e|<)",
+            )
+        ):
+            add("low_urine_magnesium", 0.74, direction="low")
+            add("magnesium_depletion", 0.74)
+        if self._has_assertive_term(
+            raw_text,
+            (
+                "\u8840\u9541\u964d\u4f4e",
+                "\u8840\u9541\u504f\u4f4e",
+                "\u4f4e\u8840\u9541",
+                "琛€闀侀檷浣?",
+                "琛€闀佸亸浣?",
+                "浣庤闀?",
+            ),
+        ):
+            add("low_magnesium", 0.78, direction="low")
+        if (
+            self._has_assertive_term(
+                raw_text,
+                (
+                    "QTc\u5ef6\u957f\u652f\u6301\u4f4e\u9541",
+                    "QT\u5ef6\u957f\u652f\u6301\u4f4e\u9541",
+                    "QTc\u663e\u8457\u5ef6\u957f",
+                    "QT\u5ef6\u957f",
+                    "QT寮傚父",
+                ),
+            )
+            and self._has_assertive_term(raw_text, ("\u4f4e\u9541", "浣庨晛", "镁"))
+        ):
+            add("low_magnesium_support", 0.7, term="QT")
+
+        if self._has_assertive_term(raw_text, ("\u80ba\u80be\u7efc\u5408\u5f81", "鑲鸿偩缁煎悎寰?")):
+            add("pulmonary_renal_syndrome", 0.76)
+            add("pulmonary_hemorrhage", 0.73)
+            add("renal_impairment", 0.7)
+        if self._has_assertive_term(
+            raw_text,
+            ("\u80ba\u6ce1\u51fa\u8840", "\u5f25\u6f2b\u6027\u80ba\u6ce1\u51fa\u8840", "\u80ba\u51fa\u8840", "\u54b3\u8840", "\u8840\u75f0", "鑲烘场鍑鸿", "寮ユ极鎬ц偤娉″嚭琛€", "鑲哄嚭琛€", "鍜宠"),
+        ):
+            add("pulmonary_hemorrhage", 0.76)
+            add("hemoptysis", 0.72)
+        if self._has_assertive_term(
+            raw_text,
+            ("\u8840\u5c3f", "\u955c\u4e0b\u8840\u5c3f", "\u5c3f\u8272\u6df1", "\u5c3f\u8272\u53d8\u6df1", "\u7ea2\u7ec6\u80de\u7ba1\u578b", "闀滀笅琛€灏?", "鏄惧井闀滀笅琛€灏?", "琛€灏?", "灏胯壊鍙樻繁", "灏跨孩缁嗚優"),
+        ):
+            add("microscopic_hematuria", 0.74)
+        if self._has_assertive_term(raw_text, ("\u86cb\u767d\u5c3f", "\u5c3f\u86cb\u767d\u9633\u6027", "铔嬬櫧灏?", "灏胯泲鐧介槼鎬?")):
+            add("proteinuria", 0.72)
+        if self._has_assertive_term(
+            raw_text,
+            ("\u80be\u529f\u80fd\u53d7\u635f", "\u80be\u529f\u80fd\u635f\u5bb3", "\u80be\u635f\u5bb3", "\u808c\u9150\u5347\u9ad8", "\u80be\u5c0f\u7403\u6ee4\u8fc7\u7387\u964d\u4f4e", "鑲惧姛鑳藉彈鎹?", "鑲惧姛鑳芥崯瀹?", "鑲炬崯瀹?", "鑲岄厫鍗囬珮"),
+        ):
+            add("renal_impairment", 0.74)
+        if self._has_assertive_term(raw_text, ("MPO-ANCA\u9633\u6027", "MPO\u6297\u4f53\u9633\u6027", "MPO-ANCA闃虫€?", "MPO鎶椾綋闃虫€?")):
+            add("mpo_anca_positive", 0.78)
+            add("anca_positive", 0.73)
+        if self._has_assertive_term(raw_text, ("p-ANCA\u9633\u6027", "P-ANCA\u9633\u6027", "p-ANCA闃虫€?")):
+            add("p_anca_positive", 0.76)
+            add("anca_positive", 0.72)
+        if self._has_assertive_term(raw_text, ("ANCA\u9633\u6027", "ANCA\u8c31\u9633\u6027", "ANCA闃虫€?", "ANCA璋遍槼鎬?")):
+            add("anca_positive", 0.74)
+
+        if self._has_assertive_term(
+            raw_text,
+            (
+                "BNP\u5347\u9ad8",
+                "BNP\u589e\u9ad8",
+                "NT-proBNP\u5347\u9ad8",
+                "NT-proBNP\u589e\u9ad8",
+                "EF\u4e0b\u964d",
+                "\u5c04\u8840\u5206\u6570\u964d\u4f4e",
+                "\u80ba\u6de4\u8840",
+                "\u80ba\u6c34\u80bf",
+                "\u5fc3\u5f71\u589e\u5927",
+                "\u5fc3\u810f\u6269\u5927",
+                "BNP鍗囬珮",
+                "NT-proBNP鍗囬珮",
+                "EF涓嬮檷",
+                "鑲烘筏琛€",
+                "鑲烘按鑲?",
+                "蹇冨奖澧炲ぇ",
+                "蹇冭剰鎵╁ぇ",
+            ),
+        ):
+            add("heart_failure_state", 0.76)
+        if (
+            self._has_assertive_term(raw_text, ("\u5fc3\u529b\u8870\u7aed", "\u5fc3\u8870", "蹇冨姏琛扮", "蹇冭“"))
+            and self._has_assertive_term(raw_text, ("\u7aef\u5750\u547c\u5438", "绔潗鍛煎惛"))
+            and self._has_assertive_term(raw_text, ("\u6c34\u80bf", "姘磋偪"))
+        ):
+            add("heart_failure_state", 0.74)
+
+        if self._has_assertive_term(raw_text, ("\u80ba\u52a8\u8109\u74e3\u72ed\u7a84", "\u80ba\u52a8\u8109\u74e3\u53e3\u72ed\u7a84", "鑲哄姩鑴夌摚鐙獎")):
+            add("pulmonary_valve_stenosis", 0.78)
+        if self._regex_assertive(
+            raw_text,
+            r"(?:\u80ba\u52a8\u8109\u74e3|\u8de8\u74e3|\u5cf0\u503c).{0,12}(?:\u538b\u5dee|\u538b\u529b\u9636\u5dee).{0,12}(?:\u5347\u9ad8|\u589e\u9ad8|[5-9]\d\s*mmHg|\d{2,3}\s*mmHg)",
+        ):
+            add("pulmonary_valve_gradient", 0.76, direction="high")
+        if self._has_assertive_term(raw_text, ("\u53f3\u5fc3\u5ba4\u80a5\u539a", "\u53f3\u5ba4\u80a5\u539a", "鍙冲績瀹よ偉鍘?", "鍙冲鑲ュ帤")):
+            add("right_ventricular_hypertrophy", 0.72)
+        if self._has_assertive_term(raw_text, ("\u80ba\u52a8\u8109\u9ad8\u538b", "\u80ba\u52a8\u8109\u538b\u5347\u9ad8", "鑲哄姩鑴夐珮鍘?")):
+            add("pulmonary_hypertension", 0.72)
+        if self._has_assertive_term(raw_text, ("\u5ba4\u95f4\u9694\u7f3a\u635f", "\u5927\u578bVSD", "VSD", "瀹ら棿闅旂己鎹?")):
+            add("ventricular_septal_defect", 0.76)
+        if self._has_assertive_term(raw_text, ("\u53f3\u5411\u5de6\u5206\u6d41", "\u53f3\u81f3\u5de6\u5206\u6d41", "鍙冲悜宸﹀垎娴?")):
+            add("right_to_left_shunt", 0.76)
+        if self._has_assertive_term(raw_text, ("\u5148\u5929\u6027\u5fc3\u810f\u75c5", "\u5148\u5fc3\u75c5", "\u5148\u5929\u6027\u5fc3\u810f\u7f3a\u9677", "鍏堝ぉ鎬у績鑴忕梾")):
+            add("congenital_heart_defect", 0.76)
+
+        return [
+            Observation(
+                finding=finding,
+                source="reasoning_inference",
+                direction=direction,
+                polarity="positive",
+                confidence=confidence,
+                raw_text=source_text,
+                source_text=source_text,
+                field_path=field_path,
+            )
+            for finding, confidence, direction, source_text in findings
+        ]
+
+    def _has_assertive_term(self, text: str, terms: Sequence[str]) -> bool:
+        for term in terms:
+            if not term:
+                continue
+            search_from = 0
+            lowered = text.lower()
+            target = str(term).lower()
+            while True:
+                start = lowered.find(target, search_from)
+                if start < 0:
+                    break
+                if not self._window_blocked(text, start, start + len(term)):
+                    return True
+                self._record_blocked(term, text, start, start + len(term))
+                search_from = start + len(term)
+        return False
+
+    def _regex_assertive(self, text: str, pattern: str) -> bool:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            if not self._window_blocked(text, match.start(), match.end()):
+                return True
+            self._record_blocked(match.group(0), text, match.start(), match.end())
+        return False
+
+    def _record_blocked(self, term: str, text: str, start: int, end: int) -> None:
+        support = self._support_text(text, term, start, end)
+        record = {"term": term, "source_text": support, "reason": "blocked_reasoning_window"}
+        if record not in self.last_audit["blocked"]:
+            self.last_audit["blocked"].append(record)
+
+    @staticmethod
+    def _window_blocked(text: str, start: int, end: int) -> bool:
+        window = text[max(0, start - 24): min(len(text), end + 36)]
+        blockers = (
+            "\u4e0d\u652f\u6301",
+            "\u6392\u9664",
+            "\u4e0d\u80fd\u89e3\u91ca",
+            "\u7f3a\u4e4f",
+            "\u65e0",
+            "\u672a\u89c1",
+            "\u672a\u53d1\u73b0",
+            "\u9634\u6027",
+            "\u6b63\u5e38",
+            "\u9274\u522b",
+            "\u5f85\u9274\u522b",
+            "\u9700\u9274\u522b",
+            "\u5f85\u6392",
+            "\u5f85\u67e5",
+            "\u9700\u67e5",
+            "\u5efa\u8bae",
+            "\u6392\u67e5",
+            "\u9664\u5916",
+            "\u53ef\u80fd",
+            "\u7591\u4f3c",
+            "涓嶆敮鎸?",
+            "鎺掗櫎",
+            "涓嶈兘瑙ｉ噴",
+            "缂轰箯",
+            "鏈",
+            "鏈彂鐜?",
+            "闃存€?",
+            "姝ｅ父",
+            "閴村埆",
+            "寰呴壌鍒?",
+            "闇€閴村埆",
+            "寰呮帓",
+            "寰呮煡",
+            "闇€鏌?",
+            "寤鸿",
+            "鎺掓煡",
+            "闄ゅ",
+            "鍙兘",
+            "鐤戜技",
+        )
+        return any(token in window for token in blockers)
+
+    @staticmethod
+    def _support_text(
+        text: str,
+        term: str = "",
+        start: int = -1,
+        end: int = -1,
+    ) -> str:
+        raw = str(text or "")
+        if start < 0 and term:
+            start = raw.lower().find(str(term).lower())
+            end = start + len(str(term)) if start >= 0 else -1
+        if start < 0:
+            return raw[:240]
+        left = max(raw.rfind(mark, 0, start) for mark in ("。", "；", ";", "\n", "，", ","))
+        right_positions = [
+            raw.find(mark, end)
+            for mark in ("。", "；", ";", "\n", "，", ",")
+        ]
+        right_positions = [pos for pos in right_positions if pos >= 0]
+        right = min(right_positions) if right_positions else min(len(raw), start + 120)
+        return raw[left + 1:right].strip()[:240]
+
+
+class HybridEvidenceCompiler:
+    """Merge deterministic evidence and reasoning-derived soft findings."""
+
+    def __init__(
+        self,
+        normalizer: Optional[ClinicalEvidenceNormalizer] = None,
+        reasoning_adapter: Optional[ReasoningEvidenceAdapter] = None,
+        ref_dir: str = "data/ref_data",
+    ):
+        self.normalizer = normalizer or ClinicalEvidenceNormalizer(ref_dir=ref_dir)
+        self.reasoning_adapter = reasoning_adapter or ReasoningEvidenceAdapter()
+        self.last_audit: Dict[str, Any] = {}
+
+    def compile(
+        self,
+        collected_info: Optional[Dict[str, Any]],
+        exam_results: Optional[Dict[str, Any]],
+        diagnosis_result: Optional[Dict[str, Any]] = None,
+        raw_case_text: str = "",
+    ) -> EvidenceBundle:
+        base = self.normalizer.normalize(
+            collected_info,
+            exam_results,
+            raw_case_text=raw_case_text,
+        )
+        reasoning = self.reasoning_adapter.adapt(diagnosis_result or {})
+        observations = self.merge_observations(base.observations, reasoning)
+        finalized = self.normalizer._finalize_observations(observations)
+        bundle = EvidenceBundle(finalized)
+        self.last_audit = self._build_audit(bundle, reasoning)
+        return bundle
+
+    def merge_observations(
+        self,
+        base: Sequence[Observation],
+        additions: Sequence[Observation],
+    ) -> List[Observation]:
+        best: Dict[Tuple[str, str], Observation] = {}
+        for item in list(base or []) + list(additions or []):
+            if not item or not item.finding:
+                continue
+            key = (item.finding, item.polarity)
+            current = best.get(key)
+            if current is None or self._source_rank(item) > self._source_rank(current):
+                best[key] = item
+                continue
+            if self._source_rank(item) == self._source_rank(current) and item.confidence > current.confidence:
+                best[key] = item
+        return list(best.values())
+
+    def _build_audit(
+        self,
+        bundle: EvidenceBundle,
+        reasoning_observations: Sequence[Observation],
+    ) -> Dict[str, Any]:
+        raw_case_count = len(
+            [
+                item
+                for item in bundle.observations
+                if item.source == "raw_case_finding"
+                and item.polarity == "positive"
+                and not item.finding.startswith("field:")
+            ]
+        )
+        reasoning_count = len(
+            [
+                item
+                for item in bundle.observations
+                if item.source == "reasoning_inference"
+                and item.polarity == "positive"
+                and not item.finding.startswith("field:")
+            ]
+        )
+        return {
+            "reasoning_inference_finding_count": reasoning_count,
+            "raw_case_finding_count": raw_case_count,
+            "blocked_reasoning_inference_count": len(
+                self.reasoning_adapter.last_audit.get("blocked") or []
+            ),
+            "reasoning_inference_findings": [
+                item.to_dict() for item in bundle.observations
+                if item.source == "reasoning_inference"
+            ],
+            "reasoning_inference_candidates": [
+                item.to_dict() for item in reasoning_observations
+            ],
+            "blocked_reasoning_inferences": list(
+                self.reasoning_adapter.last_audit.get("blocked") or []
+            ),
+            "raw_case_audit": dict(self.normalizer.last_raw_case_audit),
+        }
+
+    @staticmethod
+    def _source_rank(item: Observation) -> int:
+        source = str(item.source or "")
+        if source == "reasoning_inference":
+            return 1
+        if source in {"evidence_interpreter", "闂瘖", "问诊"}:
+            return 2
+        if source == "raw_case_finding":
+            return 3
+        return 4
+
 
 def _flatten_leaves(value: Any, prefix: str = "") -> Iterable[Tuple[str, Any]]:
     if isinstance(value, dict):
@@ -1264,6 +2194,95 @@ def _flatten_leaves(value: Any, prefix: str = "") -> Iterable[Tuple[str, Any]]:
             yield from _flatten_leaves(item, path)
         return
     yield prefix or "value", value
+
+
+def _extract_raw_case_text(value: Any) -> str:
+    parts: List[str] = []
+
+    def visit(item: Any, key: str = "") -> None:
+        if isinstance(item, dict):
+            for child_key, child in item.items():
+                name = str(child_key or "")
+                if name in _RAW_CASE_FIELD_KEYS:
+                    visit(child, name)
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child, key)
+            return
+        if key in _RAW_CASE_FIELD_KEYS and isinstance(item, str):
+            text = " ".join(item.split())
+            if text and text not in parts:
+                parts.append(text)
+
+    visit(value or {})
+    return "\n".join(parts)
+
+
+def _without_raw_case_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_raw_case_fields(item)
+            for key, item in value.items()
+            if str(key or "") not in _RAW_CASE_FIELD_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_raw_case_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_without_raw_case_fields(item) for item in value)
+    return value
+
+
+def _contains_raw_case_leakage(text: str) -> bool:
+    normalized = str(text or "")
+    lowered = normalized.lower()
+    return any(
+        (term.lower() in lowered if term.isascii() else term in normalized)
+        for term in _RAW_CASE_LEAKAGE_TERMS
+    )
+
+
+def _finding_metadata(finding: str, override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = dict(_FINDING_METADATA.get(str(finding or ""), {}))
+    if override:
+        for key in ("evidence_level", "information_value", "generic_parents"):
+            if key in override:
+                data[key] = override[key]
+    level = str(data.get("evidence_level") or "")
+    if not level:
+        level = "generic" if str(finding or "").startswith(("field:", "symptom:")) else "supportive"
+    try:
+        information_value = float(data.get("information_value", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        information_value = 0.0
+    if information_value <= 0.0:
+        if level == "generic":
+            information_value = 0.08
+        elif level == "diagnostic_pattern":
+            information_value = 0.9
+        elif level == "specific":
+            information_value = 0.78
+        else:
+            information_value = 0.55
+    return {
+        "evidence_level": level,
+        "information_value": max(0.0, min(1.0, information_value)),
+        "generic_parents": tuple(data.get("generic_parents") or ()),
+    }
+
+
+def _negated_near(text: str, term: str, window: int = 8) -> bool:
+    target = str(text or "")
+    needle = str(term or "")
+    if not target or not needle:
+        return False
+    if any(marker in needle for marker in ("\u65e0\u529b", "\u4e4f\u529b")):
+        return False
+    start = target.lower().find(needle.lower())
+    if start < 0:
+        return False
+    context = target[max(0, start - window):start + len(needle) + 4]
+    return any(marker in context for marker in _NEGATION_TERMS)
 
 
 def _as_text_list(value: Any) -> List[str]:

@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 class PolicyStore:
     """策略补丁持久化 + 命中匹配 + 元迭代（audit/retire）。"""
 
-    def __init__(self, store_path: str = "data/memory_data/policies.json"):
+    def __init__(self, store_path: str = "outputs/runtime_state/policies.json"):
         self.store_path = store_path
         self.patches: List[Dict[str, Any]] = []
         self._load()

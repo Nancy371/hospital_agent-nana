@@ -4,6 +4,38 @@ from typing import Any, Dict, List, Optional
 
 from .knowledge import KnowledgeBase
 
+_GENERIC_INFLAMMATION_EXAM_MARKERS = (
+    "CBC",
+    "CRP",
+    "ESR",
+    "PCT",
+    "全血细胞计数",
+    "C反应蛋白",
+    "红细胞沉降率",
+    "降钙素原",
+)
+_SPECIAL_DISCRIMINATOR_EXAM_MARKERS = (
+    "AFB",
+    "NAAT",
+    "Xpert",
+    "ANCA",
+    "MPO",
+    "p-ANCA",
+    "CT",
+    "MRI",
+    "血清学",
+    "涂片",
+    "病理",
+    "活检",
+    "支气管镜",
+    "尿液分析",
+    "肾功能",
+    "屈光",
+    "眼压",
+    "裂隙灯",
+    "痰培养",
+)
+
 
 _PEDIATRIC_CARDIAC_SCREEN_EXAMS = [
     "体格检查",
@@ -197,7 +229,7 @@ class ExamStrategyAgent:
         self,
         knowledge: KnowledgeBase,
         max_new_items: int = 10,
-        discriminating_exam_max_items: int = 4,
+        discriminating_exam_max_items: int = 6,
     ):
         self.knowledge = knowledge
         self.max_new_items = max_new_items
@@ -220,8 +252,10 @@ class ExamStrategyAgent:
         existing_valid, _ = self.knowledge.normalize_examinations(list(existing_results.keys()))
         existing_set = set(existing_results.keys()) | set(existing_valid)
 
-        proposed_valid, invalid_items = self.knowledge.normalize_examinations(proposed_items or [])
         judge_payload = self._judge_payload(judge_decision)
+        proposed_valid, invalid_items = self.knowledge.normalize_examinations(
+            proposed_items or []
+        )
         differential_plan = self._differential_driven_plan(
             collected_info=collected_info,
             candidate_diseases=candidate_diseases,
@@ -258,6 +292,10 @@ class ExamStrategyAgent:
                 "differential_candidates": differential_plan["differential_candidates"],
                 "discriminating_items": items,
                 "blocked_items": blocked_items,
+                "generic_exam_suppression_count": differential_plan.get(
+                    "generic_exam_suppression_count",
+                    0,
+                ),
                 "clinical_context": self.knowledge.build_clinical_context(
                     symptoms=symptoms,
                     candidate_diseases=differential_plan["differential_candidates"],
@@ -500,9 +538,18 @@ class ExamStrategyAgent:
         payload = self._judge_payload(judge_decision)
         if not payload:
             return {}
+        exam_tasks = [
+            item
+            for item in payload.get("discriminating_exam_tasks", []) or []
+            if isinstance(item, dict) and str(item.get("exam") or "").strip()
+        ]
         raw_discriminating = [
             str(item).strip()
-            for item in payload.get("discriminating_exams", []) or []
+            for item in (
+                [task.get("exam") for task in exam_tasks]
+                or payload.get("discriminating_exams", [])
+                or []
+            )
             if str(item).strip()
         ]
         if not raw_discriminating:
@@ -517,14 +564,16 @@ class ExamStrategyAgent:
             )
             if str(item).strip()
         ]
-        differential_candidates = list(dict.fromkeys(differential_candidates))[:5]
+        differential_candidates = list(dict.fromkeys(differential_candidates))[:6]
         normalized, _ = self.knowledge.normalize_examinations(raw_discriminating)
         if not normalized:
             return {}
-        _ranked, information_gain = self._rank_by_information_gain(
+        task_by_exam = self._normalized_exam_task_map(exam_tasks)
+        ranked, information_gain = self._rank_by_information_gain(
             candidate_diseases=differential_candidates or candidate_diseases or [],
             symptoms=(collected_info or {}).get("symptoms", []),
             proposed_items=list(dict.fromkeys(normalized + proposed_items)),
+            exam_tasks=exam_tasks,
         )
         high_value_proposed = [
             item
@@ -533,9 +582,11 @@ class ExamStrategyAgent:
         ]
         if payload.get("needs_discriminating_exams"):
             high_value_proposed = []
-            ordered = list(dict.fromkeys(normalized))
+            ordered = [item for item in ranked if item in set(normalized)]
         else:
-            ordered = list(dict.fromkeys(high_value_proposed + normalized))
+            ordered = list(
+                dict.fromkeys(high_value_proposed + [item for item in ranked if item in set(normalized)])
+            )
         items = self.prepare_order_items(
             list(dict.fromkeys(ordered)),
             collected_info=collected_info,
@@ -555,8 +606,22 @@ class ExamStrategyAgent:
             {
                 "exam": item,
                 "exam_source": "judge_discriminating_exam",
-                "target_candidates": list(differential_candidates),
-                "target_findings": list(target_findings),
+                "target_candidates": list(
+                    task_by_exam.get(item, {}).get("target_candidates")
+                    or differential_candidates
+                ),
+                "target_findings": list(
+                    task_by_exam.get(item, {}).get("target_findings")
+                    or target_findings
+                ),
+                "exam_type": str(
+                    task_by_exam.get(item, {}).get("exam_type")
+                    or self._exam_type_for_name(item)
+                ),
+                "expected_effect": str(
+                    task_by_exam.get(item, {}).get("expected_effect")
+                    or "shift_probabilities_across_differential_pool"
+                ),
                 "information_gain": information_gain.get(item, 0.0),
                 "allowed_reason": (
                     "needs_discriminating_exams"
@@ -574,6 +639,11 @@ class ExamStrategyAgent:
             "primary_diagnosis": str(payload.get("primary") or payload.get("judge_primary") or ""),
             "candidate_exam_pool": normalized,
             "exam_authorization_details": authorization_details,
+            "generic_exam_suppression_count": sum(
+                1
+                for item in normalized + proposed_items
+                if self._generic_inflammation_exam(item) and item not in set(items)
+            ),
         }
 
     @staticmethod
@@ -596,9 +666,29 @@ class ExamStrategyAgent:
                 "differential_candidates",
                 "evidence_gap_targets",
                 "discriminating_exams",
+                "discriminating_exam_tasks",
+                "discriminating_findings",
             )
             if hasattr(judge_decision, key)
         }
+
+    def _normalized_exam_task_map(
+        self,
+        exam_tasks: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        result: Dict[str, Dict[str, Any]] = {}
+        for task in exam_tasks or []:
+            if not isinstance(task, dict):
+                continue
+            normalized, _ = self.knowledge.normalize_examinations(
+                [str(task.get("exam") or "")]
+            )
+            if not normalized:
+                continue
+            current = dict(task)
+            current["exam"] = normalized[0]
+            result[normalized[0]] = current
+        return result
 
     def _strict_authorized_exam_plan(
         self,
@@ -960,6 +1050,7 @@ class ExamStrategyAgent:
         candidate_diseases: List[Any],
         symptoms: List[Any],
         proposed_items: List[str],
+        exam_tasks: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[List[str], Dict[str, float]]:
         """Rank exams by relevance and ability to separate the top candidates."""
         candidates: List[str] = []
@@ -973,11 +1064,31 @@ class ExamStrategyAgent:
             normalized = self.knowledge.normalize_diagnosis(str(value)) or str(value)
             if normalized not in candidates:
                 candidates.append(normalized)
-            if len(candidates) >= 3:
+            if len(candidates) >= 6:
                 break
 
         exam_support: Dict[str, set] = {}
         relevance: Dict[str, float] = {}
+        task_type: Dict[str, str] = {}
+        task_findings: Dict[str, set] = {}
+        task_by_exam = self._normalized_exam_task_map(exam_tasks or [])
+        for exam, task in task_by_exam.items():
+            targets = [
+                self.knowledge.normalize_diagnosis(str(item)) or str(item)
+                for item in task.get("target_candidates", []) or []
+                if str(item).strip()
+            ]
+            targets = [item for item in targets if item in set(candidates)] or list(candidates)
+            exam_support.setdefault(exam, set()).update(targets)
+            task_type[exam] = str(task.get("exam_type") or self._exam_type_for_name(exam))
+            task_findings.setdefault(exam, set()).update(
+                str(item).strip()
+                for item in task.get("target_findings", []) or []
+                if str(item).strip()
+            )
+            relevance[exam] = relevance.get(exam, 0.0) + float(
+                task.get("information_gain_hint", 0.8) or 0.8
+            )
         for rank, disease in enumerate(candidates):
             profile = self.knowledge.get_disease_profile(disease) or {}
             raw_items: List[str] = []
@@ -1004,7 +1115,7 @@ class ExamStrategyAgent:
 
         for exam in proposed_items:
             exam_support.setdefault(exam, set())
-            relevance[exam] = relevance.get(exam, 0.0) + 0.15
+            relevance[exam] = relevance.get(exam, 0.0) + 0.05
 
         candidate_count = max(1, len(candidates))
         max_relevance = max(relevance.values(), default=1.0)
@@ -1016,14 +1127,62 @@ class ExamStrategyAgent:
             elif 0 < coverage < candidate_count:
                 discrimination = 1.0
             elif coverage == candidate_count:
-                discrimination = 0.35
+                discrimination = 0.90
             else:
                 discrimination = 0.0
+            multi_candidate = 1.0 if coverage >= 2 else 0.0
             relevance_score = relevance.get(exam, 0.0) / max_relevance
-            scores[exam] = round(0.65 * discrimination + 0.35 * relevance_score, 4)
+            exam_type = task_type.get(exam) or self._exam_type_for_name(exam)
+            type_score = self._exam_type_score(exam_type)
+            finding_score = min(1.0, len(task_findings.get(exam, set())) / 4.0)
+            score = (
+                0.32 * discrimination
+                + 0.24 * multi_candidate
+                + 0.22 * type_score
+                + 0.12 * finding_score
+                + 0.10 * relevance_score
+            )
+            if exam_type == "generic_inflammation" and coverage < 2:
+                score *= 0.45
+            scores[exam] = round(score, 4)
 
-        ranked = sorted(scores, key=lambda item: (scores[item], relevance.get(item, 0.0)), reverse=True)
+        ranked = sorted(
+            scores,
+            key=lambda item: (
+                scores[item],
+                self._exam_type_score(task_type.get(item) or self._exam_type_for_name(item)),
+                len(exam_support.get(item, set())),
+                relevance.get(item, 0.0),
+            ),
+            reverse=True,
+        )
         return ranked, scores
+
+    @staticmethod
+    def _generic_inflammation_exam(exam: str) -> bool:
+        text = str(exam or "")
+        return any(marker in text for marker in _GENERIC_INFLAMMATION_EXAM_MARKERS)
+
+    @staticmethod
+    def _special_discriminator_exam(exam: str) -> bool:
+        text = str(exam or "")
+        return any(marker in text for marker in _SPECIAL_DISCRIMINATOR_EXAM_MARKERS)
+
+    def _exam_type_for_name(self, exam: str) -> str:
+        if self._generic_inflammation_exam(exam):
+            return "generic_inflammation"
+        if self._special_discriminator_exam(exam):
+            return "special_discriminator"
+        return "confirmatory"
+
+    @staticmethod
+    def _exam_type_score(exam_type: str) -> float:
+        return {
+            "special_discriminator": 1.0,
+            "shared_discriminator": 0.78,
+            "confirmatory": 0.50,
+            "generic_inflammation": 0.12,
+        }.get(str(exam_type or ""), 0.35)
 
     def _scenario_items(
         self,

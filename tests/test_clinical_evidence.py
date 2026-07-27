@@ -1,6 +1,11 @@
 import unittest
 
-from agent.clinical_evidence import ClinicalEvidenceNormalizer, EvidenceAgent
+from agent.clinical_evidence import (
+    ClinicalEvidenceNormalizer,
+    EvidenceAgent,
+    HybridEvidenceCompiler,
+    ReasoningEvidenceAdapter,
+)
 
 
 class ClinicalEvidenceNormalizerTests(unittest.TestCase):
@@ -327,6 +332,164 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
             "cardiopulmonary_exertional_pattern",
         }:
             self.assertIn(finding, findings)
+
+    def test_interpreter_v2_prioritizes_high_information_eye_findings(self):
+        bundle = self.normalizer.normalize(
+            {
+                "age": 52,
+                "symptoms": [
+                    "\u770b\u8fd1\u6a21\u7cca\uff0c\u9605\u8bfb\u56f0\u96be\uff0c\u770b\u624b\u673a\u8d39\u52b2",
+                    "\u89c6\u7269\u6a21\u7cca",
+                ],
+            },
+            {
+                "\u5c48\u5149\u68c0\u67e5": {
+                    "status": "abnormal",
+                    "result": {"\u7ed3\u8bba": "+1.50D\u9605\u8bfb\u955c\u53ef\u6539\u5584\u8fd1\u89c6\u529b"},
+                }
+            },
+        )
+        findings = bundle.findings("positive")
+        self.assertIn("near_vision_difficulty", findings)
+        self.assertIn("refractive_correction_improves_near_vision", findings)
+        self.assertIn("presbyopia_pattern", findings)
+        visual = [item for item in bundle.observations if item.finding == "visual_blurring"]
+        self.assertTrue(visual)
+        self.assertTrue(any(item.shadowed_by for item in visual))
+        self.assertGreaterEqual(
+            max(item.information_value for item in bundle.observations if item.finding == "near_vision_difficulty"),
+            0.9,
+        )
+
+    def test_raw_case_text_enters_interpreter_without_losing_specific_findings(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {},
+            raw_case_text="\u770b\u624b\u673a\u5c0f\u5b57\u8d39\u52b2\uff0c\u8fdc\u89c6\u529b\u5c1a\u53ef\uff0c\u9605\u8bfb\u955c\u53ef\u6539\u5584\u8fd1\u89c6\u529b\u3002",
+        )
+        findings = bundle.findings("positive")
+        self.assertIn("near_vision_difficulty", findings)
+        self.assertIn("refractive_correction_improves_near_vision", findings)
+        self.assertIn("presbyopia_pattern", findings)
+        self.assertTrue(
+            all(
+                item.source_text
+                for item in bundle.observations
+                if item.source == "raw_case_finding"
+            )
+        )
+        visual = [item for item in bundle.observations if item.finding == "visual_blurring"]
+        self.assertTrue(not visual or any(item.shadowed_by for item in visual))
+
+    def test_raw_case_text_with_answer_leakage_is_blocked(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {},
+            raw_case_text="expected diagnosis: \u8001\u89c6\u3002\u6807\u51c6\u7b54\u6848\uff1a\u8001\u89c6\u3002\u770b\u624b\u673a\u8d39\u52b2\u3002",
+        )
+        findings = bundle.findings("positive")
+        self.assertNotIn("near_vision_difficulty", findings)
+        self.assertTrue(self.normalizer.last_raw_case_audit["raw_case_blocked"])
+        self.assertEqual(
+            self.normalizer.last_raw_case_audit["raw_case_blocked_reason"],
+            "raw_case_contains_answer_leakage",
+        )
+
+    def test_reasoning_adapter_adds_low_magnesium_soft_findings(self):
+        adapter = ReasoningEvidenceAdapter()
+        observations = adapter.adapt(
+            {
+                "reasoning": "\u8179\u6cfb\u5bfc\u81f4\u9541\u4e22\u5931\uff0cQTc\u5ef6\u957f\u652f\u6301\u4f4e\u9541\u8840\u75c7\u3002"
+            }
+        )
+        findings = {item.finding for item in observations}
+        self.assertIn("magnesium_depletion", findings)
+        self.assertIn("low_magnesium_support", findings)
+        self.assertTrue(all(item.source == "reasoning_inference" for item in observations))
+        self.assertTrue(all(item.source_text for item in observations))
+        self.assertTrue(all(item.confidence <= 0.78 for item in observations))
+
+    def test_reasoning_adapter_blocks_differential_only_language(self):
+        adapter = ReasoningEvidenceAdapter()
+        observations = adapter.adapt({"reasoning": "\u80ba\u764c\u9700\u9274\u522b\u4f46\u8bc1\u636e\u4e0d\u8db3\u3002"})
+        self.assertEqual(observations, [])
+        self.assertEqual(adapter.last_audit["blocked_reasoning_inference_count"], 0)
+
+    def test_reasoning_adapter_structures_pulmonary_renal_evidence(self):
+        adapter = ReasoningEvidenceAdapter()
+        observations = adapter.adapt(
+            {
+                "reasoning": "ANCA\u9633\u6027\u3001\u8840\u5c3f\u548c\u54b3\u8840\u652f\u6301\u80ba\u80be\u7efc\u5408\u5f81\u3002"
+            }
+        )
+        findings = {item.finding for item in observations}
+        for finding in {
+            "anca_positive",
+            "microscopic_hematuria",
+            "pulmonary_hemorrhage",
+            "pulmonary_renal_syndrome",
+        }:
+            self.assertIn(finding, findings)
+
+    def test_hybrid_compiler_preserves_objective_evidence_priority(self):
+        compiler = HybridEvidenceCompiler(normalizer=self.normalizer)
+        bundle = compiler.compile(
+            {"symptoms": ["\u8179\u6cfb"]},
+            {
+                "\u62a5\u544a\u6a21\u677f": {
+                    "status": "normal",
+                    "result": {"\u5907\u6ce8": "\u8840\u9541\u53c2\u8003\u8303\u56f4\uff1a0.75-1.02 mmol/L"},
+                }
+            },
+            {"reasoning": "\u8179\u6cfb\u5bfc\u81f4\u9541\u4e22\u5931\uff0cQTc\u5ef6\u957f\u652f\u6301\u4f4e\u9541\u8840\u75c7\u3002"},
+        )
+        findings = bundle.findings("positive")
+        self.assertIn("magnesium_depletion", findings)
+        self.assertNotIn("low_magnesium", findings)
+        self.assertEqual(
+            compiler.last_audit["reasoning_inference_finding_count"],
+            2,
+        )
+
+    def test_visual_blurring_alone_stays_low_information(self):
+        bundle = self.normalizer.normalize({"symptoms": ["\u89c6\u7269\u6a21\u7cca"]}, {})
+        findings = bundle.findings("positive")
+        self.assertIn("visual_blurring", findings)
+        self.assertNotIn("near_vision_difficulty", findings)
+        self.assertNotIn("presbyopia_pattern", findings)
+        visual = next(item for item in bundle.observations if item.finding == "visual_blurring")
+        self.assertEqual(visual.evidence_level, "generic")
+        self.assertLessEqual(visual.information_value, 0.2)
+
+    def test_interpreter_v2_maps_night_vision_and_urachal_language(self):
+        bundle = self.normalizer.normalize(
+            {
+                "symptoms": [
+                    "\u591c\u76f2\uff0c\u6697\u9002\u5e94\u5dee",
+                    "\u8110\u90e8\u5206\u6ccc\u7269\u4f34\u4e0b\u8179\u6b63\u4e2d\u75bc\u75db",
+                ]
+            },
+            {},
+        )
+        findings = bundle.findings("positive")
+        for finding in {
+            "night_vision_decline",
+            "nyctalopia_pattern",
+            "umbilical_discharge",
+            "midline_suprapubic_pain",
+            "urachal_remnant_pattern",
+        }:
+            self.assertIn(finding, findings)
+
+    def test_interpreter_v2_respects_simple_negation_window(self):
+        bundle = self.normalizer.normalize(
+            {"symptoms": ["\u5426\u8ba4\u770b\u8fd1\u56f0\u96be\uff0c\u65e0\u591c\u76f2\uff0c\u8679\u819c\u65e0\u7f3a\u635f"]},
+            {},
+        )
+        findings = bundle.findings("positive")
+        self.assertNotIn("near_vision_difficulty", findings)
+        self.assertNotIn("night_vision_decline", findings)
+        self.assertNotIn("iris_coloboma", findings)
 
     def test_normal_otoscopy_does_not_become_tympanitis(self):
         bundle = self.normalizer.normalize(

@@ -549,6 +549,9 @@ _CATEGORY_RULES: Dict[str, Dict[str, Any]] = {
         "target_diseases": ["肺结核"],
         "findings": {
             "tuberculosis_exposure": 0.42,
+            "tb_exposure": 0.44,
+            "tuberculosis_pattern": 0.52,
+            "chronic_cough_pattern": 0.28,
             "cough": 0.16,
             "fever": 0.14,
             "hemoptysis": 0.32,
@@ -573,8 +576,10 @@ _CATEGORY_RULES: Dict[str, Dict[str, Any]] = {
         "findings": {
             "near_vision_difficulty": 0.48,
             "age_related_near_blur": 0.46,
+            "refractive_correction_improves_near_vision": 0.52,
+            "presbyopia_pattern": 0.58,
             "refractive_error": 0.34,
-            "visual_blurring": 0.10,
+            "visual_blurring": 0.04,
         },
         "terms": {
             "老视": 0.58,
@@ -654,8 +659,10 @@ _CATEGORY_RULES: Dict[str, Dict[str, Any]] = {
         "target_diseases": ["脐尿管囊肿"],
         "findings": {
             "umbilical_discharge": 0.46,
+            "midline_suprapubic_pain": 0.34,
             "umbilical_mass": 0.36,
             "midline_suprapubic_cyst": 0.42,
+            "urachal_remnant_pattern": 0.58,
             "urachal_cyst_imaging": 0.56,
             "pelvic_pain": 0.10,
         },
@@ -823,7 +830,10 @@ class DiseaseCategoryClassifier:
 
     def classify(self, evidence: Optional[EvidenceBundle]) -> List[DiseaseCategoryAssessment]:
         observations = list((evidence or EvidenceBundle()).observations)
-        positives = [item for item in observations if item.polarity == "positive"]
+        positives = [
+            item for item in observations
+            if item.polarity == "positive" and not getattr(item, "shadowed_by", "")
+        ]
         findings = set(item.finding for item in positives)
         text = _combined_text(positives)
         age = _first_age(observations)
@@ -834,8 +844,9 @@ class DiseaseCategoryClassifier:
             links: List[str] = []
             terms_hit: List[str] = []
             for finding, weight in (rule.get("findings") or {}).items():
-                if finding in findings:
-                    score += float(weight)
+                finding_hits = [item for item in positives if item.finding == finding]
+                if finding_hits:
+                    score += float(weight) * max(_information_multiplier(item) for item in finding_hits)
                     links.append(finding)
             lower_text = text.lower()
             for term, weight in (rule.get("terms") or {}).items():
@@ -978,12 +989,14 @@ class DiseaseRetriever:
         for spec in entry.get("supporting_evidence", []) or []:
             hits = [
                 item for item in observations
-                if item.polarity == "positive" and _observation_matches(spec, item)
+                if item.polarity == "positive"
+                and not getattr(item, "shadowed_by", "")
+                and _observation_matches(spec, item)
             ]
             if not hits:
                 continue
             weight = float(spec.get("weight", 0.2) or 0.2)
-            confidence = max(item.confidence for item in hits)
+            confidence = max(item.confidence * _information_multiplier(item) for item in hits)
             score += weight * confidence
             links.extend(item.finding for item in hits)
         return min(0.78, score), list(dict.fromkeys(links))
@@ -1060,6 +1073,16 @@ def _first_age(observations: Sequence[Observation]) -> Optional[float]:
         if item.finding == "field:age" and item.value is not None:
             return item.value
     return None
+
+
+def _information_multiplier(item: Observation) -> float:
+    try:
+        value = float(getattr(item, "information_value", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value <= 0.0:
+        return 1.0
+    return max(0.35, min(1.45, 0.65 + value))
 
 
 def _max_category_confidence(category: str, categories: Sequence[DiseaseCategoryAssessment]) -> float:
