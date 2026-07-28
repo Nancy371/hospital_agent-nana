@@ -14,12 +14,28 @@ _NEGATION_RE = re.compile(
 )
 _UNCERTAINTY_RE = re.compile(r"(?:考虑|可能|疑似|不能除外|倾向|待排)" )
 _POSITIVE_RE = re.compile(r"(?:阳性|提示|符合|诊断为|检出|发现|可见|存在|增高|升高|降低|减低)" )
+_DIAGNOSIS_NEGATION_RE = re.compile(
+    r"(?:排除|除外|不支持|未提示|未见|未发现|无证据|证据不足|阴性)"
+)
+_DIAGNOSIS_NEGATION_GUARD_RE = re.compile(
+    r"(?:不能排除|不能除外|不排除|不除外|难以排除|尚不能排除|未能排除|待排|待除外|待鉴别|鉴别诊断|需要鉴别|需鉴别)"
+)
+_DIAGNOSIS_CLAUSE_SPLIT_RE = re.compile(r"[。；;！!？?\n]")
 _SEVERITY_TERMS = ("极重度", "重度", "中重度", "中度", "轻中度", "轻度", "显著")
 _ANATOMY_TERMS = (
     "左心房", "右心房", "左心室", "右心室", "二尖瓣", "三尖瓣", "肺动脉瓣",
     "主动脉瓣", "左肺", "右肺", "上肺", "下肺", "肾脏", "膀胱", "尿道",
     "肝脏", "胆囊", "胰腺", "脑", "视网膜", "脊柱", "关节",
 )
+
+_FINDING_DIAGNOSIS_NEGATION_LINKS: Dict[str, Tuple[str, ...]] = {
+    "低镁血症": (
+        "low_magnesium",
+        "low_urine_magnesium",
+        "magnesium_load_retention_high",
+        "magnesium_depletion",
+    ),
+}
 
 _INTERPRETER_RULES: Tuple[Dict[str, Any], ...] = (
     {
@@ -1298,6 +1314,7 @@ class ClinicalEvidenceNormalizer:
         self.diagnosis_aliases = self._load_diagnosis_aliases()
         self.interpreter = ClinicalEvidenceInterpreter()
         self.last_raw_case_audit: Dict[str, Any] = {}
+        self.last_suppressed_structured_findings: List[Dict[str, Any]] = []
 
     def normalize(
         self,
@@ -1310,6 +1327,7 @@ class ClinicalEvidenceNormalizer:
         exams = exam_results or {}
         raw_case = str(raw_case_text or "").strip() or _extract_raw_case_text(info)
         info = _without_raw_case_fields(info)
+        self.last_suppressed_structured_findings = []
         self.last_raw_case_audit = {
             "raw_case_text_supplied": bool(str(raw_case_text or "").strip()),
             "raw_case_blocked": False,
@@ -1690,8 +1708,7 @@ class ClinicalEvidenceNormalizer:
         direction: str,
         polarity: str,
     ) -> List[Observation]:
-        if polarity == "negative":
-            return []
+        negative_polarity = polarity == "negative"
         key = _normalize_term(path + " " + text)
         findings: List[Tuple[str, float]] = []
         if any(token in key for token in ("心率", "脉搏", "heartrate", "pulse", "hr")) and value is not None and value < 50:
@@ -1772,6 +1789,17 @@ class ClinicalEvidenceNormalizer:
             findings.append(("pulmonary_valve_gradient", 0.9))
         if not findings:
             return []
+        if negative_polarity:
+            self._suppress_findings_negated_in_source(source, path, text, findings)
+            return []
+        findings = self._suppress_findings_negated_in_source(
+            source,
+            path,
+            text,
+            findings,
+        )
+        if not findings:
+            return []
         deduped_findings = dict(findings)
         return [
             Observation(
@@ -1789,6 +1817,74 @@ class ClinicalEvidenceNormalizer:
             )
             for finding, confidence in deduped_findings.items()
         ]
+
+    def _suppress_findings_negated_in_source(
+        self,
+        source: str,
+        path: str,
+        text: str,
+        findings: Sequence[Tuple[str, float]],
+    ) -> List[Tuple[str, float]]:
+        finding_names = {finding for finding, _confidence in findings}
+        suppressed: set[str] = set()
+        for diagnosis, linked_findings in _FINDING_DIAGNOSIS_NEGATION_LINKS.items():
+            linked = set(linked_findings)
+            affected = sorted(finding_names & linked)
+            if not affected:
+                continue
+            clause = self._diagnosis_negation_clause(text, diagnosis)
+            if not clause:
+                continue
+            suppressed.update(affected)
+            for finding in affected:
+                self.last_suppressed_structured_findings.append(
+                    {
+                        "finding": finding,
+                        "affected_diagnosis": diagnosis,
+                        "source": source,
+                        "field_path": path,
+                        "source_text": str(text or "")[:500],
+                        "negation_text": clause[:500],
+                        "reason": "same_segment_diagnosis_negation",
+                    }
+                )
+        if not suppressed:
+            return list(findings)
+        return [
+            (finding, confidence)
+            for finding, confidence in findings
+            if finding not in suppressed
+        ]
+
+    def _diagnosis_negation_clause(self, text: str, diagnosis: str) -> str:
+        raw = " ".join(str(text or "").split())
+        if not raw:
+            return ""
+        aliases = self._diagnosis_aliases_for(diagnosis)
+        clauses = [
+            item.strip()
+            for item in _DIAGNOSIS_CLAUSE_SPLIT_RE.split(raw)
+            if item.strip()
+        ]
+        if raw not in clauses:
+            clauses.append(raw)
+        for clause in clauses:
+            if not any(_contains_alias(clause, alias) for alias in aliases):
+                continue
+            if _DIAGNOSIS_NEGATION_GUARD_RE.search(clause):
+                continue
+            if _DIAGNOSIS_NEGATION_RE.search(clause):
+                return clause
+        return ""
+
+    def _diagnosis_aliases_for(self, diagnosis: str) -> List[str]:
+        aliases = [str(diagnosis or "").strip()]
+        aliases.extend(
+            alias
+            for alias, target in self.diagnosis_aliases.items()
+            if target == diagnosis and str(alias or "").strip()
+        )
+        return list(dict.fromkeys(item for item in aliases if item))
 
     @staticmethod
     def _magnesium_numeric_findings(
@@ -1845,11 +1941,15 @@ class ClinicalEvidenceNormalizer:
                 weakness_term = any(
                     marker in term for marker in ("\u65e0\u529b", "\u4e4f\u529b")
                 )
+                if _DIAGNOSIS_NEGATION_GUARD_RE.search(clause):
+                    return "uncertain", 0.6
                 if _NEGATION_RE.search(clause) and not weakness_term:
                     return "negative", 0.94
                 if _UNCERTAINTY_RE.search(clause):
                     return "uncertain", 0.6
                 return "positive", 0.86 if _POSITIVE_RE.search(clause) else 0.78
+        if _DIAGNOSIS_NEGATION_GUARD_RE.search(target):
+            return "uncertain", 0.6
         if _NEGATION_RE.search(target):
             # A leaf is a narrow semantic field. A leading negative applies to
             # examples inside the same value, including "未见...(如 ASD)".
@@ -2417,6 +2517,9 @@ class HybridEvidenceCompiler:
             ],
             "blocked_reasoning_inferences": list(
                 self.reasoning_adapter.last_audit.get("blocked") or []
+            ),
+            "suppressed_structured_findings": list(
+                self.normalizer.last_suppressed_structured_findings
             ),
             "raw_case_audit": dict(self.normalizer.last_raw_case_audit),
         }

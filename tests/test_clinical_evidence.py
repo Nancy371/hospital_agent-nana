@@ -100,6 +100,47 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
         self.assertIn("magnesium_load_retention_high", bundle.findings("positive"))
         self.assertIn("magnesium_depletion", bundle.findings("positive"))
 
+    def test_magnesium_load_retention_negated_conclusion_suppresses_positive_findings(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "镁负荷试验": {
+                    "status": "abnormal",
+                    "result": {
+                        "镁负荷保留率": (
+                            "62%［参考范围：镁储备充足时通常＜20-30%］；"
+                            "结论：排除低镁血症。"
+                        ),
+                    },
+                }
+            },
+        )
+        self.assertNotIn("magnesium_load_retention_high", bundle.findings("positive"))
+        self.assertNotIn("magnesium_depletion", bundle.findings("positive"))
+        suppressed = self.normalizer.last_suppressed_structured_findings
+        self.assertTrue(suppressed)
+        self.assertEqual(suppressed[0]["affected_diagnosis"], "低镁血症")
+        self.assertEqual(suppressed[0]["reason"], "same_segment_diagnosis_negation")
+
+    def test_cannot_rule_out_low_magnesium_does_not_suppress_positive_findings(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "镁负荷试验": {
+                    "status": "abnormal",
+                    "result": {
+                        "镁负荷保留率": (
+                            "62%［参考范围：镁储备充足时通常＜20-30%］；"
+                            "结论：不能排除低镁血症。"
+                        ),
+                    },
+                }
+            },
+        )
+        self.assertIn("magnesium_load_retention_high", bundle.findings("positive"))
+        self.assertIn("magnesium_depletion", bundle.findings("positive"))
+        self.assertEqual(self.normalizer.last_suppressed_structured_findings, [])
+
     def test_reference_only_magnesium_range_has_no_numeric_disease_evidence(self):
         bundle = self.normalizer.normalize(
             {},

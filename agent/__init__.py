@@ -44,6 +44,8 @@ __all__ = [
     "MechanismReasoner",
     "MechanismHypothesis",
     "RetrievalView",
+    "RootCauseArbiter",
+    "RootCauseArbitrationResult",
     "ExternalMedicalKnowledgeRetriever",
     "ExternalMedicalResult",
     "ShadowReplay",
@@ -114,6 +116,9 @@ def __getattr__(name: str):
     if name in ("MechanismReasoner", "MechanismHypothesis", "RetrievalView"):
         from . import mechanism_reasoner as _mechanism_reasoner
         return getattr(_mechanism_reasoner, name)
+    if name in ("RootCauseArbiter", "RootCauseArbitrationResult"):
+        from . import root_cause_arbitration as _root_cause_arbitration
+        return getattr(_root_cause_arbitration, name)
     if name in ("ExternalMedicalKnowledgeRetriever", "ExternalMedicalResult"):
         from . import medical_retrieval as _medical_retrieval
         return getattr(_medical_retrieval, name)

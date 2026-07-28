@@ -26,6 +26,8 @@ PANCREATITIS = "\u80f0\u817a\u708e"
 URETHRAL_SYNDROME = "\u5c3f\u9053\u7efc\u5408\u5f81"
 AV_BLOCK_2 = "\u4e8c\u5ea6\u623f\u5ba4\u4f20\u5bfc\u963b\u6ede"
 ARRHYTHMIA = "\u5fc3\u5f8b\u5931\u5e38"
+LOW_MAGNESIUM = "\u4f4e\u9541\u8840\u75c7"
+RICKETS = "\u7ef4\u751f\u7d20D\u7f3a\u4e4f\u6027\u4f5d\u507b\u75c5"
 
 
 def load_config():
@@ -415,6 +417,309 @@ class DiagnosisJudgeTests(unittest.TestCase):
         decision = self.run_candidates([ohss, pancreatitis])
         self.assertEqual(decision.final_diagnoses, [PANCREATITIS])
         self.assertNotIn(OHSS, decision.required_gap_authorized_diagnoses)
+
+    def test_reasoning_structured_conflict_defers_primary_and_orders_adjudication(self):
+        low_magnesium = candidate(
+            LOW_MAGNESIUM,
+            0.72,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.90,
+            coverage=0.74,
+            residual=0.16,
+            core_coverage=0.78,
+            residual_core=0,
+            matched=[
+                "magnesium_load_retention_high",
+                "magnesium_depletion",
+                "muscle_cramp",
+            ],
+            core_score=0.70,
+            diagnostic_score=0.86,
+        )
+        conflict = {
+            "conflict_type": "reasoning_structured_polarity_conflict",
+            "affected_diagnosis": LOW_MAGNESIUM,
+            "finding": "magnesium_load_retention_high",
+            "reasoning_text": "镁负荷试验排除低镁血症",
+            "structured_sources": [{"source": "镁负荷试验"}],
+            "adjudication_exams": [
+                "血清电解质",
+                "24小时尿电解质检测",
+                "镁负荷试验",
+                "维生素D检测",
+                "甲状旁腺激素检测（PTH）",
+                "X线检查",
+            ],
+            "action": "defer_primary_and_order_discriminating_exams",
+            "status": "unresolved",
+        }
+        low_magnesium.evidence_conflicts = [conflict]
+        low_magnesium.unresolved_evidence_conflict = True
+        low_magnesium.conflict_adjudication_exams = list(conflict["adjudication_exams"])
+        rickets = candidate(
+            RICKETS,
+            0.60,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.92,
+            coverage=0.64,
+            residual=0.24,
+            core_coverage=0.68,
+            residual_core=0,
+            matched=["vitamin_d_low", "bone_deformity", "waddling_gait"],
+            core_score=0.66,
+            diagnostic_score=0.32,
+        )
+        decision = self.run_candidates([low_magnesium, rickets])
+        payload = decision.judge_decision
+        self.assertEqual(payload["primary_status"], "deferred")
+        self.assertTrue(payload["needs_discriminating_exams"])
+        self.assertIn(LOW_MAGNESIUM, payload["conflict_affected_diagnoses"])
+        self.assertIn(RICKETS, payload["differential_candidates"])
+        tasks = payload["discriminating_exam_tasks"]
+        self.assertTrue(
+            any(item.get("exam_source") == "conflict_adjudication_exam" for item in tasks)
+        )
+        exams = [item["exam"] for item in tasks]
+        self.assertIn("血清电解质", exams)
+        self.assertNotIn(LOW_MAGNESIUM, decision.final_diagnoses)
+        self.assertTrue(
+            any(
+                item.get("diagnosis") == LOW_MAGNESIUM
+                and item.get("reason") == "unresolved reasoning-structured evidence conflict"
+                for item in decision.blocked_diagnoses
+            )
+        )
+
+    def test_final_gate_blocks_conflict_candidate_but_keeps_clean_alternative(self):
+        low_magnesium = candidate(
+            LOW_MAGNESIUM,
+            0.72,
+            required=True,
+            matched=["magnesium_load_retention_high", "magnesium_depletion"],
+            diagnostic_score=0.86,
+        )
+        low_magnesium.unresolved_evidence_conflict = True
+        low_magnesium.evidence_conflicts = [
+            {
+                "conflict_type": "reasoning_structured_polarity_conflict",
+                "affected_diagnosis": LOW_MAGNESIUM,
+                "finding": "magnesium_depletion",
+                "status": "unresolved",
+            }
+        ]
+        rickets = candidate(
+            RICKETS,
+            0.66,
+            required=True,
+            matched=["vitamin_d_low", "bone_deformity"],
+            core_score=0.62,
+            diagnostic_score=0.30,
+        )
+        decision = DiagnosisDecision(
+            final_diagnoses=[LOW_MAGNESIUM, RICKETS],
+            trusted_diagnoses=[LOW_MAGNESIUM, RICKETS],
+            candidates=[low_magnesium, rickets],
+            unexplained_evidence=[],
+            confidence=0.0,
+            margin=0.0,
+            low_confidence=False,
+        )
+        self.engine.authorize_final_diagnoses(
+            decision,
+            [LOW_MAGNESIUM, RICKETS],
+        )
+        self.assertEqual(decision.final_diagnoses, [RICKETS])
+        self.assertTrue(
+            any(
+                item.get("diagnosis") == LOW_MAGNESIUM
+                and item.get("reason") == "unresolved reasoning-structured evidence conflict"
+                for item in decision.blocked_diagnoses
+            )
+        )
+
+    def test_root_cause_arbitration_promotes_metabolic_bone_cause(self):
+        low_magnesium = candidate(
+            LOW_MAGNESIUM,
+            0.78,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.90,
+            coverage=0.82,
+            residual=0.12,
+            core_coverage=0.82,
+            residual_core=0,
+            matched=[
+                "magnesium_load_retention_high",
+                "magnesium_depletion",
+                "muscle_cramp",
+            ],
+            core_score=0.68,
+            diagnostic_score=0.86,
+        )
+        rickets = candidate(
+            RICKETS,
+            0.62,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.92,
+            coverage=0.70,
+            residual=0.22,
+            core_coverage=0.70,
+            residual_core=0,
+            matched=[
+                "vitamin_d_low",
+                "hypocalcemia",
+                "alp_elevated",
+                "bone_deformity",
+                "waddling_gait",
+            ],
+            core_score=0.70,
+            diagnostic_score=0.30,
+        )
+        decision = self.run_candidates([low_magnesium, rickets])
+        payload = decision.judge_decision
+        root_payload = payload["root_cause_arbitration"]
+        self.assertTrue(root_payload["applied"])
+        self.assertTrue(root_payload["primary_override"])
+        self.assertEqual(decision.final_diagnoses, [RICKETS])
+        self.assertEqual(payload["primary"], RICKETS)
+        self.assertEqual(payload["root_cause_primary"], RICKETS)
+        self.assertIn(LOW_MAGNESIUM, payload["root_cause_secondary"])
+        self.assertEqual(low_magnesium.explained_by_root_cause, RICKETS)
+        self.assertEqual(low_magnesium.root_cause_role, "secondary")
+        self.assertFalse(low_magnesium.root_cause_submit_as_final)
+
+    def test_root_cause_arbitration_does_not_move_pure_low_magnesium(self):
+        low_magnesium = candidate(
+            LOW_MAGNESIUM,
+            0.78,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.90,
+            coverage=0.82,
+            residual=0.12,
+            core_coverage=0.82,
+            residual_core=0,
+            matched=[
+                "magnesium_load_retention_high",
+                "magnesium_depletion",
+            ],
+            core_score=0.68,
+            diagnostic_score=0.86,
+        )
+        decision = self.run_candidates([low_magnesium])
+        self.assertEqual(decision.final_diagnoses, [LOW_MAGNESIUM])
+        self.assertFalse(decision.judge_decision["root_cause_arbitration"]["applied"])
+        self.assertEqual(low_magnesium.root_cause_role, "")
+
+    def test_root_cause_arbitration_can_authorize_mechanism_gap(self):
+        low_magnesium = candidate(
+            LOW_MAGNESIUM,
+            0.67,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.90,
+            coverage=0.35,
+            residual=0.65,
+            core_coverage=0.40,
+            residual_core=3,
+            matched=["magnesium_load_retention_high", "magnesium_depletion"],
+            diagnostic_score=1.0,
+        )
+        rickets = candidate(
+            RICKETS,
+            0.89,
+            required=False,
+            diagnosis_type="metabolic",
+            specificity=0.92,
+            coverage=0.52,
+            residual=0.48,
+            core_coverage=0.40,
+            residual_core=3,
+            matched=[
+                "symptom:腿痛",
+                "symptom:间歇性跛行",
+                "alp_elevated",
+                "hypocalcemia",
+            ],
+            diagnostic_score=1.0,
+        )
+        rickets.required_gaps = ["vitamin_d_low|bone_deformity"]
+        rickets.required_gap_state = "actionable_gap"
+        rickets.component_scores["required_gap_state"] = "actionable_gap"
+        decision = self.run_candidates([low_magnesium, rickets])
+        payload = decision.judge_decision
+        self.assertEqual(decision.final_diagnoses, [RICKETS])
+        self.assertIn(RICKETS, decision.required_gap_authorized_diagnoses)
+        self.assertTrue(payload["root_cause_arbitration"]["applied"])
+        self.assertTrue(payload["root_cause_arbitration"]["primary_override"])
+
+    def test_root_cause_arbitration_respects_upstream_contradiction(self):
+        low_magnesium = candidate(
+            LOW_MAGNESIUM,
+            0.78,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.90,
+            coverage=0.82,
+            residual=0.12,
+            core_coverage=0.82,
+            residual_core=0,
+            matched=["magnesium_load_retention_high", "magnesium_depletion"],
+            core_score=0.68,
+            diagnostic_score=0.86,
+        )
+        rickets = candidate(
+            RICKETS,
+            0.66,
+            required=True,
+            diagnosis_type="metabolic",
+            coverage=0.76,
+            residual=0.18,
+            core_coverage=0.76,
+            matched=["vitamin_d_low", "hypocalcemia", "bone_deformity"],
+            core_score=0.72,
+            diagnostic_score=0.30,
+        )
+        rickets.hard_contradiction = True
+        decision = self.run_candidates([low_magnesium, rickets])
+        self.assertEqual(decision.final_diagnoses, [LOW_MAGNESIUM])
+        self.assertFalse(decision.judge_decision["root_cause_arbitration"]["applied"])
+
+    def test_root_cause_arbitration_uses_generic_structural_relation(self):
+        heart_failure = candidate(
+            HEART_FAILURE,
+            0.78,
+            required=True,
+            diagnosis_type="state",
+            specificity=0.72,
+            coverage=0.82,
+            residual=0.12,
+            core_coverage=0.82,
+            matched=["heart_failure_state", "fluid_retention_pattern"],
+            core_score=0.56,
+            diagnostic_score=0.0,
+        )
+        pulmonary_stenosis = candidate(
+            PULMONARY_STENOSIS,
+            0.60,
+            required=True,
+            diagnosis_type="structural",
+            specificity=0.92,
+            coverage=0.62,
+            residual=0.28,
+            core_coverage=0.62,
+            matched=["pulmonary_valve_stenosis", "valve_gradient_high"],
+            core_score=0.62,
+            diagnostic_score=0.40,
+        )
+        decision = self.run_candidates([heart_failure, pulmonary_stenosis])
+        self.assertEqual(decision.final_diagnoses[:2], [PULMONARY_STENOSIS, HEART_FAILURE])
+        self.assertTrue(decision.judge_decision["root_cause_arbitration"]["applied"])
+        self.assertEqual(heart_failure.explained_by_root_cause, PULMONARY_STENOSIS)
+        self.assertTrue(heart_failure.root_cause_submit_as_final)
 
     def test_direct_congenital_parent_beats_gap_child_even_without_parent_field(self):
         pulmonary = candidate(

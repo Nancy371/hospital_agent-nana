@@ -141,6 +141,17 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "blocked_reasoning_inference_count": metric(
             "blocked_reasoning_inference_count"
         ),
+        "reasoning_structured_conflict_count": metric(
+            "reasoning_structured_conflict_count"
+        ),
+        "conflict_deferred_primary_count": metric("conflict_deferred_primary_count"),
+        "conflict_blocked_final_count": metric("conflict_blocked_final_count"),
+        "root_cause_arbitration_count": metric("root_cause_arbitration_count"),
+        "root_cause_primary_override_count": metric("root_cause_primary_override_count"),
+        "root_cause_secondary_submission_count": metric(
+            "root_cause_secondary_submission_count"
+        ),
+        "root_cause_coverage": metric("root_cause_coverage"),
         "generic_only_candidate_count": metric("generic_only_candidate_count"),
         "evidence_information_value_mean": metric("evidence_information_value_mean"),
         "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,

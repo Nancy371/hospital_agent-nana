@@ -1833,8 +1833,58 @@ class MyDoctorAgent(BaseDoctorAgent):
             decision.get("required_gap_authorized_diagnoses")
         )
         judge_payload = decision.get("judge_decision") or {}
+        decision_conflicts = list(
+            decision.get("evidence_conflicts")
+            or judge_payload.get("evidence_conflicts")
+            or []
+        )
+        blocked_records = list(decision.get("blocked_diagnoses") or [])
+        reasoning_structured_conflict_count = sum(
+            1
+            for item in decision_conflicts
+            if isinstance(item, dict)
+            and str(item.get("conflict_type") or "")
+            == "reasoning_structured_polarity_conflict"
+        )
+        conflict_deferred_primary_count = int(
+            bool(
+                reasoning_structured_conflict_count
+                and str(judge_payload.get("primary_status") or "") == "deferred"
+                and judge_payload.get("needs_discriminating_exams")
+            )
+        )
+        conflict_blocked_final_count = sum(
+            1
+            for item in blocked_records
+            if isinstance(item, dict)
+            and str(item.get("reason") or "")
+            == "unresolved reasoning-structured evidence conflict"
+        )
         pairwise_comparisons = list(judge_payload.get("pairwise_comparisons") or [])
         pool_filter_summary = dict(judge_payload.get("pool_filter_summary") or {})
+        root_cause_payload = dict(
+            decision.get("root_cause_arbitration")
+            or judge_payload.get("root_cause_arbitration")
+            or {}
+        )
+        root_cause_secondary = _names(
+            root_cause_payload.get("root_cause_secondary")
+            or judge_payload.get("root_cause_secondary")
+            or []
+        )
+        root_cause_arbitration_count = int(bool(root_cause_payload.get("applied")))
+        root_cause_primary_override_count = int(
+            bool(root_cause_payload.get("primary_override"))
+        )
+        root_cause_secondary_submission_count = len(
+            [name for name in root_cause_secondary if name in set(submitter_final)]
+        )
+        try:
+            root_cause_coverage = float(
+                root_cause_payload.get("root_cause_coverage", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            root_cause_coverage = 0.0
         differential_candidates = _names(judge_payload.get("differential_candidates"))
         discriminating_exams = _names(judge_payload.get("discriminating_exams"))
         discriminating_findings = _names(judge_payload.get("discriminating_findings"))
@@ -2384,6 +2434,13 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "generic_only_candidate_count": pool_filter_summary.get(
                     "generic_only_candidate_count"
                 ),
+                "reasoning_structured_conflict_count": reasoning_structured_conflict_count,
+                "conflict_deferred_primary_count": conflict_deferred_primary_count,
+                "conflict_blocked_final_count": conflict_blocked_final_count,
+                "root_cause_arbitration_count": root_cause_arbitration_count,
+                "root_cause_primary_override_count": root_cause_primary_override_count,
+                "root_cause_secondary_submission_count": root_cause_secondary_submission_count,
+                "root_cause_coverage": root_cause_coverage,
             },
             "top_candidates": top_twenty,
             "retriever_top1": retriever_top1,
@@ -2392,7 +2449,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             "submitter_final": submitter_final,
             "required_gap_authorized_diagnoses": required_gap_authorized_diagnoses,
             "authorized_diagnoses": authorized,
-            "blocked_diagnoses": list(decision.get("blocked_diagnoses") or [])
+            "blocked_diagnoses": blocked_records
             if isinstance(decision, dict)
             else [],
             "audit": {
@@ -2453,6 +2510,18 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "residual_core_evidence_count": residual_core_evidence_count,
                 "high_value_gap_candidates": _names(
                     judge_payload.get("high_value_gap_candidates")
+                ),
+                "root_cause_arbitration": root_cause_payload,
+                "root_cause_primary": str(
+                    root_cause_payload.get("root_cause_primary")
+                    or judge_payload.get("root_cause_primary")
+                    or ""
+                ),
+                "root_cause_secondary": root_cause_secondary,
+                "candidate_explanation_edges": list(
+                    root_cause_payload.get("candidate_explanation_edges")
+                    or judge_payload.get("candidate_explanation_edges")
+                    or []
                 ),
             },
             "evaluation_error": evaluation_error,

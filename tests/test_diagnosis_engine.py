@@ -141,6 +141,38 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertTrue(low_mag.required_met)
         self.assertEqual(decision.final_diagnoses[0], "低镁血症")
 
+    def test_reasoning_exclusion_conflict_defers_and_blocks_low_magnesium_final(self):
+        evidence, decision = self.decide(
+            {"symptoms": ["腹泻", "手足抽筋", "心悸"]},
+            {
+                "镁负荷试验": {
+                    "status": "abnormal",
+                    "result": {
+                        "镁负荷保留率": "62%［参考范围：镁储备充足时通常＜20-30%］",
+                    },
+                },
+            },
+            llm={
+                "diagnosis_candidates": [
+                    {"name": "低镁血症", "confidence": 0.88},
+                ],
+                "reasoning": "镁负荷试验排除低镁血症，暂考虑其他代谢性疾病。",
+            },
+        )
+        self.assertIn("magnesium_load_retention_high", evidence.findings("positive"))
+        low_mag = next(item for item in decision.candidates if item.diagnosis == "低镁血症")
+        self.assertTrue(low_mag.unresolved_evidence_conflict)
+        self.assertTrue(decision.evidence_conflicts)
+        self.assertEqual(decision.judge_decision["primary_status"], "deferred")
+        self.assertNotIn("低镁血症", decision.final_diagnoses)
+        self.assertTrue(
+            any(
+                item.get("diagnosis") == "低镁血症"
+                and item.get("reason") == "unresolved reasoning-structured evidence conflict"
+                for item in decision.blocked_diagnoses
+            )
+        )
+
     def test_unmet_etiology_candidate_uses_gap_state_not_required_gate(self):
         _, decision = self.decide(
             {"symptoms": ["腹泻", "手足抽筋", "心悸"]},

@@ -11,7 +11,9 @@ from .candidate_generator import CandidateGenerator, CandidatePool
 from .clinical_evidence import EvidenceBundle, Observation
 from .diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter
 from .diagnosis_resolver import DiagnosisResolution, OpenWorldDiagnosisResolver
+from .evidence_conflicts import EvidenceConflictArbiter
 from .mechanism_reasoner import MechanismReasoner
+from .root_cause_arbitration import RootCauseArbiter
 
 
 _SECONDARY_MANIFESTATION_DIAGNOSES = {
@@ -192,6 +194,14 @@ class CandidateScore:
     generic_coverage_score: float = 0.0
     core_evidence_score: float = 0.0
     diagnostic_evidence_score: float = 0.0
+    evidence_conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    unresolved_evidence_conflict: bool = False
+    conflict_adjudication_exams: List[str] = field(default_factory=list)
+    root_cause_coverage: float = 0.0
+    explains_candidates: List[str] = field(default_factory=list)
+    explained_by_root_cause: str = ""
+    root_cause_role: str = ""
+    root_cause_submit_as_final: bool = False
 
     @property
     def trusted(self) -> bool:
@@ -231,6 +241,12 @@ class DiagnosisDecision:
     open_world_candidates: List[Dict[str, Any]] = field(default_factory=list)
     mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
     retrieval_views: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    conflict_affected_diagnoses: List[str] = field(default_factory=list)
+    root_cause_arbitration: Dict[str, Any] = field(default_factory=dict)
+    root_cause_primary: str = ""
+    root_cause_secondary: List[str] = field(default_factory=list)
+    candidate_explanation_edges: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -260,6 +276,12 @@ class DiagnosisDecision:
             "open_world_candidates": list(self.open_world_candidates),
             "mechanism_hypotheses": list(self.mechanism_hypotheses),
             "retrieval_views": list(self.retrieval_views),
+            "evidence_conflicts": list(self.evidence_conflicts),
+            "conflict_affected_diagnoses": list(self.conflict_affected_diagnoses),
+            "root_cause_arbitration": dict(self.root_cause_arbitration),
+            "root_cause_primary": self.root_cause_primary,
+            "root_cause_secondary": list(self.root_cause_secondary),
+            "candidate_explanation_edges": list(self.candidate_explanation_edges),
         }
 
 
@@ -609,6 +631,8 @@ class DiagnosisDecisionEngine:
         self.mechanism_reasoner = MechanismReasoner()
         self.judge = DiagnosisJudge(config=config, knowledge=self.knowledge)
         self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
+        self.conflict_arbiter = EvidenceConflictArbiter(self.knowledge)
+        self.root_cause_arbiter = RootCauseArbiter(self.knowledge, ref_dir=ref_dir)
 
     @staticmethod
     def _load_weights(configured: Dict[str, Any]) -> Dict[str, float]:
@@ -650,12 +674,13 @@ class DiagnosisDecisionEngine:
             rag_chunks=rag_chunks or [],
             evidence=evidence,
         )
-        return self.rank(candidate_pool, evidence)
+        return self.rank(candidate_pool, evidence, llm_result=llm_result or {})
 
     def rank(
         self,
         candidate_pool: CandidatePool,
         evidence: EvidenceBundle,
+        llm_result: Optional[Dict[str, Any]] = None,
     ) -> DiagnosisDecision:
         priors = candidate_pool.priors()
         sources_by_name = candidate_pool.sources_by_name()
@@ -677,6 +702,12 @@ class DiagnosisDecisionEngine:
         self._apply_competitive_specificity(scores)
         scores = self._sort_candidates(scores)
         self._clear_submission_marks(scores)
+        evidence_conflicts = self.conflict_arbiter.detect(
+            llm_result or {},
+            evidence,
+            scores,
+        )
+        self._apply_evidence_conflicts(scores, evidence_conflicts)
 
         trusted_pool = [
             item for item in scores
@@ -742,9 +773,38 @@ class DiagnosisDecisionEngine:
             open_world_candidates=open_world_candidates,
             mechanism_hypotheses=mechanism_hypotheses,
             retrieval_views=retrieval_views,
+            evidence_conflicts=evidence_conflicts,
+            conflict_affected_diagnoses=[
+                str(item.get("affected_diagnosis") or "")
+                for item in evidence_conflicts
+                if str(item.get("affected_diagnosis") or "")
+            ],
         )
         self.judge_and_submit(decision)
         return decision
+
+    @staticmethod
+    def _apply_evidence_conflicts(
+        scores: Sequence[CandidateScore],
+        evidence_conflicts: Sequence[Dict[str, Any]],
+    ) -> None:
+        if not evidence_conflicts:
+            return
+        by_name = {item.diagnosis: item for item in scores}
+        for conflict in evidence_conflicts:
+            diagnosis = str(conflict.get("affected_diagnosis") or "").strip()
+            candidate = by_name.get(diagnosis)
+            if candidate is None:
+                continue
+            candidate.evidence_conflicts.append(dict(conflict))
+            if str(conflict.get("status") or "unresolved") != "resolved":
+                candidate.unresolved_evidence_conflict = True
+            exams = list(candidate.conflict_adjudication_exams)
+            for exam in conflict.get("adjudication_exams") or []:
+                text = str(exam or "").strip()
+                if text and text not in exams:
+                    exams.append(text)
+            candidate.conflict_adjudication_exams = exams
 
     def judge_and_submit(self, decision: DiagnosisDecision) -> DiagnosisDecision:
         """Run the replayable judge and submitter over an existing decision."""
@@ -753,6 +813,17 @@ class DiagnosisDecisionEngine:
         judge_decision = self.judge.judge(
             decision.candidates,
             preselected=decision.final_diagnoses,
+            max_final_diagnoses=self.max_final_diagnoses,
+        )
+        root_cause = self.root_cause_arbiter.arbitrate(
+            judge_decision,
+            decision.candidates,
+            mechanism_hypotheses=decision.mechanism_hypotheses,
+            max_final_diagnoses=self.max_final_diagnoses,
+        )
+        self.root_cause_arbiter.apply_to_judge_decision(
+            judge_decision,
+            root_cause,
             max_final_diagnoses=self.max_final_diagnoses,
         )
         self.submitter.apply(decision, judge_decision)
@@ -922,6 +993,8 @@ class DiagnosisDecisionEngine:
             return candidate.differential_only_reason or "differential only"
         if candidate.hard_contradiction:
             return "hard contradiction present"
+        if getattr(candidate, "unresolved_evidence_conflict", False):
+            return "unresolved reasoning-structured evidence conflict"
         gap_authorized = bool(getattr(candidate, "required_gap_authorized", False))
         if candidate.required_gaps and not self._gap_candidate_has_submission_evidence(candidate):
             return "required evidence gap lacks objective confirmation"
@@ -960,6 +1033,12 @@ class DiagnosisDecisionEngine:
     ) -> str:
         if candidate.hard_contradiction:
             return "secondary diagnosis has hard contradiction"
+        if getattr(candidate, "explained_by_root_cause", "") == primary.diagnosis:
+            if not bool(getattr(candidate, "root_cause_submit_as_final", False)):
+                return "root-cause downstream diagnosis retained for audit only"
+            if self._has_authorized_independent_objective_evidence(candidate):
+                return ""
+            return "root-cause downstream diagnosis lacks independent objective evidence"
         if self._is_generic_parent_of_selected(candidate, selected):
             return "generic parent suppressed by a more specific primary diagnosis"
         if self._is_suppressed_by_selected(candidate, selected):
@@ -1039,6 +1118,11 @@ class DiagnosisDecisionEngine:
     ) -> bool:
         if f"diagnosis:{candidate.diagnosis}" in set(candidate.matched_evidence or []):
             return True
+        if (
+            getattr(candidate, "root_cause_role", "") == "secondary"
+            and getattr(candidate, "explained_by_root_cause", "")
+        ):
+            return bool(getattr(candidate, "root_cause_submit_as_final", False))
         return self._has_independent_state_evidence(candidate) or bool(
             candidate.component_scores.get("objective_evidence", 0.0) >= 1.0
         )
@@ -1144,6 +1228,30 @@ class DiagnosisDecisionEngine:
                     ),
                     "hard_contradicted_evidence": list(
                         candidate.hard_contradicted_evidence[:6]
+                    ),
+                    "evidence_conflicts": list(
+                        getattr(candidate, "evidence_conflicts", []) or []
+                    ),
+                    "unresolved_evidence_conflict": bool(
+                        getattr(candidate, "unresolved_evidence_conflict", False)
+                    ),
+                    "conflict_adjudication_exams": list(
+                        getattr(candidate, "conflict_adjudication_exams", []) or []
+                    ),
+                    "root_cause_role": str(
+                        getattr(candidate, "root_cause_role", "") or ""
+                    ),
+                    "explained_by_root_cause": str(
+                        getattr(candidate, "explained_by_root_cause", "") or ""
+                    ),
+                    "root_cause_submit_as_final": bool(
+                        getattr(candidate, "root_cause_submit_as_final", False)
+                    ),
+                    "explains_candidates": list(
+                        getattr(candidate, "explains_candidates", []) or []
+                    ),
+                    "root_cause_coverage": float(
+                        getattr(candidate, "root_cause_coverage", 0.0) or 0.0
                     ),
                 }
             )

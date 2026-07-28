@@ -378,6 +378,15 @@ class JudgeDecision:
     gap_state_distribution: Dict[str, int] = field(default_factory=dict)
     primary_unlock_reason: str = ""
     explanation_score_changed_ranking: bool = False
+    evidence_conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    conflict_affected_diagnoses: List[str] = field(default_factory=list)
+    root_cause_arbitration: Dict[str, Any] = field(default_factory=dict)
+    root_cause_primary: str = ""
+    root_cause_secondary: List[str] = field(default_factory=list)
+    root_cause_primary_override: bool = False
+    root_cause_coverage: float = 0.0
+    candidate_explanation_edges: List[Dict[str, Any]] = field(default_factory=list)
+    primary_override_source: str = ""
     reasoning: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -409,8 +418,14 @@ class DifferentialPoolFilter:
         self,
         pool: Sequence[Any],
         source_by_name: Optional[Dict[str, str]] = None,
+        force_names: Optional[Sequence[str]] = None,
     ) -> DifferentialPoolFilterResult:
         source_by_name = dict(source_by_name or {})
+        force_names = {
+            str(item or "").strip()
+            for item in (force_names or [])
+            if str(item or "").strip()
+        }
         candidates = [item for item in pool or [] if item]
         result = DifferentialPoolFilterResult()
         if not candidates:
@@ -435,6 +450,10 @@ class DifferentialPoolFilter:
         excluded: List[Dict[str, Any]] = []
         for index, candidate in enumerate(candidates):
             name = self._name(candidate)
+            if name in force_names and not getattr(candidate, "hard_contradiction", False):
+                retained.append(candidate)
+                result.pool_filter_reasons[name] = "forced_conflict_or_top_candidate"
+                continue
             reason = self._keep_reason(
                 candidate,
                 index,
@@ -467,7 +486,12 @@ class DifferentialPoolFilter:
             retained = [candidates[0]]
             result.pool_filter_reasons[self._name(candidates[0])] = "fallback_top_candidate"
 
-        retained = self._limit_pool(retained, relevance, candidates)
+        retained = self._limit_pool(
+            retained,
+            relevance,
+            candidates,
+            force_names=force_names,
+        )
         retained_names = {self._name(item) for item in retained}
         for candidate in candidates:
             name = self._name(candidate)
@@ -726,7 +750,9 @@ class DifferentialPoolFilter:
         retained: Sequence[Any],
         relevance: Dict[str, Dict[str, Any]],
         original: Sequence[Any],
+        force_names: Optional[set[str]] = None,
     ) -> List[Any]:
+        force_names = set(force_names or set())
         limit = int(
             getattr(self.judge, "filtered_pool_max_size", 0)
             or max(self.judge.differential_top_k, 6)
@@ -747,7 +773,22 @@ class DifferentialPoolFilter:
                 -index,
             )
 
-        selected = sorted(retained, key=key, reverse=True)[:limit]
+        forced = [
+            item
+            for item in retained
+            if self._name(item) in force_names
+            and not getattr(item, "hard_contradiction", False)
+        ]
+        forced_ids = {id(item) for item in forced}
+        remaining_limit = max(0, limit - len(forced))
+        selected = forced + [
+            item
+            for item in sorted(
+                [item for item in retained if id(item) not in forced_ids],
+                key=key,
+                reverse=True,
+            )[:remaining_limit]
+        ]
         selected_ids = {id(item) for item in selected}
         return [item for item in original if id(item) in selected_ids]
 
@@ -1188,9 +1229,28 @@ class DiagnosisJudge:
             decision.reasoning = "Judge found no supported candidate."
             return decision
 
+        evidence_conflicts = self._collect_evidence_conflicts(ranked)
+        conflict_affected_diagnoses = self._conflict_affected_diagnoses(
+            evidence_conflicts
+        )
+        force_names = self._forced_pool_names_for_conflicts(
+            ranked,
+            conflict_affected_diagnoses,
+        )
         raw_differential_pool = self._differential_pool(ranked)
+        raw_differential_pool = self._extend_forced_pool(
+            raw_differential_pool,
+            ranked,
+            force_names,
+        )
         raw_pool_source = self._differential_pool_source(raw_differential_pool)
-        pool_filter = self.pool_filter.filter(raw_differential_pool, raw_pool_source)
+        for name in force_names:
+            raw_pool_source.setdefault(name, "forced_conflict_or_top_candidate")
+        pool_filter = self.pool_filter.filter(
+            raw_differential_pool,
+            raw_pool_source,
+            force_names=force_names,
+        )
         differential_pool = pool_filter.candidates or raw_differential_pool
         allowed_pairs = self.pool_filter.allowed_pair_names(pool_filter)
         pairwise = self._pairwise_comparisons(differential_pool, allowed_pairs)
@@ -1198,8 +1258,15 @@ class DiagnosisJudge:
         discriminating_findings = self._discriminating_findings(
             differential_pool, required_gap_by_candidate
         )
-        discriminating_exam_tasks = self._discriminating_exam_tasks(
+        base_discriminating_exam_tasks = self._discriminating_exam_tasks(
             differential_pool, pairwise, discriminating_findings
+        )
+        conflict_exam_tasks = self._conflict_adjudication_exam_tasks(
+            differential_pool
+        )
+        discriminating_exam_tasks = self._merge_discriminating_exam_tasks(
+            conflict_exam_tasks,
+            base_discriminating_exam_tasks,
         )
         discriminating_exams = [
             str(task.get("exam") or "").strip()
@@ -1300,6 +1367,8 @@ class DiagnosisJudge:
         decision.discriminating_exam_tasks = discriminating_exam_tasks
         decision.required_gap_by_candidate = required_gap_by_candidate
         decision.differential_pool_source = dict(pool_filter.pool_source)
+        decision.evidence_conflicts = evidence_conflicts
+        decision.conflict_affected_diagnoses = conflict_affected_diagnoses
         decision.dynamic_rerank_trace = [
             {
                 "stage": "initial_judge",
@@ -1307,6 +1376,8 @@ class DiagnosisJudge:
                 "primary_status": primary_status,
                 "needs_discriminating_exams": needs_discriminating,
                 "defer_reason": defer_reason,
+                "evidence_conflicts": list(evidence_conflicts),
+                "conflict_affected_diagnoses": list(conflict_affected_diagnoses),
                 "required_gap_state": gap_state_by_candidate.get(primary.diagnosis, ""),
                 "gap_state_distribution": dict(gap_state_distribution),
                 "primary_unlock_reason": decision.primary_unlock_reason,
@@ -1343,6 +1414,8 @@ class DiagnosisJudge:
             and decision.retriever_top1 != decision.judge_primary
         )
         decision.reasoning = self._reasoning(decision)
+        decision.evidence_conflicts = evidence_conflicts
+        decision.conflict_affected_diagnoses = conflict_affected_diagnoses
         return decision
 
     def _differential_pool(self, ranked: Sequence[Any]) -> List[Any]:
@@ -1400,6 +1473,110 @@ class DiagnosisJudge:
             result[item.diagnosis] = (
                 "top_k" if index < self.differential_top_k else "top20_priority_tail"
             )
+        return result
+
+    @staticmethod
+    def _collect_evidence_conflicts(ranked: Sequence[Any]) -> List[Dict[str, Any]]:
+        conflicts: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in ranked or []:
+            for conflict in getattr(candidate, "evidence_conflicts", []) or []:
+                if not isinstance(conflict, dict):
+                    continue
+                diagnosis = str(
+                    conflict.get("affected_diagnosis")
+                    or getattr(candidate, "diagnosis", "")
+                    or ""
+                )
+                finding = str(conflict.get("finding") or "")
+                key = (diagnosis, finding)
+                if key in seen:
+                    continue
+                seen.add(key)
+                conflicts.append(dict(conflict))
+        return conflicts
+
+    @staticmethod
+    def _conflict_affected_diagnoses(
+        evidence_conflicts: Sequence[Dict[str, Any]],
+    ) -> List[str]:
+        return list(
+            dict.fromkeys(
+                str(item.get("affected_diagnosis") or "").strip()
+                for item in evidence_conflicts or []
+                if str(item.get("affected_diagnosis") or "").strip()
+            )
+        )
+
+    def _forced_pool_names_for_conflicts(
+        self,
+        ranked: Sequence[Any],
+        conflict_affected_diagnoses: Sequence[str],
+    ) -> List[str]:
+        names: List[str] = []
+
+        def add(name: str) -> None:
+            text = str(name or "").strip()
+            if text and text not in names:
+                names.append(text)
+
+        if ranked:
+            add(str(getattr(ranked[0], "diagnosis", "") or ""))
+        affected = set(conflict_affected_diagnoses or [])
+        if not affected:
+            return []
+        for item in ranked:
+            name = str(getattr(item, "diagnosis", "") or "")
+            if name in affected:
+                add(name)
+
+        conflict_candidates = [
+            item
+            for item in ranked
+            if str(getattr(item, "diagnosis", "") or "") in affected
+        ]
+        if not conflict_candidates:
+            return names
+        conflict_score = max(self._judge_score(item) for item in conflict_candidates)
+        for index, item in enumerate(ranked[: self.top_k]):
+            if not item or getattr(item, "hard_contradiction", False):
+                continue
+            name = str(getattr(item, "diagnosis", "") or "")
+            if name in names:
+                continue
+            high_value = (
+                index < max(3, self.differential_top_k)
+                or self._priority(item)
+                or self._systemic_primary(item)
+                or self._core_or_diagnostic_signal(item)
+                or float(getattr(item, "specificity", 0.0) or 0.0) >= 0.85
+            )
+            if index < max(3, self.differential_top_k) and high_value:
+                add(name)
+                continue
+            if high_value and self._judge_score(item) >= conflict_score - 0.26:
+                add(name)
+        return names[:8]
+
+    @staticmethod
+    def _extend_forced_pool(
+        pool: Sequence[Any],
+        ranked: Sequence[Any],
+        force_names: Sequence[str],
+    ) -> List[Any]:
+        result: List[Any] = []
+        seen_names: set[str] = set()
+        for item in pool or []:
+            name = str(getattr(item, "diagnosis", "") or "")
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            result.append(item)
+        for item in ranked or []:
+            name = str(getattr(item, "diagnosis", "") or "")
+            if name in force_names and name not in seen_names:
+                seen_names.add(name)
+                result.append(item)
         return result
 
     def _pairwise_comparisons(
@@ -1505,6 +1682,9 @@ class DiagnosisJudge:
         pairwise: Sequence[Dict[str, Any]],
         discriminating_exams: Sequence[str],
     ) -> str:
+        conflict_reason = self._conflict_defer_reason(primary, pool)
+        if conflict_reason:
+            return conflict_reason
         if not primary or not discriminating_exams:
             return ""
         if getattr(primary, "hard_contradiction", False):
@@ -1524,6 +1704,36 @@ class DiagnosisJudge:
         return (
             "defer_for_discrimination: high-value unresolved contender(s) "
             f"remain before primary lock: {names}"
+        )
+
+    def _conflict_defer_reason(
+        self,
+        primary: Any,
+        pool: Sequence[Any],
+    ) -> str:
+        if not primary or getattr(primary, "hard_contradiction", False):
+            return ""
+        if getattr(primary, "unresolved_evidence_conflict", False):
+            return (
+                "defer_for_conflict: unresolved reasoning-structured evidence "
+                f"conflict affects primary {primary.diagnosis}"
+            )
+        primary_score = self._judge_score(primary)
+        contenders = [
+            item
+            for item in pool or []
+            if item
+            and item.diagnosis != primary.diagnosis
+            and getattr(item, "unresolved_evidence_conflict", False)
+            and self._judge_score(item)
+            >= primary_score - max(self.pairwise_close_margin, 0.26)
+        ]
+        if not contenders:
+            return ""
+        names = ", ".join(item.diagnosis for item in contenders[:3])
+        return (
+            "defer_for_conflict: unresolved reasoning-structured evidence "
+            f"conflict remains for close candidate(s): {names}"
         )
 
     def _primary_lock_allowed(
@@ -1753,6 +1963,117 @@ class DiagnosisJudge:
             reverse=True,
         )
         return tasks[: self.discriminating_exam_max_items]
+
+    def _conflict_adjudication_exam_tasks(
+        self,
+        pool: Sequence[Any],
+    ) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        pool_size = max(1, len([item for item in pool or [] if item]))
+        for candidate in pool or []:
+            diagnosis = str(getattr(candidate, "diagnosis", "") or "")
+            if not diagnosis or not getattr(candidate, "unresolved_evidence_conflict", False):
+                continue
+            conflicts = [
+                item
+                for item in getattr(candidate, "evidence_conflicts", []) or []
+                if isinstance(item, dict)
+                and str(item.get("status") or "unresolved") != "resolved"
+            ]
+            if not conflicts:
+                continue
+            findings = [
+                str(item.get("finding") or "").strip()
+                for item in conflicts
+                if str(item.get("finding") or "").strip()
+            ]
+            exams = list(getattr(candidate, "conflict_adjudication_exams", []) or [])
+            for conflict in conflicts:
+                for exam in conflict.get("adjudication_exams") or []:
+                    text = str(exam or "").strip()
+                    if text and text not in exams:
+                        exams.append(text)
+            for exam in exams:
+                text = str(exam or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                tasks.append(
+                    {
+                        "exam": text,
+                        "target_candidates": [diagnosis],
+                        "target_findings": list(dict.fromkeys(findings))[:12],
+                        "exam_type": "conflict_adjudication",
+                        "expected_effect": "resolve_reasoning_structured_polarity_conflict",
+                        "source": ["evidence_conflict_arbiter"],
+                        "pool_candidate_count": pool_size,
+                        "target_candidate_count": 1,
+                        "information_gain_hint": 0.98,
+                        "exam_source": "conflict_adjudication_exam",
+                    }
+                )
+        return tasks
+
+    def _merge_discriminating_exam_tasks(
+        self,
+        conflict_tasks: Sequence[Dict[str, Any]],
+        base_tasks: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        by_exam: Dict[str, Dict[str, Any]] = {}
+
+        def add(task: Dict[str, Any]) -> None:
+            exam = str((task or {}).get("exam") or "").strip()
+            if not exam:
+                return
+            current = by_exam.get(exam)
+            if current is None:
+                current = dict(task)
+                current["target_candidates"] = list(
+                    dict.fromkeys(current.get("target_candidates") or [])
+                )
+                current["target_findings"] = list(
+                    dict.fromkeys(current.get("target_findings") or [])
+                )
+                current["source"] = list(dict.fromkeys(current.get("source") or []))
+                by_exam[exam] = current
+                merged.append(current)
+                return
+            current["target_candidates"] = list(
+                dict.fromkeys(
+                    list(current.get("target_candidates") or [])
+                    + list(task.get("target_candidates") or [])
+                )
+            )
+            current["target_findings"] = list(
+                dict.fromkeys(
+                    list(current.get("target_findings") or [])
+                    + list(task.get("target_findings") or [])
+                )
+            )[:12]
+            current["source"] = list(
+                dict.fromkeys(
+                    list(current.get("source") or []) + list(task.get("source") or [])
+                )
+            )
+            current["target_candidate_count"] = len(current["target_candidates"])
+            current["information_gain_hint"] = max(
+                float(current.get("information_gain_hint") or 0.0),
+                float(task.get("information_gain_hint") or 0.0),
+            )
+            if task.get("exam_source") == "conflict_adjudication_exam":
+                current["exam_source"] = "conflict_adjudication_exam"
+                current["exam_type"] = "conflict_adjudication"
+                current["expected_effect"] = (
+                    "resolve_reasoning_structured_polarity_conflict"
+                )
+
+        for task in conflict_tasks or []:
+            add(task)
+        for task in base_tasks or []:
+            add(task)
+        return merged[: self.discriminating_exam_max_items]
 
     def _exam_task_type(
         self,
@@ -2173,6 +2494,8 @@ class DiagnosisJudge:
         return "partially_satisfied"
 
     def _gap_submission_authorized(self, candidate: Any) -> bool:
+        if getattr(candidate, "unresolved_evidence_conflict", False):
+            return False
         state = self._required_gap_state(candidate)
         return state in {"actionable_gap", "nonblocking_gap", "partially_satisfied"} and (
             self._gap_authorizable(candidate)
@@ -2765,6 +3088,22 @@ class DiagnosisSubmitter:
         decision.decision_override = bool(judge_decision.decision_override)
         decision.required_gap_authorized_diagnoses = list(
             judge_decision.required_gap_authorized_diagnoses
+        )
+        decision.evidence_conflicts = list(judge_decision.evidence_conflicts)
+        decision.conflict_affected_diagnoses = list(
+            judge_decision.conflict_affected_diagnoses
+        )
+        decision.root_cause_arbitration = dict(
+            getattr(judge_decision, "root_cause_arbitration", {}) or {}
+        )
+        decision.root_cause_primary = str(
+            getattr(judge_decision, "root_cause_primary", "") or ""
+        )
+        decision.root_cause_secondary = list(
+            getattr(judge_decision, "root_cause_secondary", []) or []
+        )
+        decision.candidate_explanation_edges = list(
+            getattr(judge_decision, "candidate_explanation_edges", []) or []
         )
         decision.judge_decision = judge_decision.to_dict()
         decision.pre_authorization_diagnoses = list(judge_decision.final_diagnoses)
