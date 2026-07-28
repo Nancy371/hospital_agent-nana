@@ -71,7 +71,7 @@ class PolicyGateTests(unittest.TestCase):
         self.assertEqual(store.patches[0]["stats"]["status"], "retired")
         self.assertEqual(store.patches[1]["trigger"]["symptoms_any"], ["胸痛"])
 
-    def test_replay_can_promote_without_runtime_hits(self):
+    def test_replay_needs_full_promotion_metrics_before_promoting(self):
         store = PolicyStore("tests/does-not-exist-policies.json")
         store._save = lambda: None
         store.patches = [
@@ -91,8 +91,40 @@ class PolicyGateTests(unittest.TestCase):
             }
         ]
         result = store.audit()
+        self.assertEqual(result["promoted"], 0)
+        self.assertEqual(store.patches[0]["stats"]["status"], "shadow")
+
+        store.record_diagnostic_replay(
+            "candidate",
+            {"a": 0.2, "b": 0.2, "c": 0.2},
+            promotion_metrics={
+                "target_fix_rate": 0.95,
+                "neighboring_accuracy_delta": 0.0,
+                "false_positive_increase": 0.0,
+                "global_accuracy_delta": 0.0,
+                "unsafe_submission_delta": 0.0,
+            },
+        )
+        result = store.audit()
         self.assertEqual(result["promoted"], 1)
         self.assertEqual(store.patches[0]["stats"]["status"], "active")
+
+    def test_required_gap_authorized_legacy_patch_is_quarantined(self):
+        store = PolicyStore("tests/does-not-exist-policies.json")
+        store._save = lambda: None
+        store.patches = [
+            {
+                "id": "unsafe",
+                "type": "ranking",
+                "trigger": {"always": True},
+                "action": {"required_gap_authorized": True},
+                "stats": {"status": "active"},
+                "source": {},
+            }
+        ]
+        changed = store._normalize_loaded_patches()
+        self.assertTrue(changed)
+        self.assertEqual(store.patches[0]["stats"]["status"], "quarantined")
 
 
 class TreatmentAndMemoryTests(unittest.TestCase):

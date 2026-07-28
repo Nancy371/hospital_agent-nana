@@ -10,7 +10,7 @@ DefectDetector 是自迭代闭环的第一环。它接收一次诊疗结束后�
   - severity：high / medium / low
   - signal：触发规则名（便于溯源）
   - evidence：触发时的关键字段
-  - suggested_fix：建议的策略补丁草案（供 PolicyStore emit_patch 消费）
+  - failure_stage / failure_type / root_cause：先定位错误层级和可泛化根因
 """
 
 from __future__ import annotations
@@ -178,6 +178,8 @@ class DefectDetector:
                 },
             })
 
+        defects = [self._normalize_failure_attribution(item) for item in defects]
+
         if defects:
             logger.info(f"[detector] 规则通道识别缺陷 {len(defects)} 项: "
                         f"{[d['signal'] for d in defects]}")
@@ -197,9 +199,9 @@ class DefectDetector:
 
         约定 llm_chat 签名: `async llm_chat(messages: List[dict], temperature: float) -> str`
         返回 JSON 数组，每项形如:
-          {"subsystem": "...", "severity": "high|medium|low",
-           "signal": "...", "evidence": {...},
-           "suggested_fix": {"type": "...", "trigger": {...}, "action": "...", "items": [...]}}
+          {"failure_stage": "...", "failure_type": "...",
+           "affected_candidate": "...", "root_cause": "...",
+           "generalizable_pattern": "...", "evidence_refs": [...]}
         """
         if not self.llm_chat:
             return []
@@ -215,9 +217,10 @@ class DefectDetector:
         system_prompt = (
             "你是医疗 Agent 的复盘专家。给定一次诊疗的评估报告、问诊信息、检查结果、"
             "以及规则通道已识别的缺陷,请**仅**输出规则未覆盖的**深层归因**缺陷。\n"
-            "输出严格 JSON 数组,每项字段: subsystem(inquiry|examination|treatment|"
-            "reasoning|boundary), severity(high|medium|low), signal(蛇形英文短语), "
-            "evidence(对象), suggested_fix{type,trigger,action,items?}。\n"
+            "输出严格 JSON 数组,每项字段: failure_stage(evidence_mapping|candidate_recall|"
+            "eligibility|ranking|exam_selection|submission), failure_type, affected_candidate, "
+            "root_cause, generalizable_pattern, evidence_refs。\n"
+            "不要输出 suggested_fix、疾病加分、疾病降分或病例答案补丁。\n"
             f"最多输出 {max_extra} 项。如无新增缺陷,输出 []。禁止解释,禁止 markdown。"
         )
         user_prompt = _build_llm_user_prompt(
@@ -240,28 +243,28 @@ class DefectDetector:
         for item in extra[:max_extra]:
             if not isinstance(item, dict):
                 continue
-            sig = item.get("signal")
+            sig = item.get("failure_type") or item.get("signal")
             if not sig or sig in covered:
                 continue
-            fix = item.get("suggested_fix") or {}
-            if not isinstance(fix, dict) or "type" not in fix or "action" not in fix:
-                continue
-            trigger = fix.get("trigger", {"always": True})
-            if not isinstance(trigger, dict):
-                trigger_text = str(trigger).strip()
-                trigger = {"signal": trigger_text} if trigger_text else {"always": True}
-            fix["trigger"] = trigger
-            items = fix.get("items", [])
-            if isinstance(items, str):
-                items = [items]
-            elif not isinstance(items, list):
-                items = []
-            item.setdefault("subsystem", "reasoning")
+            item.setdefault("signal", sig)
+            item.setdefault("failure_stage", item.get("subsystem") or "ranking")
+            item.setdefault("failure_type", sig)
+            item.setdefault("affected_candidate", "")
+            item.setdefault("root_cause", sig)
+            item.setdefault("generalizable_pattern", item.get("root_cause") or sig)
+            refs = item.get("evidence_refs") or item.get("evidence") or []
+            if isinstance(refs, dict):
+                refs = list(refs.keys())
+            elif isinstance(refs, str):
+                refs = [refs]
+            elif not isinstance(refs, list):
+                refs = []
+            item["evidence_refs"] = refs
             item.setdefault("severity", "medium")
             item.setdefault("evidence", {})
-            fix["items"] = items
+            item.pop("suggested_fix", None)
             item["source_channel"] = "llm"
-            out.append(item)
+            out.append(self._normalize_failure_attribution(item))
             covered.add(sig)
 
         if out:
@@ -284,10 +287,102 @@ class DefectDetector:
                 report, collected_info, exam_results, rule_defects
             )
             rule_defects.extend(extra)
-        return rule_defects
+        return [self._normalize_failure_attribution(item) for item in rule_defects]
+
+    @staticmethod
+    def _normalize_failure_attribution(item: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(item or {})
+        signal = str(item.get("signal") or item.get("failure_type") or "unknown_failure").strip()
+        stage = _failure_stage(item.get("failure_stage") or item.get("subsystem") or signal)
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        final_dx = str(evidence.get("final_dx") or evidence.get("finalDiagnosis") or "").strip()
+        root_cause, pattern = _failure_text(stage, signal, final_dx)
+        item["signal"] = signal
+        item["failure_stage"] = stage
+        item["failure_type"] = str(item.get("failure_type") or signal)
+        item["affected_candidate"] = str(item.get("affected_candidate") or final_dx or "").strip()
+        item["root_cause"] = str(item.get("root_cause") or root_cause)
+        item["generalizable_pattern"] = str(item.get("generalizable_pattern") or pattern)
+        refs = item.get("evidence_refs")
+        if not refs:
+            refs = list(evidence.keys()) if isinstance(evidence, dict) else []
+        if isinstance(refs, str):
+            refs = [refs]
+        elif not isinstance(refs, list):
+            refs = []
+        item["evidence_refs"] = [str(ref) for ref in refs if str(ref)]
+        item["source_case"] = str(item.get("source_case") or evidence.get("patient_id") or "")
+        item.pop("suggested_fix", None)
+        return item
 
 
 # ---------------- helpers ----------------
+
+def _failure_stage(value: Any) -> str:
+    text = str(value or "").strip()
+    aliases = {
+        "inquiry": "candidate_recall",
+        "low_diagnosis_accuracy": "ranking",
+        "diagnosis_without_symptoms": "candidate_recall",
+        "examination": "exam_selection",
+        "low_examination_precision": "exam_selection",
+        "kb_coverage_gap": "exam_selection",
+        "treatment": "submission",
+        "low_treatment_score": "submission",
+        "boundary": "submission",
+        "elderly_chest_pain_missing_ecg": "exam_selection",
+        "reasoning": "ranking",
+    }
+    text = aliases.get(text, text)
+    if text in {
+        "evidence_mapping",
+        "candidate_recall",
+        "eligibility",
+        "ranking",
+        "exam_selection",
+        "submission",
+    }:
+        return text
+    return "ranking"
+
+
+def _failure_text(stage: str, signal: str, final_dx: str = "") -> tuple:
+    affected = f" for {final_dx}" if final_dx else ""
+    if signal == "low_diagnosis_accuracy":
+        return (
+            "diagnosis failed; locate recall, eligibility, ranking, or submission before changing scores",
+            "diagnosis accuracy failures must become layer-specific principles, not disease score patches",
+        )
+    if signal == "low_examination_precision":
+        return (
+            "exam selection produced low-precision examinations",
+            "exam policies must target missing discriminating anchors and avoid broad panels",
+        )
+    if signal == "low_treatment_score":
+        return (
+            "submitted treatment plan underperformed",
+            "treatment adjustments belong to submission safety and personalization rules",
+        )
+    if signal == "kb_coverage_gap":
+        return (
+            f"required examination coverage was incomplete{affected}",
+            "missing required tests should generate exam-selection candidates, not final diagnosis authorization",
+        )
+    if signal == "elderly_chest_pain_missing_ecg":
+        return (
+            "red-flag presentation lacked required cardiac exclusion tests",
+            "safety-critical symptoms require specific exclusion exams before low-risk submission",
+        )
+    if signal == "diagnosis_without_symptoms":
+        return (
+            "diagnosis was attempted before enough patient evidence was collected",
+            "candidate recall must preserve evidence intake before diagnosis generation",
+        )
+    return (
+        f"{stage} failure detected by {signal}",
+        f"{stage} failures should be generalized as evidence conditions and layer-local actions",
+    )
+
 
 def _safe_float(v) -> Optional[float]:
     try:

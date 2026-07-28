@@ -203,3 +203,4 @@ log_llm_prompts: false
 self_improve_enabled: true
 self_improve_use_llm_attribute: true
 policy_store_path: outputs/runtime_state/policies.json
+candidate_policy_store_path: outputs/runtime_state/candidate_policies.json

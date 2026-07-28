@@ -41,6 +41,19 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             [(item.get("metrics") or {}).get(name) for item in evaluated]
         )
 
+    def merged_distribution(name: str) -> Dict[str, int]:
+        merged: Dict[str, int] = {}
+        for item in evaluated:
+            value = (item.get("metrics") or {}).get(name) or {}
+            if not isinstance(value, dict):
+                continue
+            for key, count in value.items():
+                try:
+                    merged[str(key)] = merged.get(str(key), 0) + int(count or 0)
+                except (TypeError, ValueError):
+                    continue
+        return merged
+
     audits = [item.get("audit") or {} for item in results]
     recall_values = [
         (item.get("metrics") or {}).get("candidate_recall_at_5")
@@ -156,6 +169,12 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "root_cause_secondary_submission_count"
         ),
         "root_cause_coverage": metric("root_cause_coverage"),
+        "candidate_policy_count": metric("candidate_policy_count"),
+        "policy_promotion_count": metric("policy_promotion_count"),
+        "policy_quarantine_count": metric("policy_quarantine_count"),
+        "policy_rejected_count": metric("policy_rejected_count"),
+        "policy_conflict_count": metric("policy_conflict_count"),
+        "failure_stage_distribution": merged_distribution("failure_stage_distribution"),
         "generic_only_candidate_count": metric("generic_only_candidate_count"),
         "evidence_information_value_mean": metric("evidence_information_value_mean"),
         "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,

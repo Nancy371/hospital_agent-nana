@@ -45,6 +45,7 @@ from .diagnosis_eligibility import DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED, PRIMAR
 from .diagnosis_engine import DiagnosisDecisionEngine
 from .diagnosis_critic import DiagnosisCritic
 from .diagnostic_learning import DiagnosticLearningStore
+from .candidate_policy_store import CandidatePolicyStore, RuleGeneralizer
 from .treatment_safety import TreatmentSafetyGate
 
 logger = logging.getLogger(__name__)
@@ -758,6 +759,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         )
         self.detector: Optional[DefectDetector] = None
         self.policy_store: Optional[PolicyStore] = None
+        self.candidate_policy_store: Optional[CandidatePolicyStore] = None
+        self.rule_generalizer: Optional[RuleGeneralizer] = None
         if self.self_improve_enabled:
             try:
                 # 注入 llm_chat 以启用 LLM 归因通道；critic 内部会在 use_llm=False 或 llm_chat=None 时自动退化
@@ -768,8 +771,25 @@ class MyDoctorAgent(BaseDoctorAgent):
                 policy_path = config.get(
                     "policy_store_path", "outputs/runtime_state/policies.json"
                 )
+                candidate_policy_path = config.get(
+                    "candidate_policy_store_path",
+                    "outputs/runtime_state/candidate_policies.json",
+                )
                 self.policy_store = PolicyStore(store_path=policy_path)
+                self.candidate_policy_store = CandidatePolicyStore(
+                    path=candidate_policy_path
+                )
+                self.rule_generalizer = RuleGeneralizer()
+                legacy = self.candidate_policy_store.ingest_legacy_patches(
+                    self.policy_store.patches
+                )
                 sanitation = self.policy_store.sanitize_shadow_patches()
+                logger.info(
+                    "[SelfImprove] legacy policies copied to candidate store: "
+                    "converted=%s quarantined=%s",
+                    legacy.get("converted", 0),
+                    legacy.get("quarantined", 0),
+                )
                 logger.info(
                     f"[自迭代] 已启用 detector + policy_store "
                     f"(现有补丁 {len(self.policy_store.patches)} 项, "
@@ -779,6 +799,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                 logger.warning(f"[自迭代] 初始化失败，降级为无自迭代模式: {_e}")
                 self.detector = None
                 self.policy_store = None
+                self.candidate_policy_store = None
+                self.rule_generalizer = None
         self.memory_manager = DoctorAgentMemory(
             config=config,
             episodic_memory=self.memory,
@@ -2344,6 +2366,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             )
             if key in final_result
         }
+        policy_summary = (
+            self.candidate_policy_store.summary()
+            if getattr(self, "candidate_policy_store", None) is not None
+            else {}
+        )
         return {
             "patient_id": patient_id,
             "status": "evaluated" if report else "evaluation_failed",
@@ -2445,6 +2472,14 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "root_cause_primary_override_count": root_cause_primary_override_count,
                 "root_cause_secondary_submission_count": root_cause_secondary_submission_count,
                 "root_cause_coverage": root_cause_coverage,
+                "candidate_policy_count": policy_summary.get("candidate_policy_count"),
+                "policy_promotion_count": policy_summary.get("policy_promotion_count"),
+                "policy_quarantine_count": policy_summary.get("policy_quarantine_count"),
+                "policy_rejected_count": policy_summary.get("policy_rejected_count"),
+                "policy_conflict_count": policy_summary.get("policy_conflict_count"),
+                "failure_stage_distribution": policy_summary.get(
+                    "failure_stage_distribution"
+                ),
             },
             "top_candidates": top_twenty,
             "retriever_top1": retriever_top1,
@@ -4849,7 +4884,12 @@ class MyDoctorAgent(BaseDoctorAgent):
         # ============ 自迭代闭环 ============
         # 1) 缺陷检测 → 2) 编译为策略补丁 → 3) 反馈本例 ΔScore
         try:
-            if self.detector is not None and self.policy_store is not None:
+            if (
+                self.detector is not None
+                and self.policy_store is not None
+                and self.candidate_policy_store is not None
+                and self.rule_generalizer is not None
+            ):
                 # 步骤1：缺陷检测（规则通道 + LLM 归因通道合并；后者受 config 开关与 llm_chat 注入双重控制）
                 _defects = await self.detector.detect_all(
                     report=report,
@@ -4859,10 +4899,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                                     if self._planner else None),
                     use_llm=self.self_improve_use_llm_attribute,
                 )
-                # 步骤2：编译补丁（默认 shadow，收敛后由 audit 提权到 active）
-                _emitted = self.policy_store.emit_from_defects(
-                    _defects, default_status="shadow"
+                # 步骤2：单例失败只写候选策略库，不直接写 active/shadow PolicyStore。
+                _policies = self.rule_generalizer.generalize(
+                    _defects,
+                    source_case=patient_id,
                 )
+                _candidate_stats = self.candidate_policy_store.upsert_many(_policies)
                 # 步骤3：本例用到的补丁 → 结合 ΔScore 反馈
                 _used_ids = []
                 if self._planner is not None:
@@ -4892,9 +4934,12 @@ class MyDoctorAgent(BaseDoctorAgent):
 
                 if _defects:
                     logger.info(
-                        f"[自迭代] 反思阶段识别缺陷 {len(_defects)} 项，"
-                        f"emit 补丁 {len(_emitted)} 项 "
-                        f"(库大小={len(self.policy_store.patches)})"
+                        "[SelfImprove] failure attributions=%s candidate_policies=%s "
+                        "updated=%s quarantined=%s",
+                        len(_defects),
+                        _candidate_stats.get("candidate", 0),
+                        _candidate_stats.get("updated", 0),
+                        _candidate_stats.get("quarantined", 0),
                     )
         except Exception as _e:
             logger.warning(f"[自迭代] 反思阶段闭环失败(不影响主流程): {_e}")

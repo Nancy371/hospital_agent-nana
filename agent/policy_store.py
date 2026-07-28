@@ -33,6 +33,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from .candidate_policy_store import promotion_decision
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +95,16 @@ class PolicyStore:
             if not isinstance(patch.get("source"), dict):
                 patch["source"] = {"signal": str(patch.get("source") or ""), "severity": "low"}
                 changed = True
+            action_text = json.dumps(patch.get("action") or "", ensure_ascii=False)
+            source_text = json.dumps(patch.get("source") or {}, ensure_ascii=False)
+            if "required_gap_authorized" in action_text or "required_gap_authorized" in source_text:
+                stats = patch.setdefault("stats", {})
+                if stats.get("status") != "quarantined":
+                    stats["status"] = "quarantined"
+                    patch.setdefault("source", {})[
+                        "quarantine_reason"
+                    ] = "required_gap_authorized policies are deprecated"
+                    changed = True
         return changed
 
     def _save(self) -> None:
@@ -251,6 +263,57 @@ class PolicyStore:
             logger.info(f"[policy] emit 补丁 {len(touched)} 项 (库大小={len(self.patches)})")
         return touched
 
+    def upsert_policy_candidate(self, policy: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Install a validated active policy candidate into the active store.
+
+        Candidate and temporary policies are intentionally ignored here; runtime
+        failures must pass replay/promotion before they affect normal behavior.
+        """
+        if not isinstance(policy, dict):
+            return None
+        if str(policy.get("status") or "") != "active":
+            return None
+        action = policy.get("action") or {}
+        action_text = json.dumps(action, ensure_ascii=False, sort_keys=True)
+        if "required_gap_authorized" in action_text:
+            return None
+        now = _now_iso()
+        patch = {
+            "id": policy.get("policy_id") or _mk_id(),
+            "type": "layer_policy",
+            "target_layer": policy.get("target_layer"),
+            "policy_type": policy.get("policy_type", "general_rule"),
+            "trigger": {
+                "policy_conditions": list(policy.get("trigger_conditions") or []),
+            },
+            "action": action,
+            "items": [],
+            "stats": {
+                "hits": 0,
+                "successes": 0,
+                "failures": 0,
+                "created_at": policy.get("created_at") or now,
+                "last_used_at": None,
+                "status": "active",
+            },
+            "source": {
+                "policy_id": policy.get("policy_id"),
+                "source_cases": list(policy.get("source_cases") or []),
+                "validation_cases": list(policy.get("validation_cases") or []),
+                "validation_metrics": dict(policy.get("validation_metrics") or {}),
+                "priority": policy.get("priority"),
+                "priority_class": policy.get("priority_class"),
+            },
+        }
+        for existing in self.patches:
+            if existing.get("id") == patch["id"]:
+                existing.update(patch)
+                self._save()
+                return existing
+        self.patches.append(patch)
+        self._save()
+        return patch
+
     def _find_similar(self, cand: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """同 type + trigger 关键字段一致 视为同一补丁。"""
         for p in self.patches:
@@ -329,6 +392,7 @@ class PolicyStore:
         self,
         patch_id: str,
         gains_by_case: Dict[str, float],
+        promotion_metrics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Persist independent replay evidence used by the promotion gate."""
         unique = {
@@ -338,11 +402,14 @@ class PolicyStore:
         }
         count = len(unique)
         successes = sum(1 for gain in unique.values() if gain > 0)
+        decision = promotion_decision(promotion_metrics or {})
         summary = {
             "independent_cases": count,
             "success_ratio": round(successes / count, 4) if count else 0.0,
             "avg_diagnosis_gain": round(sum(unique.values()) / count, 4) if count else 0.0,
             "case_gains": unique,
+            "promotion_metrics": dict(promotion_metrics or {}),
+            "promotion_decision": decision.to_dict(),
             "updated_at": _now_iso(),
         }
         for patch in self.patches:
@@ -375,11 +442,13 @@ class PolicyStore:
             replay_cases = int(replay.get("independent_cases", 0) or 0)
             replay_ratio = float(replay.get("success_ratio", 0.0) or 0.0)
             replay_delta = float(replay.get("avg_diagnosis_gain", 0.0) or 0.0)
+            decision_payload = replay.get("promotion_decision") or {}
             if (
                 status == "shadow"
                 and replay_cases >= min_replay_cases
                 and replay_ratio >= min_success_ratio
                 and replay_delta >= min_avg_delta
+                and bool(decision_payload.get("promote_allowed"))
             ):
                 stats["status"] = "active"
                 promoted += 1

@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from .candidate_policy_store import promotion_decision
+
 
 class DiagnosticLearningStore:
     """Store evaluation-derived rule candidates without changing active knowledge."""
@@ -96,6 +98,7 @@ class DiagnosticLearningStore:
         self,
         candidate_id: str,
         gains_by_case: Dict[str, float],
+        promotion_metrics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         data = self._load()
         candidate = next(
@@ -117,15 +120,18 @@ class DiagnosticLearningStore:
         successes = sum(1 for gain in unique.values() if gain > 0)
         ratio = successes / count if count else 0.0
         average = sum(unique.values()) / count if count else 0.0
+        decision = promotion_decision(promotion_metrics or {})
         replay = {
             "independent_cases": count,
             "success_ratio": round(ratio, 4),
             "avg_diagnosis_gain": round(average, 4),
             "case_gains": unique,
+            "promotion_metrics": dict(promotion_metrics or {}),
+            "promotion_decision": decision.to_dict(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         candidate["replay"] = replay
-        if count >= 3 and ratio >= 0.6 and average >= 0.1:
+        if decision.promote_allowed:
             candidate["status"] = "active"
         elif candidate.get("status") == "active":
             candidate["status"] = "shadow"

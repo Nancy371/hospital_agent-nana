@@ -7,6 +7,10 @@ __all__ = [
     "MyDoctorAgent",
     "DefectDetector",
     "PolicyStore",
+    "CandidatePolicyStore",
+    "RuleGeneralizer",
+    "FailureAttribution",
+    "PromotionDecision",
     "ExamStrategyAgent",
     "InquiryStrategyAgent",
     "QualityAgent",
@@ -71,6 +75,14 @@ def __getattr__(name: str):
     if name == "PolicyStore":
         from .policy_store import PolicyStore
         return PolicyStore
+    if name in (
+        "CandidatePolicyStore",
+        "RuleGeneralizer",
+        "FailureAttribution",
+        "PromotionDecision",
+    ):
+        from . import candidate_policy_store as _candidate_policy_store
+        return getattr(_candidate_policy_store, name)
     if name == "ExamStrategyAgent":
         from .exam_strategy import ExamStrategyAgent
         return ExamStrategyAgent

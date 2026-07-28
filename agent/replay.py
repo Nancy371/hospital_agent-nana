@@ -20,6 +20,7 @@ import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from .clinical_evidence import ClinicalEvidenceNormalizer, EvidenceBundle
+from .candidate_policy_store import promotion_decision
 from .diagnosis_engine import DiagnosisDecisionEngine
 
 logger = logging.getLogger(__name__)
@@ -393,6 +394,75 @@ class DiagnosticReplay:
             "success_ratio": round(ratio, 4),
             "avg_diagnosis_gain": round(average, 4),
             "should_promote": bool(count >= 3 and ratio >= 0.6 and average >= 0.1),
+        }
+
+    @staticmethod
+    def policy_promotion_summary(per_case: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+        """Evaluate a candidate policy against target/neighbor/counterexample buckets."""
+        rows = [dict(item) for item in per_case or [] if isinstance(item, dict)]
+
+        def bucket(*names: str) -> List[Dict[str, Any]]:
+            allowed = set(names)
+            return [item for item in rows if str(item.get("bucket") or "") in allowed]
+
+        def accuracy_delta(items: List[Dict[str, Any]]) -> float:
+            if not items:
+                return 0.0
+            deltas = [
+                float(bool(item.get("candidate_correct")))
+                - float(bool(item.get("baseline_correct")))
+                for item in items
+            ]
+            return sum(deltas) / len(deltas)
+
+        def false_positive_delta(items: List[Dict[str, Any]]) -> float:
+            if not items:
+                return 0.0
+            deltas = [
+                float(item.get("candidate_false_positives", 0) or 0)
+                - float(item.get("baseline_false_positives", 0) or 0)
+                for item in items
+            ]
+            return sum(deltas) / len(deltas)
+
+        def unsafe_delta(items: List[Dict[str, Any]]) -> float:
+            if not items:
+                return 0.0
+            deltas = [
+                float(bool(item.get("candidate_unsafe_submission")))
+                - float(bool(item.get("baseline_unsafe_submission")))
+                for item in items
+            ]
+            return sum(deltas) / len(deltas)
+
+        target_rows = bucket("target", "source", "same_pattern_positive")
+        neighbor_rows = bucket("neighbor", "neighboring_differential")
+        counter_rows = bucket("counterexample", "negative")
+        target_fix_rate = (
+            sum(1 for item in target_rows if item.get("candidate_correct"))
+            / len(target_rows)
+            if target_rows
+            else 0.0
+        )
+        metrics = {
+            "target_fix_rate": round(target_fix_rate, 4),
+            "neighboring_accuracy_delta": round(accuracy_delta(neighbor_rows), 4),
+            "false_positive_increase": round(false_positive_delta(counter_rows), 4),
+            "global_accuracy_delta": round(accuracy_delta(rows), 4),
+            "unsafe_submission_delta": round(unsafe_delta(rows), 4),
+            "bucket_counts": {
+                "target": len(target_rows),
+                "neighbor": len(neighbor_rows),
+                "counterexample": len(counter_rows),
+                "historical_stable": len(bucket("historical_stable", "stable")),
+            },
+        }
+        decision = promotion_decision(metrics)
+        return {
+            **metrics,
+            "promote_allowed": decision.promote_allowed,
+            "failed_gates": list(decision.failed_gates),
+            "should_promote": decision.promote_allowed,
         }
 
     @staticmethod
