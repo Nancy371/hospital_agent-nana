@@ -7,6 +7,7 @@ from agent.diagnosis_eligibility import (
     DIFFERENTIAL_ONLY,
     EXCLUDED,
     NEEDS_ANCHOR,
+    PATTERN_CONTRADICTED,
     PRIMARY_ELIGIBLE,
     DiagnosisEligibilityGate,
 )
@@ -150,6 +151,76 @@ class DiagnosisEligibilityGateTests(unittest.TestCase):
 
         self.assertEqual(result.status, DEFERRED)
         self.assertEqual(result.reason, NEEDS_ANCHOR)
+
+    def test_pyuria_alone_is_not_prostatitis_anchor(self):
+        prostatitis = candidate(
+            diagnosis="急性细菌性前列腺炎",
+            diagnosis_type="etiology",
+            required_met=True,
+            matched_evidence=["pyuria"],
+            core_matched_evidence=["pyuria"],
+            required_gaps=[],
+            source_prior=0.55,
+            coverage_score=0.45,
+            core_explanatory_coverage=0.36,
+        )
+
+        result = self.gate.evaluate(prostatitis)
+
+        self.assertEqual(result.status, DEFERRED)
+        self.assertEqual(result.reason, NEEDS_ANCHOR)
+        self.assertIn(
+            "acute_bacterial_prostatitis_requires_urinary_or_prostate_anchor",
+            result.missing_required_anchors,
+        )
+
+    def test_negative_urine_pattern_downgrades_pyuria_support(self):
+        prostatitis = candidate(
+            diagnosis="急性细菌性前列腺炎",
+            diagnosis_type="etiology",
+            required_met=True,
+            matched_evidence=[
+                "pyuria",
+                "urine_culture_no_growth",
+                "leukocyte_esterase_negative",
+                "nitrite_negative",
+            ],
+            core_matched_evidence=["pyuria"],
+            required_gaps=[],
+            source_prior=0.55,
+            coverage_score=0.45,
+            core_explanatory_coverage=0.36,
+        )
+
+        result = self.gate.evaluate(prostatitis)
+
+        self.assertEqual(result.status, DIFFERENTIAL_ONLY)
+        self.assertEqual(result.reason, PATTERN_CONTRADICTED)
+        self.assertIn("urine_culture_no_growth", result.blockers)
+        self.assertEqual(result.evidence_pattern_matches[0]["role"], "negative_pattern")
+
+    def test_confirmed_bacterial_prostatitis_pattern_is_primary_eligible(self):
+        prostatitis = candidate(
+            diagnosis="急性细菌性前列腺炎",
+            diagnosis_type="etiology",
+            required_met=True,
+            matched_evidence=[
+                "prostate_tenderness",
+                "dysuria",
+                "pyuria",
+                "urine_culture_positive",
+            ],
+            core_matched_evidence=["prostate_tenderness", "dysuria"],
+            diagnostic_matched_evidence=["urine_culture_positive"],
+            required_gaps=[],
+            core_evidence_score=0.62,
+            diagnostic_evidence_score=0.55,
+        )
+
+        result = self.gate.evaluate(prostatitis)
+
+        self.assertEqual(result.status, PRIMARY_ELIGIBLE)
+        self.assertEqual(result.reason, ANCHORS_SATISFIED)
 
     def test_pulmonary_cryptococcosis_without_fungal_anchor_is_deferred(self):
         crypto = candidate(

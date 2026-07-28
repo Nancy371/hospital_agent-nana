@@ -168,29 +168,49 @@
         {"finding": "dysuria", "weight": 0.26},
         {"finding": "urinary_frequency", "weight": 0.18},
         {"finding": "urinary_urgency", "weight": 0.18},
-        {"finding": "pyuria", "weight": 0.34},
-        {"finding": "bacteriuria", "weight": 0.34},
-        {"finding": "urine_culture_positive", "weight": 0.38}
+        {"finding": "pyuria", "weight": 0.16, "role": "urinary_inflammation_support"},
+        {"finding": "bacteriuria", "weight": 0.42, "role": "bacterial_confirmation_anchor"},
+        {"finding": "urine_culture_positive", "weight": 0.42, "role": "bacterial_confirmation_anchor"},
+        {"finding": "leukocyte_esterase_positive", "weight": 0.24, "role": "bacterial_confirmation_anchor"},
+        {"finding": "nitrite_positive", "weight": 0.24, "role": "bacterial_confirmation_anchor"}
       ],
       "required_groups": [
         [
           {"finding": "prostate_tenderness"},
           {"finding": "perineal_pain"},
-          {"finding": "fever"},
-          {"finding": "diagnosis:急性细菌性前列腺炎"}
-        ],
-        [
+          {"finding": "pelvic_pain"},
           {"finding": "dysuria"},
           {"finding": "urinary_frequency"},
           {"finding": "urinary_urgency"},
-          {"finding": "pyuria"},
+          {"finding": "diagnosis:急性细菌性前列腺炎"}
+        ],
+        [
           {"finding": "bacteriuria"},
           {"finding": "urine_culture_positive"},
+          {"finding": "leukocyte_esterase_positive"},
+          {"finding": "nitrite_positive"},
           {"finding": "diagnosis:急性细菌性前列腺炎"}
         ]
       ],
       "contradictions": [
-        {"finding": "urine_culture_no_growth", "penalty": 0.25, "hard": false}
+        {"finding": "urine_culture_no_growth", "penalty": 0.32, "hard": false},
+        {"finding": "leukocyte_esterase_negative", "penalty": 0.18, "hard": false},
+        {"finding": "nitrite_negative", "penalty": 0.18, "hard": false},
+        {"finding": "urine_wbc_normal", "penalty": 0.24, "hard": false}
+      ],
+      "diagnostic_patterns": [
+        {
+          "pattern_id": "acute_bacterial_prostatitis_confirmed_pattern",
+          "role": "positive_pattern",
+          "description": "Localizing prostate/urinary evidence plus bacterial confirmation is required before final submission."
+        },
+        {
+          "pattern_id": "acute_bacterial_prostatitis_negative_urine_pattern",
+          "role": "negative_pattern",
+          "support_findings": ["pyuria"],
+          "blockers": ["urine_culture_no_growth", "leukocyte_esterase_negative", "nitrite_negative", "urine_wbc_normal"],
+          "action": "downgrade_to_differential_only"
+        }
       ],
       "generalization_suppressions": ["前列腺增生", "泌尿系感染", "尿道综合征"],
       "suppress_diagnoses": ["前列腺增生"],

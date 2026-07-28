@@ -133,7 +133,7 @@ class DiseaseRetrievalUpgradeTests(unittest.TestCase):
         self.assertIn("cytology_chronic_inflammation", ent.matched_evidence)
         self.assertEqual(decision.final_diagnoses[0], "慢性鼻咽炎")
 
-    def test_negative_urine_culture_is_soft_for_acute_bacterial_prostatitis(self):
+    def test_negative_urine_culture_defers_acute_bacterial_prostatitis(self):
         _, decision = self.decide(
             {"symptoms": ["发热", "寒战", "尿频", "尿急", "尿痛", "会阴痛"]},
             {
@@ -153,10 +153,41 @@ class DiseaseRetrievalUpgradeTests(unittest.TestCase):
             llm={"diagnosis_candidates": [{"name": "前列腺增生", "confidence": 0.86}]},
         )
         prostatitis = next(item for item in decision.candidates if item.diagnosis == "急性细菌性前列腺炎")
-        self.assertTrue(prostatitis.required_met)
+        self.assertFalse(prostatitis.required_met)
+        self.assertEqual(prostatitis.eligibility_status, "Deferred")
         self.assertFalse(prostatitis.hard_contradiction)
         self.assertIn("urine_culture_no_growth", prostatitis.soft_contradicted_evidence)
-        self.assertEqual(decision.final_diagnoses[0], "急性细菌性前列腺炎")
+        self.assertNotIn("急性细菌性前列腺炎", decision.final_diagnoses)
+
+    def test_pyuria_with_negative_urine_markers_is_not_final_prostatitis(self):
+        _, decision = self.decide(
+            {"symptoms": ["乏力", "低热"]},
+            {
+                "尿培养": {
+                    "status": "normal",
+                    "result": {"结论": "尿培养无生长"},
+                },
+                "尿液分析（UA）": {
+                    "status": "abnormal",
+                    "result": {
+                        "尿白细胞": "80 个/HPF［参考值：0-5］",
+                        "白细胞酯酶": "阴性",
+                        "亚硝酸盐": "阴性",
+                    },
+                },
+            },
+            llm={"diagnosis_candidates": [{"name": "急性细菌性前列腺炎", "confidence": 0.86}]},
+        )
+        prostatitis = next(item for item in decision.candidates if item.diagnosis == "急性细菌性前列腺炎")
+        self.assertEqual(prostatitis.eligibility_status, "DifferentialOnly")
+        self.assertIn("urine_culture_no_growth", prostatitis.eligibility_blockers)
+        self.assertTrue(
+            any(
+                item.get("role") == "negative_pattern"
+                for item in prostatitis.evidence_pattern_matches
+            )
+        )
+        self.assertNotIn("急性细菌性前列腺炎", decision.final_diagnoses)
 
     def test_microtia_beats_fracture_when_congenital_evidence_present(self):
         _, decision = self.decide(

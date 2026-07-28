@@ -19,6 +19,7 @@ NO_SUPPORTING_EVIDENCE = "NoSupportingEvidence"
 WEAK_DIFFERENTIAL_SIGNAL = "WeakDifferentialSignal"
 INSUFFICIENT_EXPLANATION = "InsufficientExplanation"
 ANCHORS_SATISFIED = "AnchorsSatisfied"
+PATTERN_CONTRADICTED = "PatternContradicted"
 
 
 _ACUTE_PROSTATITIS_ANCHORS = {
@@ -29,9 +30,37 @@ _ACUTE_PROSTATITIS_ANCHORS = {
     "dysuria",
     "urinary_frequency",
     "urinary_urgency",
-    "pyuria",
     "bacteriuria",
     "urine_culture_positive",
+    "leukocyte_esterase_positive",
+    "nitrite_positive",
+}
+
+_ACUTE_PROSTATITIS_LOCALIZING_ANCHORS = {
+    "prostate_tenderness",
+    "perineal_pain",
+    "pelvic_pain",
+    "dysuria",
+    "urinary_frequency",
+    "urinary_urgency",
+}
+
+_ACUTE_PROSTATITIS_BACTERIAL_ANCHORS = {
+    "bacteriuria",
+    "urine_culture_positive",
+    "leukocyte_esterase_positive",
+    "nitrite_positive",
+}
+
+_ACUTE_PROSTATITIS_INFLAMMATION_SUPPORT = {
+    "pyuria",
+}
+
+_ACUTE_PROSTATITIS_BACTERIAL_BLOCKERS = {
+    "urine_culture_no_growth",
+    "leukocyte_esterase_negative",
+    "nitrite_negative",
+    "urine_wbc_normal",
 }
 
 _PULMONARY_CRYPTOCOCCOSIS_ANCHORS = {
@@ -352,6 +381,11 @@ class DiagnosisEligibilityGate:
         if getattr(candidate, "unresolved_evidence_conflict", False):
             blockers.append("unresolved_reasoning_structured_evidence_conflict")
             return self._result(candidate, DEFERRED, CONFLICT_NEEDS_ADJUDICATION, missing, satisfied, blockers)
+        blocking_pattern = self._blocking_evidence_pattern(candidate)
+        if blocking_pattern:
+            blockers.extend(blocking_pattern.get("blockers", []))
+            self._append_evidence_pattern(candidate, blocking_pattern)
+            return self._result(candidate, DIFFERENTIAL_ONLY, PATTERN_CONTRADICTED, missing, satisfied, blockers)
         if bool(getattr(candidate, "differential_only", False)):
             reason = str(getattr(candidate, "differential_only_reason", "") or WEAK_DIFFERENTIAL_SIGNAL)
             return self._result(candidate, DIFFERENTIAL_ONLY, reason, missing, satisfied, blockers)
@@ -467,6 +501,53 @@ class DiagnosisEligibilityGate:
         if matched & _ACUTE_PROSTATITIS_ANCHORS:
             return ""
         return "acute_bacterial_prostatitis_requires_urinary_or_prostate_anchor"
+
+    def _blocking_evidence_pattern(self, candidate: Any) -> Dict[str, Any]:
+        diagnosis = str(getattr(candidate, "diagnosis", "") or "")
+        entry = self._entry(candidate)
+        category = str(entry.get("category") or getattr(candidate, "category", "") or "")
+        if diagnosis != "急性细菌性前列腺炎" and category != "acute_bacterial_prostate":
+            return {}
+        matched = {str(item) for item in getattr(candidate, "matched_evidence", []) or []}
+        contradicted = {
+            str(item)
+            for item in (
+                list(getattr(candidate, "soft_contradicted_evidence", []) or [])
+                + list(getattr(candidate, "hard_contradicted_evidence", []) or [])
+                + list(getattr(candidate, "contradicted_evidence", []) or [])
+            )
+        }
+        bacterial_positive = sorted(matched & _ACUTE_PROSTATITIS_BACTERIAL_ANCHORS)
+        if bacterial_positive:
+            return {}
+        bacterial_blockers = sorted((matched | contradicted) & _ACUTE_PROSTATITIS_BACTERIAL_BLOCKERS)
+        if not bacterial_blockers:
+            return {}
+        localizing = sorted(matched & _ACUTE_PROSTATITIS_LOCALIZING_ANCHORS)
+        inflammation_only = sorted(matched & _ACUTE_PROSTATITIS_INFLAMMATION_SUPPORT)
+        multiple_negative_markers = len(bacterial_blockers) >= 2
+        lacks_localizing_anchor = not bool(localizing)
+        if not inflammation_only and not (multiple_negative_markers and lacks_localizing_anchor):
+            return {}
+        if not multiple_negative_markers and not lacks_localizing_anchor:
+            return {}
+        return {
+            "pattern": "acute_bacterial_prostatitis_negative_urine_pattern",
+            "role": "negative_pattern",
+            "matched": sorted(set(inflammation_only + localizing)),
+            "blockers": bacterial_blockers,
+            "action": "downgrade_to_differential_only",
+            "reason": (
+                "pyuria is urinary inflammation support, not a bacterial "
+                "prostatitis anchor when bacterial urine markers are negative"
+            ),
+        }
+
+    @staticmethod
+    def _append_evidence_pattern(candidate: Any, pattern: Dict[str, Any]) -> None:
+        existing = list(getattr(candidate, "evidence_pattern_matches", []) or [])
+        existing.append(dict(pattern))
+        setattr(candidate, "evidence_pattern_matches", existing)
 
     @staticmethod
     def _insufficient_explanation(candidate: Any) -> bool:
