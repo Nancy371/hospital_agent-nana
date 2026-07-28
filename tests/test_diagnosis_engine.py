@@ -168,8 +168,8 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertTrue(
             any(
                 item.get("diagnosis") == "低镁血症"
-                and item.get("reason") == "unresolved reasoning-structured evidence conflict"
-                for item in decision.blocked_diagnoses
+                and item.get("eligibility_reason") == "ConflictNeedsAdjudication"
+                for item in decision.judge_decision["blocked_diagnoses"]
             )
         )
 
@@ -188,13 +188,15 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertFalse(low_mag.required_met)
         self.assertFalse(low_mag.hard_contradiction)
         self.assertEqual(low_mag.required_gap_state, "actionable_gap")
+        self.assertEqual(low_mag.eligibility_status, "Deferred")
         self.assertNotIn("低镁血症", decision.final_diagnoses)
         self.assertIn("低镁血症", decision.judge_decision["evidence_gap_targets"])
+        self.assertEqual(decision.required_gap_authorized_diagnoses, [])
         self.assertTrue(
             any(
                 item.get("diagnosis") == "低镁血症"
-                and "objective confirmation" in item.get("reason", "")
-                for item in decision.blocked_diagnoses
+                and item.get("eligibility_status") == "Deferred"
+                for item in decision.judge_decision["blocked_diagnoses"]
             )
         )
 
@@ -294,13 +296,18 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         self.assertFalse(vasculitis.hard_contradiction)
         self.assertGreater(vasculitis.coverage_score, cad.coverage_score)
         self.assertLess(vasculitis.residual_score, cad.residual_score)
+        self.assertEqual(vasculitis.eligibility_status, "Deferred")
         self.assertNotIn("显微镜下多血管炎", decision.final_diagnoses)
-        self.assertIn("显微镜下多血管炎", decision.required_gap_authorized_diagnoses)
+        self.assertEqual(decision.required_gap_authorized_diagnoses, [])
+        self.assertIn(
+            "显微镜下多血管炎",
+            decision.judge_decision["evidence_gap_targets"],
+        )
         self.assertTrue(
             any(
                 item.get("diagnosis") == "显微镜下多血管炎"
-                and "objective confirmation" in item.get("reason", "")
-                for item in decision.blocked_diagnoses
+                and item.get("eligibility_status") == "Deferred"
+                for item in decision.judge_decision["blocked_diagnoses"]
             )
         )
 
@@ -343,6 +350,39 @@ class DiagnosisDecisionEngineTests(unittest.TestCase):
         asd = next(item for item in decision.candidates if item.diagnosis == "房间隔缺损")
         self.assertTrue(asd.hard_contradiction)
         self.assertIn("diagnosis:房间隔缺损", evidence.findings("negative"))
+
+    def test_aspiration_pneumonia_blocks_cross_system_prostatitis_primary(self):
+        _, decision = self.decide(
+            {"symptoms": ["呛咳", "发热", "咳嗽", "喘息", "呼吸困难"]},
+            {
+                "胸部CT扫描（Chest CT）": {
+                    "status": "abnormal",
+                    "result": {"结论": "右下叶实变伴容积减小，符合肺不张，支气管肺炎表现"},
+                },
+                "支气管镜检查": {
+                    "status": "abnormal",
+                    "result": {"结论": "右下叶支气管黏液栓阻塞"},
+                },
+                "痰培养": {
+                    "status": "abnormal",
+                    "result": {"结论": "肺炎链球菌高载量"},
+                },
+            },
+            llm={
+                "diagnosis_candidates": [
+                    "急性细菌性前列腺炎",
+                    "肺隐球菌病",
+                    "支原体肺炎",
+                    "肺不张",
+                    "支气管肺炎",
+                ]
+            },
+        )
+        self.assertNotEqual(decision.final_diagnoses[0], "急性细菌性前列腺炎")
+        self.assertNotIn("急性细菌性前列腺炎", decision.final_diagnoses)
+        self.assertNotIn("肺隐球菌病", decision.final_diagnoses)
+        self.assertNotIn("支原体肺炎", decision.final_diagnoses)
+        self.assertTrue({"肺不张", "支气管肺炎"} <= set(decision.final_diagnoses))
 
     def test_structural_valve_disease_precedes_heart_failure(self):
         _, decision = self.decide(

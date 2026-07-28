@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .diagnosis_eligibility import PRIMARY_ELIGIBLE
+
 
 _OBJECTIVE_FINDINGS = {
     "afb_positive",
@@ -22,11 +24,15 @@ _OBJECTIVE_FINDINGS = {
     "low_urine_magnesium",
     "magnesium_depletion",
     "magnesium_load_retention_high",
+    "mitral_regurgitation",
     "mpo_anca_positive",
+    "pulmonary_valve_gradient",
     "pulmonary_valve_stenosis",
     "renal_impairment",
     "second_degree_av_block",
     "tb_naat_positive",
+    "tricuspid_regurgitation",
+    "valve_gradient_high",
     "ventricular_septal_defect",
     "vitamin_d_low",
 }
@@ -121,7 +127,9 @@ class RootCauseArbiter:
                 int(edge.get("min_explained_candidates", 1) or 1)
                 for edge in source_edges
             )
-            if not explains_current_primary and len(source_edges) < max(2, min_explained):
+            is_current_primary = source_name == primary_before
+            required_explained = min_explained if is_current_primary else max(2, min_explained)
+            if not explains_current_primary and len(source_edges) < required_explained:
                 continue
             coverage = self._root_candidate_coverage(source, source_edges)
             if coverage + 0.04 < current_coverage and explains_current_primary:
@@ -260,20 +268,7 @@ class RootCauseArbiter:
         setattr(judge_decision, "root_cause_primary_override", result.primary_override)
         setattr(judge_decision, "primary_override_source", "root_cause_arbitration")
         setattr(judge_decision, "root_cause_coverage", result.root_cause_coverage)
-        gap_authorized = list(
-            getattr(judge_decision, "required_gap_authorized_diagnoses", []) or []
-        )
-        if any(
-            str(edge.get("source") or "") == primary
-            and bool(edge.get("authorize_required_gap"))
-            for edge in result.candidate_explanation_edges
-        ):
-            gap_authorized.append(primary)
-        setattr(
-            judge_decision,
-            "required_gap_authorized_diagnoses",
-            list(dict.fromkeys(gap_authorized)),
-        )
+        setattr(judge_decision, "required_gap_authorized_diagnoses", [])
         trace = list(getattr(judge_decision, "dynamic_rerank_trace", []) or [])
         trace.append(
             {
@@ -355,17 +350,16 @@ class RootCauseArbiter:
     def _root_ready(self, candidate: Any, selector: Dict[str, Any]) -> bool:
         if not candidate or getattr(candidate, "hard_contradiction", False):
             return False
+        status = str(getattr(candidate, "eligibility_status", "") or "")
+        if status and status != PRIMARY_ELIGIBLE:
+            return False
         if getattr(candidate, "unresolved_evidence_conflict", False):
             return False
         if not getattr(candidate, "matched_evidence", None):
             return False
         required_gaps = list(getattr(candidate, "required_gaps", []) or [])
         if required_gaps:
-            if not bool(selector.get("allow_actionable_gap", False)):
-                return False
-            gap_state = str(getattr(candidate, "required_gap_state", "") or "")
-            if gap_state not in {"actionable_gap", "partially_satisfied"}:
-                return False
+            return False
         elif not bool(getattr(candidate, "required_met", False)):
             return False
         return self._objective_or_core(candidate, selector)
@@ -509,8 +503,12 @@ class RootCauseArbiter:
             target = by_name.get(name)
             if not target or not self._downstream_ready(target, {}):
                 continue
-            if submit_only and str(edge.get("secondary_policy") or "") == "audit_only":
-                continue
+            if submit_only:
+                policy = str(edge.get("secondary_policy") or "submit_if_objective")
+                if policy == "audit_only":
+                    continue
+                if policy == "submit_if_objective" and not self._secondary_submit_ready(target):
+                    continue
             scored.append((float(edge.get("edge_coverage", 0.0) or 0.0), name))
         scored.sort(reverse=True)
         result: List[str] = []
@@ -520,6 +518,42 @@ class RootCauseArbiter:
             if len(result) >= limit:
                 break
         return result
+
+    def _secondary_submit_ready(self, candidate: Any) -> bool:
+        name = self._name(candidate)
+        matched = self._matched(candidate)
+        if f"diagnosis:{name}" in matched:
+            return True
+        if name == "心力衰竭":
+            return self._heart_failure_state_evidence(matched)
+        components = getattr(candidate, "component_scores", {}) or {}
+        if float(components.get("objective_evidence", 0.0) or 0.0) >= 1.0:
+            return True
+        return bool(matched & _OBJECTIVE_FINDINGS)
+
+    @staticmethod
+    def _heart_failure_state_evidence(matched: set[str]) -> bool:
+        if "heart_failure_state" in matched:
+            return True
+        congestion = bool(
+            matched
+            & {
+                "fluid_retention_pattern",
+                "leg_edema",
+                "symptom:下肢水肿",
+                "symptom:脚踝水肿",
+            }
+        )
+        positional_dyspnea = bool(
+            matched
+            & {
+                "orthopnea",
+                "paroxysmal_nocturnal_dyspnea",
+                "symptom:端坐呼吸",
+                "symptom:夜间阵发性呼吸困难",
+            }
+        )
+        return congestion and positional_dyspnea
 
     def _final_names(
         self,
@@ -601,12 +635,6 @@ class RootCauseArbiter:
         if root:
             setattr(root, "root_cause_role", "primary")
             setattr(root, "root_cause_coverage", round(float(coverage or 0.0), 4))
-            if any(
-                str(edge.get("source") or "") == primary
-                and bool(edge.get("authorize_required_gap"))
-                for edge in edges
-            ):
-                setattr(root, "required_gap_authorized", True)
         for name in secondary:
             candidate = by_name.get(name)
             if candidate:

@@ -40,6 +40,20 @@ class FakeActions:
         }
 
 
+class RecordingExamActions:
+    def __init__(self):
+        self.ordered_items = []
+
+    async def order_examination(self, patient_id, items, reason=""):
+        self.ordered_items.append(list(items))
+        return {
+            "results": {
+                item: {"status": "normal", "result": "test result"}
+                for item in items
+            }
+        }
+
+
 class AgentChainTests(unittest.IsolatedAsyncioTestCase):
     async def test_fake_actions_follow_evidence_first_submission_order(self):
         with open("config.yaml", "r", encoding="utf-8") as handle:
@@ -130,6 +144,54 @@ class AgentChainTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["diagnosis"][0], "低镁血症")
             self.assertTrue(result["finished"])
 
+    async def test_deferred_anchor_corrective_exam_can_exceed_regular_round_cap(self):
+        with open("config.yaml", "r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+        config = copy.deepcopy(config)
+        config["memory"]["json_path"] = "tests/_runtime_chain/memory.json"
+        config["memory"]["md_path"] = "tests/_runtime_chain/memory.md"
+        config["memory"]["diagnostic_replay_path"] = "tests/_runtime_chain/replay.jsonl"
+        config["policy_store_path"] = "tests/_runtime_chain/policies.json"
+        config["self_improve_enabled"] = False
+        agent = MyDoctorAgent(config)
+        actions = RecordingExamActions()
+        agent.actions = actions
+        planner = agent._get_planner()
+        planner.exam_rounds = agent.max_exam_rounds
+
+        rickets = "\u7ef4\u751f\u7d20D\u7f3a\u4e4f\u6027\u4f5d\u507b\u75c5"
+        exams = [
+            "\u7ef4\u751f\u7d20D\u68c0\u6d4b",
+            "\u7532\u72b6\u65c1\u817a\u6fc0\u7d20\u68c0\u6d4b\uff08PTH\uff09",
+        ]
+
+        blocked = await agent._maybe_order_critic_exams(
+            patient_id="case-deferred-anchor",
+            recommended_exams=exams,
+            exam_results={},
+            collected_info={"symptoms": ["leg pain"]},
+            candidate_diseases=[rickets],
+            add_strong_verification=False,
+        )
+        self.assertEqual(blocked, {})
+        self.assertEqual(actions.ordered_items, [])
+
+        ordered = await agent._maybe_order_critic_exams(
+            patient_id="case-deferred-anchor",
+            recommended_exams=exams,
+            exam_results={},
+            collected_info={"symptoms": ["leg pain"]},
+            candidate_diseases=[rickets],
+            add_strong_verification=False,
+            force_deferred_anchor_round=True,
+        )
+        self.assertIn("\u7ef4\u751f\u7d20D\u68c0\u6d4b", ordered)
+        self.assertIn(
+            "\u7532\u72b6\u65c1\u817a\u6fc0\u7d20\u68c0\u6d4b\uff08PTH\uff09",
+            ordered,
+        )
+        self.assertTrue(actions.ordered_items)
+
 
 class EvidenceGapExamRecommendationTests(unittest.TestCase):
     def make_agent(self):
@@ -161,6 +223,63 @@ class EvidenceGapExamRecommendationTests(unittest.TestCase):
         self.assertLessEqual(len(exams), 4)
         self.assertIn("综合代谢面板（CMP）", exams)
         self.assertIn("24小时尿电解质检测", exams)
+
+    def test_deferred_anchor_target_survives_discriminating_pool_for_exams(self):
+        agent = self.make_agent()
+        rickets = "维生素D缺乏性佝偻病"
+        info = {"symptoms": ["腿痛", "间歇性跛行", "楼梯耐受下降", "乏力"]}
+        evidence = EvidenceBundle(
+            [
+                Observation("bone_pain", "test", confidence=0.90),
+                Observation("waddling_gait", "test", confidence=0.84),
+                Observation("hypocalcemia", "test", confidence=0.92),
+                Observation("alp_elevated", "test", confidence=0.90),
+                Observation("magnesium_load_retention_high", "test", confidence=0.88),
+            ]
+        )
+        decision = agent.diagnosis_engine.decide(
+            {
+                "diagnosis_candidates": [
+                    {"name": "低镁血症", "confidence": 0.9},
+                    {"name": rickets, "confidence": 0.84},
+                    {"name": "肾上腺疾病", "confidence": 0.7},
+                ]
+            },
+            [],
+            evidence,
+        )
+        decision.judge_decision["needs_discriminating_exams"] = True
+        decision.judge_decision["evidence_gap_targets"] = [rickets]
+        decision.judge_decision["differential_candidates"] = ["低镁血症", "肾上腺疾病"]
+        decision.judge_decision["discriminating_exams"] = ["血清电解质", "24小时尿电解质检测"]
+
+        exams = agent._recommend_evidence_gap_exams(decision, info, {})
+
+        self.assertIn("维生素D检测", exams)
+        self.assertIn("甲状旁腺激素检测（PTH）", exams)
+
+        decision.judge_decision["needs_discriminating_exams"] = True
+        decision.judge_decision["evidence_gap_targets"] = [rickets, "房间隔缺损", "肺动脉瓣狭窄"]
+        decision.judge_decision["differential_candidates"] = [
+            "低镁血症",
+            rickets,
+            "房间隔缺损",
+            "肺动脉瓣狭窄",
+        ]
+        decision.judge_decision["discriminating_exams"] = [
+            "超声心动图",
+            "胸部X线检查（CXR）",
+            "心导管检查",
+            "心脏MRI（CMR）",
+        ]
+        exams = agent._recommend_evidence_gap_exams(decision, info, {})
+        self.assertIn("维生素D检测", exams)
+        self.assertIn("甲状旁腺激素检测（PTH）", exams)
+
+        decision.judge_decision["needs_discriminating_exams"] = False
+        exams = agent._recommend_evidence_gap_exams(decision, info, {})
+        self.assertIn("维生素D检测", exams)
+        self.assertIn("甲状旁腺激素检测（PTH）", exams)
 
     def test_pulmonary_renal_gap_recommends_vasculitis_workup(self):
         agent = self.make_agent()

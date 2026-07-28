@@ -41,6 +41,7 @@ from .clinical_evidence import (
     HybridEvidenceCompiler,
     Observation,
 )
+from .diagnosis_eligibility import DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED, PRIMARY_ELIGIBLE
 from .diagnosis_engine import DiagnosisDecisionEngine
 from .diagnosis_critic import DiagnosisCritic
 from .diagnostic_learning import DiagnosticLearningStore
@@ -1833,6 +1834,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             decision.get("required_gap_authorized_diagnoses")
         )
         judge_payload = decision.get("judge_decision") or {}
+        eligibility_distribution = dict(
+            decision.get("eligibility_distribution")
+            or judge_payload.get("eligibility_distribution")
+            or {}
+        )
         decision_conflicts = list(
             decision.get("evidence_conflicts")
             or judge_payload.get("evidence_conflicts")
@@ -1901,7 +1907,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             judge_payload.get("explanation_score_changed_ranking")
         )
         gap_state_distribution = dict(judge_payload.get("gap_state_distribution") or {})
-        judge_gap_authorization_rate = bool(required_gap_authorized_diagnoses)
+        judge_gap_authorization_rate = False
         judge_primary_accuracy = (
             bool(expected and judge_primary in set(expected))
             if expected
@@ -1913,11 +1919,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             for name in names or []:
                 entry = self.diagnosis_engine.knowledge.get(name)
                 dtype = str(entry.get("diagnosis_type") or "").lower()
-                try:
-                    specificity = float(entry.get("specificity", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    specificity = 0.0
-                if dtype in {"etiology", "metabolic", "structural", "systemic"} or specificity >= 0.85:
+                if dtype in {"etiology", "metabolic", "structural", "systemic"}:
                     priority.append(name)
             return priority
 
@@ -2368,9 +2370,11 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "etiology_preference": etiology_preference,
                 "decision_override_rate": decision_override_rate,
                 "judge_gap_authorization_rate": judge_gap_authorization_rate,
-                "required_gap_authorized_count": len(
-                    required_gap_authorized_diagnoses
-                ),
+                "required_gap_authorized_count": 0,
+                "primary_eligible_count": eligibility_distribution.get(PRIMARY_ELIGIBLE),
+                "deferred_needs_anchor_count": eligibility_distribution.get(DEFERRED),
+                "differential_only_count": eligibility_distribution.get(DIFFERENTIAL_ONLY),
+                "excluded_count": eligibility_distribution.get(EXCLUDED),
                 "judge_primary_accuracy": judge_primary_accuracy,
                 "explanatory_coverage": explanatory_coverage,
                 "core_explanatory_coverage": core_explanatory_coverage,
@@ -2504,6 +2508,22 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "primary_unlock_reason": primary_unlock_reason,
                 "explanation_score_changed_ranking": explanation_score_changed_ranking,
                 "gap_state_distribution": gap_state_distribution,
+                "eligibility_distribution": eligibility_distribution,
+                "primary_eligible_candidates": _names(
+                    decision.get("primary_eligible_candidates")
+                    or judge_payload.get("primary_eligible_candidates")
+                    or []
+                ),
+                "deferred_anchor_candidates": _names(
+                    decision.get("deferred_anchor_candidates")
+                    or judge_payload.get("deferred_anchor_candidates")
+                    or []
+                ),
+                "excluded_candidates": _names(
+                    decision.get("excluded_candidates")
+                    or judge_payload.get("excluded_candidates")
+                    or []
+                ),
                 "explanatory_coverage": explanatory_coverage,
                 "core_explanatory_coverage": core_explanatory_coverage,
                 "residual_evidence_score": residual_evidence_score,
@@ -3080,11 +3100,15 @@ class MyDoctorAgent(BaseDoctorAgent):
             )
             corrective_candidate_diseases = corrective_targets
             if pre_corrective_judge.get("needs_discriminating_exams"):
-                corrective_candidate_diseases = [
+                differential_candidates = [
                     str(item).strip()
                     for item in pre_corrective_judge.get("differential_candidates") or []
                     if str(item).strip()
-                ] or corrective_targets
+                ]
+                corrective_candidate_diseases = (
+                    list(dict.fromkeys(corrective_targets + differential_candidates))
+                    or corrective_targets
+                )
             corrective_results = await self._maybe_order_critic_exams(
                 patient_id=patient_id,
                 recommended_exams=recommended_exams,
@@ -3093,6 +3117,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 candidate_diseases=corrective_candidate_diseases,
                 add_strong_verification=not bool(
                     pre_corrective_judge.get("needs_discriminating_exams")
+                ),
+                force_deferred_anchor_round=self._has_deferred_anchor_target(
+                    decision,
+                    corrective_targets,
                 ),
             )
             if corrective_results:
@@ -3858,8 +3886,6 @@ class MyDoctorAgent(BaseDoctorAgent):
             dtype = str(getattr(candidate, "diagnosis_type", "") or "").lower()
             if dtype in {"etiology", "metabolic", "structural"}:
                 return True
-            if float(getattr(candidate, "specificity", 0.0) or 0.0) >= 0.85:
-                return True
         return False
 
     def _recommend_evidence_gap_exams(
@@ -3872,9 +3898,9 @@ class MyDoctorAgent(BaseDoctorAgent):
             return []
         judge_payload = getattr(decision, "judge_decision", None) or {}
         needs_discriminating = bool(judge_payload.get("needs_discriminating_exams"))
-        if self._strict_primary_exam_stop_active(decision) and not needs_discriminating:
-            return []
         targets = self._evidence_gap_target_diagnoses(decision)
+        if self._strict_primary_exam_stop_active(decision) and not needs_discriminating and not targets:
+            return []
         if not targets and not needs_discriminating:
             return []
         if targets:
@@ -3884,9 +3910,6 @@ class MyDoctorAgent(BaseDoctorAgent):
             for item in judge_payload.get("differential_candidates") or []
             if str(item).strip()
         ]
-        if needs_discriminating and differential_names:
-            differential_set = set(differential_names)
-            targets = [name for name in targets if name in differential_set]
 
         target_proposed: List[str] = []
         for name in targets:
@@ -3903,7 +3926,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 judge_proposed.append(text)
 
         if needs_discriminating:
-            proposed = list(dict.fromkeys(judge_proposed + target_proposed))
+            proposed = list(dict.fromkeys(target_proposed + judge_proposed))
             strategy_judge_payload = dict(judge_payload)
             strategy_judge_payload["discriminating_exams"] = list(proposed)
             strategy_judge_payload["differential_candidates"] = list(
@@ -3947,7 +3970,9 @@ class MyDoctorAgent(BaseDoctorAgent):
             judge_decision=strategy_judge_payload,
         )
         if needs_discriminating:
-            ordered_items = list(dict.fromkeys(list(strategy.get("items", []) or [])))
+            ordered_items = list(
+                dict.fromkeys(target_proposed + list(strategy.get("items", []) or []))
+            )
         else:
             ordered_items = list(
                 dict.fromkeys(proposed + list(strategy.get("items", []) or []))
@@ -4017,6 +4042,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         fallback = by_name.get(pre_primary)
         if not fallback or getattr(fallback, "hard_contradiction", False):
             return False
+        if str(getattr(fallback, "eligibility_status", "") or "") != PRIMARY_ELIGIBLE:
+            return False
         if not getattr(fallback, "matched_evidence", None):
             return False
         current = by_name.get(post_primary)
@@ -4035,14 +4062,15 @@ class MyDoctorAgent(BaseDoctorAgent):
         if fallback_score + 0.04 < current_score:
             return False
 
-        setattr(fallback, "required_gap_authorized", True)
         fallback.differential_only = False
         fallback.differential_only_reason = ""
         self.diagnosis_engine.authorize_final_diagnoses(
             decision,
             [pre_primary],
-            respect_differential_only=False,
+            respect_differential_only=True,
         )
+        if not decision.final_diagnoses or decision.final_diagnoses[0] != pre_primary:
+            return False
         payload = dict(post_judge or {})
         payload.update(
             {
@@ -4057,14 +4085,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "discriminating exams did not produce a clearly superior "
                     "primary; returning to pre-discrimination explanatory primary"
                 ),
-                "required_gap_authorized_diagnoses": list(
-                    dict.fromkeys(
-                        list(
-                            payload.get("required_gap_authorized_diagnoses") or []
-                        )
-                        + [pre_primary]
-                    )
-                ),
+                "required_gap_authorized_diagnoses": [],
                 "final_diagnoses": list(decision.final_diagnoses),
                 "discrimination_attempted": True,
                 "discrimination_resolved": False,
@@ -4072,9 +4093,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         )
         decision.judge_primary = pre_primary
         decision.submitter_final = list(decision.final_diagnoses)
-        decision.required_gap_authorized_diagnoses = list(
-            dict.fromkeys(list(decision.required_gap_authorized_diagnoses or []) + [pre_primary])
-        )
+        decision.required_gap_authorized_diagnoses = []
         decision.judge_decision = payload
         return True
 
@@ -4096,38 +4115,97 @@ class MyDoctorAgent(BaseDoctorAgent):
         def key(name: str) -> tuple:
             candidate = by_name.get(name)
             if not candidate:
-                return (0, 0, 0, 0.0, 0.0)
+                return (0, 0, 0, 0, 0, 0.0, 0.0)
             has_gap = 1 if getattr(candidate, "required_gaps", None) else 0
             priority = 1 if self._is_etiology_priority_candidate(candidate) else 0
-            objective = 1 if getattr(candidate, "matched_evidence", None) else 0
+            matched = set(getattr(candidate, "matched_evidence", None) or [])
+            objective = 1 if matched else 0
+            specific_matches = len(
+                [
+                    item
+                    for item in matched
+                    if not str(item).startswith(("field:", "symptom:"))
+                ]
+            )
+            match_count = len(matched)
             judge_score = review_scores.get(
                 name,
                 float(getattr(candidate, "score", 0.0) or 0.0),
             )
-            specificity = float(getattr(candidate, "specificity", 0.0) or 0.0)
-            return (has_gap, priority, objective, judge_score, specificity)
+            evidence_specificity = float(
+                getattr(candidate, "evidence_specificity_score", 0.0) or 0.0
+            )
+            return (
+                has_gap,
+                priority,
+                objective,
+                specific_matches,
+                match_count,
+                judge_score,
+                evidence_specificity,
+            )
 
         return sorted(list(dict.fromkeys(targets)), key=key, reverse=True)
 
     def _evidence_gap_target_diagnoses(self, decision) -> List[str]:
         judge_payload = getattr(decision, "judge_decision", None) or {}
-        if (
+        by_name = {item.diagnosis: item for item in decision.candidates}
+        selected = by_name.get((decision.final_diagnoses or [""])[0])
+        selected_names = set(decision.final_diagnoses or [])
+        unexplained = set(decision.unexplained_evidence or [])
+        strict_stop_active = (
             self._strict_primary_exam_stop_active(decision)
             and not bool(judge_payload.get("needs_discriminating_exams"))
-        ):
-            return []
-        by_name = {item.diagnosis: item for item in decision.candidates}
+        )
         targets: List[str] = []
+
+        def add_deferred_anchor_target(name: str) -> None:
+            candidate = by_name.get(str(name).strip())
+            if not candidate:
+                return
+            if (
+                str(getattr(candidate, "eligibility_status", "") or "") == DEFERRED
+                and str(getattr(candidate, "eligibility_reason", "") or "") == "NeedsAnchor"
+                and candidate.diagnosis not in targets
+            ):
+                if strict_stop_active:
+                    matched = set(getattr(candidate, "matched_evidence", None) or [])
+                    residual_matches = unexplained & matched
+                    objective_residual_matches = [
+                        item
+                        for item in residual_matches
+                        if not str(item).startswith(("field:", "symptom:"))
+                    ]
+                    specific_matches = [
+                        item
+                        for item in matched
+                        if not str(item).startswith(("field:", "symptom:"))
+                    ]
+                    if not objective_residual_matches or len(specific_matches) < 2:
+                        return
+                targets.append(candidate.diagnosis)
+
         judge_targets = [
             str(item).strip()
             for item in (judge_payload.get("evidence_gap_targets") or [])
             if str(item).strip()
         ]
-        if judge_targets:
-            for name in dict.fromkeys(judge_targets):
-                candidate = by_name.get(name)
-                if candidate and getattr(candidate, "required_gap_authorized", False):
-                    targets.append(name)
+        for name in dict.fromkeys(judge_targets):
+            add_deferred_anchor_target(name)
+        deferred_anchor_names = list(
+            getattr(decision, "deferred_anchor_candidates", []) or []
+        ) + list(judge_payload.get("deferred_anchor_candidates") or [])
+        for name in dict.fromkeys(
+            str(item).strip() for item in deferred_anchor_names if str(item).strip()
+        ):
+            add_deferred_anchor_target(name)
+
+        if strict_stop_active:
+            if targets:
+                prioritized = self._prioritize_evidence_gap_exam_targets(decision, targets)
+                limit = getattr(self.diagnosis_engine, "max_evidence_gap_targets", 2)
+                return prioritized[: max(1, int(limit or 2))]
+            return []
 
         close_margin = getattr(self.diagnosis_engine, "etiology_close_margin", 0.12)
         coverage_threshold = getattr(
@@ -4140,9 +4218,6 @@ class MyDoctorAgent(BaseDoctorAgent):
             "evidence_gap_residual_threshold",
             0.72,
         )
-        selected = by_name.get((decision.final_diagnoses or [""])[0])
-        selected_names = set(decision.final_diagnoses or [])
-        unexplained = set(decision.unexplained_evidence or [])
         gap_candidates = []
         for item in decision.candidates:
             if getattr(item, "differential_only", False) and not getattr(item, "required_gaps", None):
@@ -4161,8 +4236,8 @@ class MyDoctorAgent(BaseDoctorAgent):
             key=lambda item: (
                 getattr(item, "coverage_score", 0.0),
                 1.0 - getattr(item, "residual_score", 1.0),
+                getattr(item, "evidence_specificity_score", 0.0),
                 item.score,
-                item.specificity,
             ),
             reverse=True,
         )
@@ -4262,6 +4337,9 @@ class MyDoctorAgent(BaseDoctorAgent):
             and not getattr(candidate, "hard_contradiction", False)
             and self._is_etiology_priority_candidate(candidate)
         ):
+            return False
+        status = str(getattr(candidate, "eligibility_status", "") or "")
+        if status and status != DEFERRED:
             return False
         if candidate.diagnosis in selected_names:
             return True
@@ -4424,8 +4502,7 @@ class MyDoctorAgent(BaseDoctorAgent):
     @staticmethod
     def _is_etiology_priority_candidate(candidate) -> bool:
         dtype = str(getattr(candidate, "diagnosis_type", "") or "").lower()
-        specificity = float(getattr(candidate, "specificity", 0.0) or 0.0)
-        return dtype in {"etiology", "metabolic", "structural"} or specificity >= 0.85
+        return dtype in {"etiology", "metabolic", "structural"}
 
     async def _maybe_order_critic_exams(
         self,
@@ -4435,6 +4512,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         collected_info: Optional[Dict[str, Any]] = None,
         candidate_diseases: Optional[List[Any]] = None,
         add_strong_verification: bool = True,
+        force_deferred_anchor_round: bool = False,
     ) -> Dict[str, Any]:
         if (
             not recommended_exams
@@ -4442,7 +4520,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         ):
             return {}
         planner = self._get_planner()
-        if planner.exam_rounds >= self.max_exam_rounds:
+        if planner.exam_rounds >= self.max_exam_rounds and not force_deferred_anchor_round:
             return {}
         items = self.exam_agent.prepare_order_items(
             recommended_exams,
@@ -4496,6 +4574,23 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "diagnosis_critic_corrective_exam",
             )
         return new_results
+
+    @staticmethod
+    def _has_deferred_anchor_target(decision, targets: Optional[List[str]]) -> bool:
+        if not decision or not targets:
+            return False
+        target_set = {str(item).strip() for item in targets or [] if str(item).strip()}
+        if not target_set:
+            return False
+        for candidate in getattr(decision, "candidates", []) or []:
+            if str(getattr(candidate, "diagnosis", "") or "") not in target_set:
+                continue
+            if (
+                str(getattr(candidate, "eligibility_status", "") or "") == DEFERRED
+                and str(getattr(candidate, "eligibility_reason", "") or "") == "NeedsAnchor"
+            ):
+                return True
+        return False
 
     # ============ 反思并保存经验 ============
 

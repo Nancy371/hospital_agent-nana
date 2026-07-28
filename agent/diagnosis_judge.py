@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from .diagnosis_eligibility import DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED, PRIMARY_ELIGIBLE
+
 
 _GENERIC_PARENT_DIAGNOSES = {
     "\u80ba\u708e",
@@ -325,6 +327,9 @@ class JudgeCandidateReview:
     unexplained_core_evidence: List[str] = field(default_factory=list)
     explanatory_rank_reason: str = ""
     required_gap_state: str = ""
+    eligibility_status: str = ""
+    eligibility_reason: str = ""
+    missing_required_anchors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -387,6 +392,10 @@ class JudgeDecision:
     root_cause_coverage: float = 0.0
     candidate_explanation_edges: List[Dict[str, Any]] = field(default_factory=list)
     primary_override_source: str = ""
+    eligibility_distribution: Dict[str, int] = field(default_factory=dict)
+    deferred_anchor_candidates: List[str] = field(default_factory=list)
+    excluded_candidates: List[str] = field(default_factory=list)
+    primary_eligible_candidates: List[str] = field(default_factory=list)
     reasoning: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1097,7 +1106,6 @@ class DifferentialPoolFilter:
             candidate
             and (
                 self.judge._priority(candidate)
-                or float(getattr(candidate, "specificity", 0.0) or 0.0) >= 0.85
                 or self.judge._gap_authorizable(candidate)
             )
         )
@@ -1185,7 +1193,6 @@ class DiagnosisJudge:
         )
         self.priority_gap_bonus = float(section.get("priority_gap_bonus", 0.14) or 0.14)
         self.required_met_bonus = float(section.get("required_met_bonus", 0.005) or 0.005)
-        self.specificity_bonus = float(section.get("specificity_bonus", 0.08) or 0.08)
         self.coverage_bonus = float(section.get("coverage_bonus", 0.24) or 0.24)
         self.residual_penalty = float(section.get("residual_penalty", 0.18) or 0.18)
         self.core_coverage_bonus = float(
@@ -1219,12 +1226,18 @@ class DiagnosisJudge:
         preselected: Optional[Sequence[Any]] = None,
         max_final_diagnoses: int = 3,
     ) -> JudgeDecision:
-        ranked = [item for item in candidates or [] if self._has_signal(item)]
-        ranked = [item for item in ranked if not getattr(item, "hard_contradiction", False)]
-        ranked = sorted(ranked, key=self._sort_key, reverse=True)
+        ranked_all = [item for item in candidates or [] if self._has_signal(item)]
+        ranked_all = sorted(ranked_all, key=self._sort_key, reverse=True)
+        ranked = [
+            item
+            for item in ranked_all
+            if not getattr(item, "hard_contradiction", False)
+            and self._eligibility_status(item) != EXCLUDED
+        ]
         retriever_top1 = self._name(candidates[0]) if candidates else ""
 
         decision = JudgeDecision(retriever_top1=retriever_top1)
+        self._apply_eligibility_audit(decision, ranked_all)
         if not ranked:
             decision.reasoning = "Judge found no supported candidate."
             return decision
@@ -1237,10 +1250,15 @@ class DiagnosisJudge:
             ranked,
             conflict_affected_diagnoses,
         )
-        raw_differential_pool = self._differential_pool(ranked)
+        candidate_pool_for_workup = [
+            item
+            for item in ranked
+            if self._eligibility_status(item) in {PRIMARY_ELIGIBLE, DEFERRED}
+        ] or ranked
+        raw_differential_pool = self._differential_pool(candidate_pool_for_workup)
         raw_differential_pool = self._extend_forced_pool(
             raw_differential_pool,
-            ranked,
+            candidate_pool_for_workup,
             force_names,
         )
         raw_pool_source = self._differential_pool_source(raw_differential_pool)
@@ -1273,17 +1291,69 @@ class DiagnosisJudge:
             for task in discriminating_exam_tasks
             if str(task.get("exam") or "").strip()
         ]
-        primary_pool_names = {item.diagnosis for item in differential_pool}
         primary_candidates = [
-            item for item in differential_pool if item.diagnosis in primary_pool_names
-        ] or ranked[: self.top_k]
+            item
+            for item in differential_pool
+            if self._eligibility_status(item) == PRIMARY_ELIGIBLE
+        ] or [
+            item
+            for item in ranked[: self.top_k]
+            if self._eligibility_status(item) == PRIMARY_ELIGIBLE
+        ]
         primary = self._choose_primary(primary_candidates)
+        gap_state_by_candidate = self._gap_state_by_candidate(ranked_all)
+        gap_state_distribution = self._gap_state_distribution(gap_state_by_candidate)
         if primary is None:
-            decision.reasoning = "Judge found no eligible primary candidate."
+            provisional = self._best_deferred_candidate(differential_pool or ranked)
+            evidence_gap_targets = (
+                self._deferred_evidence_gap_targets(provisional, differential_pool)
+                if provisional
+                else []
+            )
+            blocked = self._blocked_records(ranked_all, [])
+            reviews = self._reviews(
+                ranked_all,
+                provisional,
+                [],
+                evidence_gap_targets,
+                blocked,
+            )
+            if provisional:
+                decision.judge_primary = provisional.diagnosis
+                decision.primary = provisional.diagnosis
+                decision.provisional_primary = provisional.diagnosis
+                decision.pre_discrimination_primary = provisional.diagnosis
+                decision.fallback_primary = provisional.diagnosis
+                decision.explanatory_coverage = self._coverage(provisional)
+                decision.core_explanatory_coverage = self._core_coverage(provisional)
+                decision.residual_evidence_score = self._residual(provisional)
+                decision.residual_core_evidence_count = self._residual_core_count(provisional)
+            decision.primary_status = "deferred"
+            decision.needs_discriminating_exams = bool(evidence_gap_targets)
+            decision.defer_reason = "no PrimaryEligible candidate; deferred candidates need required anchor evidence"
+            decision.discrimination_attempted = bool(evidence_gap_targets)
+            decision.discrimination_resolved = False
+            decision.evidence_gap_targets = evidence_gap_targets
+            decision.final_diagnoses = []
+            decision.required_gap_authorized_diagnoses = []
+            decision.blocked_diagnoses = blocked
+            decision.reviews = reviews
+            decision.required_gap_state_by_candidate = gap_state_by_candidate
+            decision.gap_state_distribution = gap_state_distribution
+            decision.differential_candidates = [item.diagnosis for item in differential_pool]
+            decision.pairwise_comparisons = pairwise
+            decision.excluded_from_pairwise = list(pool_filter.excluded)
+            decision.pool_filter_reasons = dict(pool_filter.pool_filter_reasons)
+            decision.discriminating_findings = discriminating_findings
+            decision.discriminating_exams = discriminating_exams
+            decision.discriminating_exam_tasks = discriminating_exam_tasks
+            decision.required_gap_by_candidate = required_gap_by_candidate
+            decision.differential_pool_source = dict(pool_filter.pool_source)
+            decision.evidence_conflicts = evidence_conflicts
+            decision.conflict_affected_diagnoses = conflict_affected_diagnoses
+            decision.reasoning = self._reasoning(decision)
             return decision
 
-        gap_state_by_candidate = self._gap_state_by_candidate(ranked)
-        gap_state_distribution = self._gap_state_distribution(gap_state_by_candidate)
         defer_reason = self._defer_primary_lock_reason(
             primary,
             differential_pool,
@@ -1292,12 +1362,11 @@ class DiagnosisJudge:
         )
         needs_discriminating = bool(defer_reason)
         primary_status = "deferred" if needs_discriminating else "locked"
-        gap_authorized: List[str] = []
-        if self._gap_submission_authorized(primary):
-            setattr(primary, "required_gap_authorized", True)
-            gap_authorized.append(primary.diagnosis)
 
-        secondary = self._select_secondary(primary, ranked, max_final_diagnoses)
+        eligible_ranked = [
+            item for item in ranked if self._eligibility_status(item) == PRIMARY_ELIGIBLE
+        ]
+        secondary = self._select_secondary(primary, eligible_ranked, max_final_diagnoses)
         final = [primary.diagnosis] + [item.diagnosis for item in secondary]
 
         if needs_discriminating:
@@ -1307,8 +1376,8 @@ class DiagnosisJudge:
             )
         else:
             evidence_gap_targets = self._evidence_gap_targets(primary, ranked, final)
-        blocked = self._blocked_records(ranked, final)
-        reviews = self._reviews(ranked, primary, secondary, evidence_gap_targets, blocked)
+        blocked = self._blocked_records(ranked_all, final)
+        reviews = self._reviews(ranked_all, primary, secondary, evidence_gap_targets, blocked)
 
         decision.judge_primary = primary.diagnosis
         decision.primary = primary.diagnosis
@@ -1325,7 +1394,7 @@ class DiagnosisJudge:
         decision.differential = [item["diagnosis"] for item in blocked[: self.max_reviews]]
         decision.evidence_gap_targets = evidence_gap_targets
         decision.final_diagnoses = final[:max(1, int(max_final_diagnoses or 1))]
-        decision.required_gap_authorized_diagnoses = gap_authorized
+        decision.required_gap_authorized_diagnoses = []
         decision.blocked_diagnoses = blocked
         decision.reviews = reviews
         decision.high_value_gap_candidates = [
@@ -1455,7 +1524,6 @@ class DiagnosisJudge:
         if not (
             self._priority(candidate)
             or self._gap_authorizable(candidate)
-            or float(getattr(candidate, "specificity", 0.0) or 0.0) >= 0.85
         ):
             return False
         return bool(
@@ -1777,7 +1845,6 @@ class DiagnosisJudge:
         priority_or_specific = (
             self._priority(contender)
             or self._systemic_primary(contender)
-            or float(getattr(contender, "specificity", 0.0) or 0.0) >= 0.85
         )
         if not priority_or_specific:
             return False
@@ -2142,7 +2209,17 @@ class DiagnosisJudge:
     def _high_prior_specific_exam_candidate(self, candidate: Any) -> bool:
         if not candidate or getattr(candidate, "hard_contradiction", False):
             return False
-        if float(getattr(candidate, "specificity", 0.0) or 0.0) < 0.85:
+        status = self._eligibility_status(candidate)
+        if status and status not in {PRIMARY_ELIGIBLE, DEFERRED}:
+            return False
+        evidence_specificity = float(
+            getattr(candidate, "evidence_specificity_score", 0.0) or 0.0
+        )
+        if (
+            evidence_specificity < 0.65
+            and not getattr(candidate, "required_gaps", None)
+            and not self._priority(candidate)
+        ):
             return False
         matched = set(getattr(candidate, "matched_evidence", []) or [])
         source_prior = float(getattr(candidate, "source_prior", 0.0) or 0.0)
@@ -2161,7 +2238,7 @@ class DiagnosisJudge:
             float(getattr(candidate, "source_prior", 0.0) or 0.0),
             1 if getattr(candidate, "required_gaps", None) else 0,
             float(getattr(candidate, "coverage_score", 0.0) or 0.0),
-            float(getattr(candidate, "specificity", 0.0) or 0.0),
+            float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0),
         )
 
     def _candidate_exam_union(self, candidates: Sequence[Any]) -> List[str]:
@@ -2290,8 +2367,7 @@ class DiagnosisJudge:
         if (
             f"diagnosis:{parent}" in parent_matched
             and (
-                getattr(selected, "required_gap_authorized", False)
-                or not getattr(selected, "required_met", False)
+                not getattr(selected, "required_met", False)
                 or not self._objective_signal(selected)
             )
         ):
@@ -2310,12 +2386,7 @@ class DiagnosisJudge:
     def _direct_parent_fallback_candidate(self, selected: Any, ranked: Sequence[Any]) -> Optional[Any]:
         if not (
             selected
-            and (
-                getattr(selected, "required_gap_authorized", False)
-                or self._gap_submission_authorized(selected)
-                or self._required_gap_state(selected)
-                in {"actionable_gap", "partially_satisfied", "nonblocking_gap"}
-            )
+            and self._eligibility_status(selected) == DEFERRED
             and not f"diagnosis:{selected.diagnosis}"
             in set(getattr(selected, "matched_evidence", []) or [])
         ):
@@ -2416,6 +2487,21 @@ class DiagnosisJudge:
                 break
             if candidate.diagnosis in final_set or candidate.diagnosis in targets:
                 continue
+            if self._eligibility_status(candidate) != DEFERRED:
+                continue
+            if not getattr(candidate, "required_gaps", None):
+                continue
+            if (
+                self._same_family(primary, candidate)
+                or self._causally_related(primary, candidate)
+                or self._high_value_unresolved_contender(primary, candidate)
+            ):
+                targets.append(candidate.diagnosis)
+        for candidate in ranked:
+            if len(targets) >= self.gap_target_limit:
+                break
+            if candidate.diagnosis in final_set or candidate.diagnosis in targets:
+                continue
             if not self._gap_authorizable(candidate):
                 continue
             if self._same_family(primary, candidate) or self._causally_related(primary, candidate):
@@ -2428,7 +2514,17 @@ class DiagnosisJudge:
         pool: Sequence[Any],
     ) -> List[str]:
         targets: List[str] = []
-        for candidate in [primary] + list(pool or []):
+        ordered_pool: List[Any] = []
+        seen_ids: set[int] = set()
+        for item in [primary] + list(pool or []):
+            if not item:
+                continue
+            marker = id(item)
+            if marker in seen_ids:
+                continue
+            seen_ids.add(marker)
+            ordered_pool.append(item)
+        for candidate in ordered_pool:
             if not candidate or candidate.diagnosis in targets:
                 continue
             if getattr(candidate, "hard_contradiction", False):
@@ -2440,7 +2536,21 @@ class DiagnosisJudge:
                 continue
             if candidate.diagnosis == getattr(primary, "diagnosis", ""):
                 targets.append(candidate.diagnosis)
+                break
+        for candidate in ordered_pool:
+            if len(targets) >= self.gap_target_limit:
+                break
+            if not candidate or candidate.diagnosis in targets:
                 continue
+            if getattr(candidate, "hard_contradiction", False):
+                continue
+            if self._eligibility_status(candidate) == DEFERRED and (
+                getattr(candidate, "required_gaps", None)
+                or self._candidate_discriminating_exams(candidate)
+            ):
+                targets.append(candidate.diagnosis)
+                continue
+        for candidate in ordered_pool:
             if self._high_value_unresolved_contender(primary, candidate):
                 targets.append(candidate.diagnosis)
             if len(targets) >= self.gap_target_limit:
@@ -2462,9 +2572,55 @@ class DiagnosisJudge:
             result[state] = result.get(state, 0) + 1
         return result
 
+    def _apply_eligibility_audit(
+        self,
+        decision: JudgeDecision,
+        ranked: Sequence[Any],
+    ) -> None:
+        distribution: Dict[str, int] = {}
+        primary: List[str] = []
+        deferred: List[str] = []
+        excluded: List[str] = []
+        for candidate in ranked or []:
+            status = self._eligibility_status(candidate)
+            if not status:
+                continue
+            distribution[status] = distribution.get(status, 0) + 1
+            if status == PRIMARY_ELIGIBLE:
+                primary.append(candidate.diagnosis)
+            elif status == DEFERRED:
+                deferred.append(candidate.diagnosis)
+            elif status == EXCLUDED:
+                excluded.append(candidate.diagnosis)
+        decision.eligibility_distribution = distribution
+        decision.primary_eligible_candidates = primary
+        decision.deferred_anchor_candidates = deferred
+        decision.excluded_candidates = excluded
+
+    @staticmethod
+    def _eligibility_status(candidate: Any) -> str:
+        return str(getattr(candidate, "eligibility_status", "") or "")
+
+    def _best_deferred_candidate(self, candidates: Sequence[Any]) -> Optional[Any]:
+        deferred = [
+            item for item in candidates or [] if self._eligibility_status(item) == DEFERRED
+        ]
+        if not deferred:
+            return None
+        return sorted(deferred, key=self._sort_key, reverse=True)[0]
+
     def _required_gap_state(self, candidate: Any) -> str:
         if not candidate:
             return "unsupported_gap"
+        status = self._eligibility_status(candidate)
+        if status == PRIMARY_ELIGIBLE:
+            return "satisfied"
+        if status == DEFERRED:
+            return "actionable_gap" if getattr(candidate, "required_gaps", None) else "partially_satisfied"
+        if status == DIFFERENTIAL_ONLY:
+            return "unsupported_gap"
+        if status == EXCLUDED:
+            return "hard_contradiction"
         if getattr(candidate, "hard_contradiction", False):
             return "hard_contradiction"
         existing = str(getattr(candidate, "required_gap_state", "") or "")
@@ -2493,15 +2649,6 @@ class DiagnosisJudge:
             return "nonblocking_gap"
         return "partially_satisfied"
 
-    def _gap_submission_authorized(self, candidate: Any) -> bool:
-        if getattr(candidate, "unresolved_evidence_conflict", False):
-            return False
-        state = self._required_gap_state(candidate)
-        return state in {"actionable_gap", "nonblocking_gap", "partially_satisfied"} and (
-            self._gap_authorizable(candidate)
-            or self._explanatory_gap_authorizable(candidate)
-        )
-
     def _explanatory_gap_authorizable(self, candidate: Any) -> bool:
         if not candidate or getattr(candidate, "hard_contradiction", False):
             return False
@@ -2512,7 +2659,6 @@ class DiagnosisJudge:
         if not (
             self._priority(candidate)
             or self._systemic_primary(candidate)
-            or float(getattr(candidate, "specificity", 0.0) or 0.0) >= 0.85
         ):
             return False
         if not self._core_support_signal(candidate):
@@ -2589,8 +2735,19 @@ class DiagnosisJudge:
                 continue
             reason = "differential_only"
             gap_state = self._required_gap_state(candidate)
+            status = self._eligibility_status(candidate)
+            eligibility_reason = str(getattr(candidate, "eligibility_reason", "") or "")
+            if status:
+                if status == DEFERRED:
+                    reason = f"Deferred:{eligibility_reason or 'NeedsAnchor'}"
+                elif status == DIFFERENTIAL_ONLY:
+                    reason = f"DifferentialOnly:{eligibility_reason or 'not primary eligible'}"
+                elif status == EXCLUDED:
+                    reason = f"Excluded:{eligibility_reason or 'eligibility gate'}"
             if getattr(candidate, "hard_contradiction", False):
                 reason = "hard_contradiction"
+            elif status:
+                pass
             elif not getattr(candidate, "matched_evidence", None):
                 reason = "no_supporting_evidence"
             elif not getattr(candidate, "required_met", False):
@@ -2615,6 +2772,17 @@ class DiagnosisJudge:
                     "required_met": bool(getattr(candidate, "required_met", False)),
                     "required_gap_state": gap_state,
                     "required_gaps": list(getattr(candidate, "required_gaps", []) or [])[:4],
+                    "eligibility_status": status,
+                    "eligibility_reason": eligibility_reason,
+                    "missing_required_anchors": list(
+                        getattr(candidate, "missing_required_anchors", []) or []
+                    )[:6],
+                    "satisfied_required_anchors": list(
+                        getattr(candidate, "satisfied_required_anchors", []) or []
+                    )[:6],
+                    "eligibility_blockers": list(
+                        getattr(candidate, "eligibility_blockers", []) or []
+                    )[:6],
                     "hard_contradiction": bool(getattr(candidate, "hard_contradiction", False)),
                 }
             )
@@ -2628,7 +2796,14 @@ class DiagnosisJudge:
         gap_targets: Sequence[str],
         blocked: Sequence[Dict[str, Any]],
     ) -> List[JudgeCandidateReview]:
-        roles = {primary.diagnosis: "primary"}
+        roles: Dict[str, str] = {}
+        if primary:
+            primary_role = (
+                "primary"
+                if self._eligibility_status(primary) == PRIMARY_ELIGIBLE
+                else "evidence_gap"
+            )
+            roles[primary.diagnosis] = primary_role
         roles.update({item.diagnosis: "secondary" for item in secondary})
         roles.update({name: "evidence_gap" for name in gap_targets if name not in roles})
         blocked_reasons = {item["diagnosis"]: item["reason"] for item in blocked}
@@ -2646,9 +2821,7 @@ class DiagnosisJudge:
                     score=float(getattr(candidate, "score", 0.0) or 0.0),
                     judge_score=round(self._judge_score(candidate), 4),
                     required_met=bool(getattr(candidate, "required_met", False)),
-                    required_gap_authorized=bool(
-                        getattr(candidate, "required_gap_authorized", False)
-                    ),
+                    required_gap_authorized=False,
                     hard_contradiction=bool(getattr(candidate, "hard_contradiction", False)),
                     coverage_score=float(getattr(candidate, "coverage_score", 0.0) or 0.0),
                     residual_score=float(getattr(candidate, "residual_score", 0.0) or 0.0),
@@ -2668,16 +2841,19 @@ class DiagnosisJudge:
                         getattr(candidate, "explanatory_rank_reason", "") or ""
                     ),
                     required_gap_state=self._required_gap_state(candidate),
+                    eligibility_status=self._eligibility_status(candidate),
+                    eligibility_reason=str(
+                        getattr(candidate, "eligibility_reason", "") or ""
+                    ),
+                    missing_required_anchors=list(
+                        getattr(candidate, "missing_required_anchors", []) or []
+                    )[:6],
                 )
             )
         return reviews
 
     def _requires_gap_authorization(self, candidate: Any) -> bool:
-        return bool(
-            candidate
-            and not getattr(candidate, "required_met", False)
-            and getattr(candidate, "required_gap_authorized", False)
-        )
+        return False
 
     def _gap_authorizable(self, candidate: Any) -> bool:
         if not candidate or getattr(candidate, "hard_contradiction", False):
@@ -2711,18 +2887,15 @@ class DiagnosisJudge:
         )
 
     def _trusted(self, candidate: Any) -> bool:
-        state = self._required_gap_state(candidate)
+        if not candidate:
+            return False
+        status = self._eligibility_status(candidate)
+        if status:
+            return status == PRIMARY_ELIGIBLE
         return bool(
-            candidate
-            and not getattr(candidate, "hard_contradiction", False)
+            not getattr(candidate, "hard_contradiction", False)
             and getattr(candidate, "matched_evidence", None)
-            and state
-            in {
-                "satisfied",
-                "partially_satisfied",
-                "actionable_gap",
-                "nonblocking_gap",
-            }
+            and getattr(candidate, "required_met", False)
         )
 
     def _has_signal(self, candidate: Any) -> bool:
@@ -2735,7 +2908,14 @@ class DiagnosisJudge:
         )
 
     def _sort_key(self, candidate: Any) -> tuple:
+        status_rank = {
+            PRIMARY_ELIGIBLE: 3,
+            DEFERRED: 2,
+            DIFFERENTIAL_ONLY: 1,
+            EXCLUDED: 0,
+        }.get(self._eligibility_status(candidate), 1)
         return (
+            status_rank,
             self._primary_eligibility_score(candidate),
             self._core_coverage(candidate),
             -self._residual_core_count(candidate),
@@ -2743,13 +2923,18 @@ class DiagnosisJudge:
             self._coverage(candidate),
             self._judge_score(candidate),
             1 if self._priority(candidate) else 0,
-            float(getattr(candidate, "specificity", 0.0) or 0.0),
+            float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0),
             float(getattr(candidate, "score", 0.0) or 0.0),
         )
 
     def _primary_eligibility_score(self, candidate: Any) -> float:
         if not candidate or getattr(candidate, "hard_contradiction", False):
             return -1.0
+        status = self._eligibility_status(candidate)
+        if status == EXCLUDED:
+            return -1.0
+        if status == DIFFERENTIAL_ONLY:
+            return -0.2
         gap_state = self._required_gap_state(candidate)
         gap_penalty = {
             "satisfied": 0.0,
@@ -2764,7 +2949,7 @@ class DiagnosisJudge:
             + 0.24 * self._coverage(candidate)
             + 0.14 * self._component_score(candidate, "core_evidence_score")
             + 0.22 * self._component_score(candidate, "diagnostic_evidence_score")
-            + 0.14 * float(getattr(candidate, "specificity", 0.0) or 0.0)
+            + 0.14 * float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0)
             + 0.12 * float(getattr(candidate, "source_prior", 0.0) or 0.0)
             + 0.10 * float(getattr(candidate, "score", 0.0) or 0.0)
             - 0.18 * min(1.0, 0.25 * self._residual_core_count(candidate))
@@ -2797,7 +2982,6 @@ class DiagnosisJudge:
         )
         score -= 0.14 * self._component_score(candidate, "generic_parent_penalty")
         score -= 0.06 * self._component_score(candidate, "specific_over_generic_penalty")
-        score += self.specificity_bonus * float(getattr(candidate, "specificity", 0.0) or 0.0)
         gap_state = self._required_gap_state(candidate)
         if gap_state == "satisfied":
             score += self.required_met_bonus
@@ -2887,7 +3071,7 @@ class DiagnosisJudge:
         dtype = str(getattr(candidate, "diagnosis_type", "") or "").lower()
         if not self._disease_specific_priority_allowed(candidate):
             return False
-        return dtype in _PRIORITY_TYPES or float(getattr(candidate, "specificity", 0.0) or 0.0) >= 0.85
+        return dtype in _PRIORITY_TYPES
 
     @staticmethod
     def _disease_specific_priority_allowed(candidate: Any) -> bool:
@@ -2999,6 +3183,8 @@ class DiagnosisJudge:
         components = getattr(candidate, "component_scores", {}) or {}
         if float(components.get("objective_evidence", 0.0) or 0.0) >= 1.0:
             return True
+        if candidate.diagnosis == "心力衰竭":
+            return DiagnosisJudge._heart_failure_state_evidence(matched)
         return bool(
             matched
             & {
@@ -3012,6 +3198,30 @@ class DiagnosisJudge:
                 "pulmonary_valve_stenosis",
             }
         )
+
+    @staticmethod
+    def _heart_failure_state_evidence(matched: set[str]) -> bool:
+        if "heart_failure_state" in matched:
+            return True
+        congestion = bool(
+            matched
+            & {
+                "fluid_retention_pattern",
+                "leg_edema",
+                "symptom:下肢水肿",
+                "symptom:脚踝水肿",
+            }
+        )
+        positional_dyspnea = bool(
+            matched
+            & {
+                "orthopnea",
+                "paroxysmal_nocturnal_dyspnea",
+                "symptom:端坐呼吸",
+                "symptom:夜间阵发性呼吸困难",
+            }
+        )
+        return congestion and positional_dyspnea
 
     @staticmethod
     def _objective_signal(candidate: Any) -> bool:
@@ -3041,10 +3251,6 @@ class DiagnosisJudge:
                 " Primary lock deferred for discriminating exams; "
                 f"provisional_primary={decision.provisional_primary}."
             )
-        if decision.required_gap_authorized_diagnoses:
-            text += " Required-gap authorization: " + ", ".join(
-                decision.required_gap_authorized_diagnoses
-            ) + "."
         if decision.primary_unlock_reason:
             text += " Primary unlock: " + decision.primary_unlock_reason + "."
         if decision.gap_state_distribution:
@@ -3067,10 +3273,6 @@ class DiagnosisSubmitter:
         if not decision or not judge_decision:
             return decision
         score_by_name = {item.diagnosis: item for item in getattr(decision, "candidates", []) or []}
-        for name in judge_decision.required_gap_authorized_diagnoses:
-            candidate = score_by_name.get(name)
-            if candidate:
-                setattr(candidate, "required_gap_authorized", True)
         for name in judge_decision.final_diagnoses:
             candidate = score_by_name.get(name)
             if candidate:
@@ -3086,12 +3288,22 @@ class DiagnosisSubmitter:
         decision.judge_primary = judge_decision.judge_primary
         decision.submitter_final = list(judge_decision.final_diagnoses)
         decision.decision_override = bool(judge_decision.decision_override)
-        decision.required_gap_authorized_diagnoses = list(
-            judge_decision.required_gap_authorized_diagnoses
-        )
+        decision.required_gap_authorized_diagnoses = []
         decision.evidence_conflicts = list(judge_decision.evidence_conflicts)
         decision.conflict_affected_diagnoses = list(
             judge_decision.conflict_affected_diagnoses
+        )
+        decision.eligibility_distribution = dict(
+            getattr(judge_decision, "eligibility_distribution", {}) or {}
+        )
+        decision.deferred_anchor_candidates = list(
+            getattr(judge_decision, "deferred_anchor_candidates", []) or []
+        )
+        decision.excluded_candidates = list(
+            getattr(judge_decision, "excluded_candidates", []) or []
+        )
+        decision.primary_eligible_candidates = list(
+            getattr(judge_decision, "primary_eligible_candidates", []) or []
         )
         decision.root_cause_arbitration = dict(
             getattr(judge_decision, "root_cause_arbitration", {}) or {}
@@ -3113,10 +3325,7 @@ class DiagnosisSubmitter:
             name
             for name in judge_decision.final_diagnoses
             if score_by_name.get(name)
-            and (
-                getattr(score_by_name[name], "trusted", False)
-                or getattr(score_by_name[name], "required_gap_authorized", False)
-            )
+            and getattr(score_by_name[name], "trusted", False)
         ]
         decision.blocked_diagnoses = list(judge_decision.blocked_diagnoses)
         decision.submission_override_count = int(judge_decision.decision_override)

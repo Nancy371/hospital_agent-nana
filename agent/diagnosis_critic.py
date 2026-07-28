@@ -286,7 +286,6 @@ class DiagnosisCritic:
                 or item.source_prior >= 0.45
                 or
                 item.diagnosis_type.lower() in {"etiology", "metabolic", "structural"}
-                or item.specificity >= 0.85
             )
         ]
         if priority_candidates:

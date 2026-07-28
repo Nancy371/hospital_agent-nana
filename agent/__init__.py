@@ -24,6 +24,12 @@ __all__ = [
     "DiagnosisDecisionEngine",
     "DiagnosticKnowledgeBase",
     "DiagnosisDecision",
+    "DiagnosisEligibilityGate",
+    "EligibilityResult",
+    "PRIMARY_ELIGIBLE",
+    "DEFERRED",
+    "DIFFERENTIAL_ONLY",
+    "EXCLUDED",
     "DiagnosisJudge",
     "JudgeDecision",
     "JudgeCandidateReview",
@@ -92,6 +98,16 @@ def __getattr__(name: str):
     if name in ("DiagnosisDecisionEngine", "DiagnosticKnowledgeBase", "DiagnosisDecision"):
         from . import diagnosis_engine as _diagnosis_engine
         return getattr(_diagnosis_engine, name)
+    if name in (
+        "DiagnosisEligibilityGate",
+        "EligibilityResult",
+        "PRIMARY_ELIGIBLE",
+        "DEFERRED",
+        "DIFFERENTIAL_ONLY",
+        "EXCLUDED",
+    ):
+        from . import diagnosis_eligibility as _diagnosis_eligibility
+        return getattr(_diagnosis_eligibility, name)
     if name in ("DiagnosisJudge", "JudgeDecision", "JudgeCandidateReview", "DiagnosisSubmitter"):
         from . import diagnosis_judge as _diagnosis_judge
         return getattr(_diagnosis_judge, name)

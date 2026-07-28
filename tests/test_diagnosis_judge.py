@@ -20,6 +20,7 @@ FRACTURE = "\u9aa8\u6298"
 ZOSTER = "\u5e26\u72b6\u75b1\u75b9"
 CONGENITAL_HEART = "\u5148\u5929\u6027\u5fc3\u810f\u75c5"
 PULMONARY_STENOSIS = "\u80ba\u52a8\u8109\u74e3\u72ed\u7a84"
+MITRAL_REGURGITATION = "\u4e8c\u5c16\u74e3\u53cd\u6d41"
 HEART_FAILURE = "\u5fc3\u529b\u8870\u7aed"
 OHSS = "\u5375\u5de2\u8fc7\u5ea6\u523a\u6fc0\u7efc\u5408\u5f81"
 PANCREATITIS = "\u80f0\u817a\u708e"
@@ -144,9 +145,11 @@ class DiagnosisJudgeTests(unittest.TestCase):
         )
         decision = self.run_candidates([eczema, yaws])
         payload = decision.judge_decision
-        self.assertEqual(decision.final_diagnoses, [YAWS])
-        self.assertIn(YAWS, decision.required_gap_authorized_diagnoses)
-        self.assertTrue(payload["explanation_score_changed_ranking"])
+        self.assertEqual(decision.final_diagnoses, [])
+        self.assertEqual(payload["primary_status"], "deferred")
+        self.assertIn(YAWS, payload["deferred_anchor_candidates"])
+        self.assertIn(YAWS, payload["evidence_gap_targets"])
+        self.assertEqual(decision.required_gap_authorized_diagnoses, [])
         self.assertEqual(payload["required_gap_state_by_candidate"][YAWS], "actionable_gap")
         self.assertEqual(payload["residual_core_evidence_count"], 0)
 
@@ -186,7 +189,9 @@ class DiagnosisJudgeTests(unittest.TestCase):
         self.assertTrue(payload["needs_discriminating_exams"])
         self.assertIn(YAWS, payload["differential_candidates"])
         self.assertIn("treponema_positive", payload["discriminating_findings"])
-        self.assertIn(YAWS, decision.required_gap_authorized_diagnoses)
+        self.assertIn(YAWS, payload["deferred_anchor_candidates"])
+        self.assertIn(YAWS, payload["evidence_gap_targets"])
+        self.assertEqual(decision.required_gap_authorized_diagnoses, [])
 
     def test_tb_is_not_locked_out_by_required_met_pneumonia(self):
         pneumonia = candidate(
@@ -222,9 +227,11 @@ class DiagnosisJudgeTests(unittest.TestCase):
         )
         decision = self.run_candidates([pneumonia, tb, lung_cancer])
         payload = decision.judge_decision
-        self.assertEqual(decision.final_diagnoses[0], TB)
+        self.assertNotIn(TB, decision.final_diagnoses)
         self.assertIn(TB, payload["differential_candidates"])
-        self.assertIn(TB, decision.required_gap_authorized_diagnoses)
+        self.assertIn(TB, payload["deferred_anchor_candidates"])
+        self.assertIn(TB, payload["evidence_gap_targets"])
+        self.assertEqual(decision.required_gap_authorized_diagnoses, [])
 
     def test_urachal_cyst_core_evidence_beats_urethral_syndrome(self):
         urethral = candidate(
@@ -259,9 +266,11 @@ class DiagnosisJudgeTests(unittest.TestCase):
             core_score=0.86,
         )
         decision = self.run_candidates([urethral, urachal])
-        self.assertEqual(decision.final_diagnoses[0], URACHAL_CYST)
-        self.assertIn(URACHAL_CYST, decision.required_gap_authorized_diagnoses)
-        self.assertTrue(decision.judge_decision["explanation_score_changed_ranking"])
+        self.assertEqual(decision.final_diagnoses, [])
+        self.assertEqual(decision.judge_decision["primary_status"], "deferred")
+        self.assertIn(URACHAL_CYST, decision.judge_decision["deferred_anchor_candidates"])
+        self.assertIn(URACHAL_CYST, decision.judge_decision["evidence_gap_targets"])
+        self.assertEqual(decision.required_gap_authorized_diagnoses, [])
 
     def test_av_block_core_evidence_beats_arrhythmia_parent(self):
         arrhythmia = candidate(
@@ -484,13 +493,8 @@ class DiagnosisJudgeTests(unittest.TestCase):
         exams = [item["exam"] for item in tasks]
         self.assertIn("血清电解质", exams)
         self.assertNotIn(LOW_MAGNESIUM, decision.final_diagnoses)
-        self.assertTrue(
-            any(
-                item.get("diagnosis") == LOW_MAGNESIUM
-                and item.get("reason") == "unresolved reasoning-structured evidence conflict"
-                for item in decision.blocked_diagnoses
-            )
-        )
+        self.assertEqual(low_magnesium.eligibility_status, "Deferred")
+        self.assertEqual(low_magnesium.eligibility_reason, "ConflictNeedsAdjudication")
 
     def test_final_gate_blocks_conflict_candidate_but_keeps_clean_alternative(self):
         low_magnesium = candidate(
@@ -614,7 +618,7 @@ class DiagnosisJudgeTests(unittest.TestCase):
         self.assertFalse(decision.judge_decision["root_cause_arbitration"]["applied"])
         self.assertEqual(low_magnesium.root_cause_role, "")
 
-    def test_root_cause_arbitration_can_authorize_mechanism_gap(self):
+    def test_root_cause_arbitration_keeps_deferred_root_cause_in_workup(self):
         low_magnesium = candidate(
             LOW_MAGNESIUM,
             0.67,
@@ -651,10 +655,11 @@ class DiagnosisJudgeTests(unittest.TestCase):
         rickets.component_scores["required_gap_state"] = "actionable_gap"
         decision = self.run_candidates([low_magnesium, rickets])
         payload = decision.judge_decision
-        self.assertEqual(decision.final_diagnoses, [RICKETS])
-        self.assertIn(RICKETS, decision.required_gap_authorized_diagnoses)
-        self.assertTrue(payload["root_cause_arbitration"]["applied"])
-        self.assertTrue(payload["root_cause_arbitration"]["primary_override"])
+        self.assertEqual(decision.final_diagnoses, [LOW_MAGNESIUM])
+        self.assertIn(RICKETS, payload["deferred_anchor_candidates"])
+        self.assertIn(RICKETS, payload["evidence_gap_targets"])
+        self.assertEqual(decision.required_gap_authorized_diagnoses, [])
+        self.assertFalse(payload["root_cause_arbitration"]["applied"])
 
     def test_root_cause_arbitration_respects_upstream_contradiction(self):
         low_magnesium = candidate(
@@ -721,6 +726,44 @@ class DiagnosisJudgeTests(unittest.TestCase):
         self.assertEqual(heart_failure.explained_by_root_cause, PULMONARY_STENOSIS)
         self.assertTrue(heart_failure.root_cause_submit_as_final)
 
+    def test_root_cause_arbitration_submits_heart_failure_with_state_pattern(self):
+        mitral = candidate(
+            MITRAL_REGURGITATION,
+            0.82,
+            required=True,
+            diagnosis_type="structural",
+            specificity=0.9,
+            coverage=0.78,
+            residual=0.18,
+            core_coverage=0.78,
+            matched=["mitral_regurgitation", "diagnosis:二尖瓣反流"],
+            core_score=0.76,
+            diagnostic_score=0.40,
+        )
+        heart_failure = candidate(
+            HEART_FAILURE,
+            0.52,
+            required=True,
+            diagnosis_type="state",
+            specificity=0.50,
+            coverage=0.62,
+            residual=0.28,
+            core_coverage=0.62,
+            matched=[
+                "fluid_retention_pattern",
+                "leg_edema",
+                "paroxysmal_nocturnal_dyspnea",
+                "dyspnea_on_exertion",
+            ],
+            core_score=0.44,
+            diagnostic_score=0.0,
+        )
+        decision = self.run_candidates([mitral, heart_failure])
+        self.assertEqual(decision.final_diagnoses[:2], [MITRAL_REGURGITATION, HEART_FAILURE])
+        self.assertTrue(decision.judge_decision["root_cause_arbitration"]["applied"])
+        self.assertEqual(heart_failure.explained_by_root_cause, MITRAL_REGURGITATION)
+        self.assertTrue(heart_failure.root_cause_submit_as_final)
+
     def test_direct_congenital_parent_beats_gap_child_even_without_parent_field(self):
         pulmonary = candidate(
             PULMONARY_STENOSIS,
@@ -752,15 +795,15 @@ class DiagnosisJudgeTests(unittest.TestCase):
         yaws = candidate(
             YAWS,
             0.56,
-            required=False,
+            required=True,
             diagnosis_type="etiology",
             specificity=0.94,
             coverage=0.74,
             residual=0.18,
             core_coverage=0.78,
             matched=["treponemal_skin_lesion", "periostitis"],
-            gaps=["treponema_positive"],
         )
+        self.engine.eligibility_gate.evaluate_all([previous, yaws], None)
         judge_decision = self.engine.judge.judge([previous, yaws], preselected=[ECZEMA])
         self.assertEqual(judge_decision.primary, YAWS)
         self.assertTrue(judge_decision.primary_unlock_reason)

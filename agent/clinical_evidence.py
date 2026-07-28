@@ -566,6 +566,9 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "right_heart_enlargement": ("右心房增大", "右心室扩大", "右心室扩张", "右心扩大"),
     "heart_failure_state": ("心力衰竭", "心衰", "容量超负荷"),
     "atelectasis": ("肺不张", "肺叶不张", "肺段不张"),
+    "mycoplasma_naat_positive": ("肺炎支原体核酸阳性", "支原体核酸阳性", "Mycoplasma NAAT阳性"),
+    "mycoplasma_antibody_positive": ("肺炎支原体抗体阳性", "支原体抗体阳性", "MP抗体阳性"),
+    "interstitial_infiltrate": ("影像间质性浸润", "间质性浸润", "间质性肺炎影像"),
     "bronchopneumonia": (
         "支气管肺炎",
         "小叶性肺炎",
@@ -597,6 +600,7 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "immunocompromised": ("免疫抑制", "免疫低下", "长期激素", "化疗后", "移植后", "中性粒细胞减少"),
     "candida_positive": ("念珠菌", "白色念珠菌", "假丝酵母菌", "Candida"),
     "fungal_pneumonia": ("真菌性肺炎", "肺真菌感染", "真菌病原体"),
+    "cryptococcal_antigen_positive": ("隐球菌抗原阳性", "CrAg阳性", "CrAg 阳性"),
     "uremia": ("尿毒症", "终末期肾病", "ESRD"),
     "egfr_low": ("eGFR降低", "eGFR下降", "肾小球滤过率降低"),
     "urea_elevated": ("尿素氮升高", "BUN升高"),

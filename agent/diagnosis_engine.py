@@ -9,6 +9,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .candidate_generator import CandidateGenerator, CandidatePool
 from .clinical_evidence import EvidenceBundle, Observation
+from .diagnosis_eligibility import (
+    DEFERRED,
+    DIFFERENTIAL_ONLY,
+    EXCLUDED,
+    PRIMARY_ELIGIBLE,
+    DiagnosisEligibilityGate,
+)
 from .diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter
 from .diagnosis_resolver import DiagnosisResolution, OpenWorldDiagnosisResolver
 from .evidence_conflicts import EvidenceConflictArbiter
@@ -202,9 +209,20 @@ class CandidateScore:
     explained_by_root_cause: str = ""
     root_cause_role: str = ""
     root_cause_submit_as_final: bool = False
+    eligibility_status: str = ""
+    eligibility_reason: str = ""
+    missing_required_anchors: List[str] = field(default_factory=list)
+    satisfied_required_anchors: List[str] = field(default_factory=list)
+    eligibility_blockers: List[str] = field(default_factory=list)
+    evidence_contributions: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    positive_evidence_score: float = 0.0
+    evidence_specificity_score: float = 0.0
 
     @property
     def trusted(self) -> bool:
+        if self.eligibility_status:
+            return self.eligibility_status == PRIMARY_ELIGIBLE
         return (
             self.required_met
             and not self.hard_contradiction
@@ -247,6 +265,10 @@ class DiagnosisDecision:
     root_cause_primary: str = ""
     root_cause_secondary: List[str] = field(default_factory=list)
     candidate_explanation_edges: List[Dict[str, Any]] = field(default_factory=list)
+    eligibility_distribution: Dict[str, int] = field(default_factory=dict)
+    deferred_anchor_candidates: List[str] = field(default_factory=list)
+    excluded_candidates: List[str] = field(default_factory=list)
+    primary_eligible_candidates: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -282,6 +304,10 @@ class DiagnosisDecision:
             "root_cause_primary": self.root_cause_primary,
             "root_cause_secondary": list(self.root_cause_secondary),
             "candidate_explanation_edges": list(self.candidate_explanation_edges),
+            "eligibility_distribution": dict(self.eligibility_distribution),
+            "deferred_anchor_candidates": list(self.deferred_anchor_candidates),
+            "excluded_candidates": list(self.excluded_candidates),
+            "primary_eligible_candidates": list(self.primary_eligible_candidates),
         }
 
 
@@ -633,13 +659,14 @@ class DiagnosisDecisionEngine:
         self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
         self.conflict_arbiter = EvidenceConflictArbiter(self.knowledge)
         self.root_cause_arbiter = RootCauseArbiter(self.knowledge, ref_dir=ref_dir)
+        self.eligibility_gate = DiagnosisEligibilityGate(self.knowledge)
 
     @staticmethod
     def _load_weights(configured: Dict[str, Any]) -> Dict[str, float]:
         defaults = {
             "evidence": 0.52,
             "prior": 0.10,
-            "specificity": 0.08,
+            "specificity": 0.0,
             "explain": 0.16,
             "exam_match": 0.06,
             "temporal": 0.03,
@@ -660,6 +687,7 @@ class DiagnosisDecisionEngine:
                 defaults[key] = float(configured.get(key, default))
             except (AttributeError, TypeError, ValueError):
                 defaults[key] = default
+        defaults["specificity"] = 0.0
         return defaults
 
     def decide(
@@ -700,7 +728,6 @@ class DiagnosisDecisionEngine:
             for name, entry in self.knowledge.entries.items()
         ]
         self._apply_competitive_specificity(scores)
-        scores = self._sort_candidates(scores)
         self._clear_submission_marks(scores)
         evidence_conflicts = self.conflict_arbiter.detect(
             llm_result or {},
@@ -708,6 +735,8 @@ class DiagnosisDecisionEngine:
             scores,
         )
         self._apply_evidence_conflicts(scores, evidence_conflicts)
+        eligibility_summary = self.eligibility_gate.evaluate_all(scores, evidence)
+        scores = self._sort_candidates(scores)
 
         trusted_pool = [
             item for item in scores
@@ -779,6 +808,18 @@ class DiagnosisDecisionEngine:
                 for item in evidence_conflicts
                 if str(item.get("affected_diagnosis") or "")
             ],
+            eligibility_distribution=dict(
+                eligibility_summary.get("eligibility_distribution") or {}
+            ),
+            deferred_anchor_candidates=list(
+                eligibility_summary.get("deferred_anchor_candidates") or []
+            ),
+            excluded_candidates=list(
+                eligibility_summary.get("excluded_candidates") or []
+            ),
+            primary_eligible_candidates=list(
+                eligibility_summary.get("primary_eligible_candidates") or []
+            ),
         )
         self.judge_and_submit(decision)
         return decision
@@ -810,6 +851,26 @@ class DiagnosisDecisionEngine:
         """Run the replayable judge and submitter over an existing decision."""
         if not decision:
             return decision
+        if not any(
+            str(getattr(item, "eligibility_status", "") or "")
+            for item in decision.candidates or []
+        ):
+            eligibility_summary = self.eligibility_gate.evaluate_all(
+                decision.candidates,
+                None,
+            )
+            decision.eligibility_distribution = dict(
+                eligibility_summary.get("eligibility_distribution") or {}
+            )
+            decision.deferred_anchor_candidates = list(
+                eligibility_summary.get("deferred_anchor_candidates") or []
+            )
+            decision.excluded_candidates = list(
+                eligibility_summary.get("excluded_candidates") or []
+            )
+            decision.primary_eligible_candidates = list(
+                eligibility_summary.get("primary_eligible_candidates") or []
+            )
         judge_decision = self.judge.judge(
             decision.candidates,
             preselected=decision.final_diagnoses,
@@ -848,9 +909,7 @@ class DiagnosisDecisionEngine:
             for name in dict.fromkeys(str(item).strip() for item in diagnosis_names if str(item).strip())
             if name in score_by_name
             and (
-                score_by_name[name].trusted
-                or getattr(score_by_name[name], "required_gap_authorized", False)
-                or bool(score_by_name[name].matched_evidence)
+                score_by_name[name].eligibility_status == PRIMARY_ELIGIBLE
             )
             and not score_by_name[name].hard_contradiction
             and not (
@@ -878,6 +937,7 @@ class DiagnosisDecisionEngine:
             return decision
 
         score_by_name = {item.diagnosis: item for item in decision.candidates}
+        existing_blocked = list(decision.blocked_diagnoses or [])
         pre_names = list(
             dict.fromkeys(
                 str(item).strip()
@@ -910,6 +970,8 @@ class DiagnosisDecisionEngine:
                 eligible.append(candidate)
 
         if not eligible:
+            if not blocked and not pre_names:
+                blocked = existing_blocked
             decision.pre_authorization_diagnoses = pre_names
             decision.authorized_diagnoses = []
             decision.blocked_diagnoses = blocked
@@ -971,8 +1033,7 @@ class DiagnosisDecisionEngine:
         decision.trusted_diagnoses = [
             item.diagnosis
             for item in authorized
-            if item.score >= self.trusted_threshold
-            or getattr(item, "required_gap_authorized", False)
+            if item.score >= self.trusted_threshold or item.trusted
         ]
         decision.confidence = authorized[0].score if authorized else 0.0
         self._annotate_causal_relations(decision.candidates, authorized)
@@ -995,11 +1056,15 @@ class DiagnosisDecisionEngine:
             return "hard contradiction present"
         if getattr(candidate, "unresolved_evidence_conflict", False):
             return "unresolved reasoning-structured evidence conflict"
-        gap_authorized = bool(getattr(candidate, "required_gap_authorized", False))
+        status = str(getattr(candidate, "eligibility_status", "") or "")
+        if status and status != PRIMARY_ELIGIBLE:
+            if status == DEFERRED:
+                return "candidate deferred pending required anchor evidence"
+            if status == EXCLUDED:
+                return "candidate excluded by eligibility gate"
+            return "candidate is differential-only by eligibility gate"
         if candidate.required_gaps and not self._gap_candidate_has_submission_evidence(candidate):
             return "required evidence gap lacks objective confirmation"
-        if gap_authorized and not self._gap_candidate_has_submission_evidence(candidate):
-            return "required gap authorization lacks objective or diagnostic evidence"
         if (
             decision
             and self._strong_open_world_contenders(decision.open_world_candidates)
@@ -1009,7 +1074,7 @@ class DiagnosisDecisionEngine:
             return "strong open-world contender remains unresolved"
         if not candidate.matched_evidence:
             return "no matched supporting evidence"
-        if not candidate.trusted and not gap_authorized and candidate.score <= 0:
+        if not candidate.trusted and candidate.score <= 0:
             return "not trusted by evidence-first decision"
         return ""
 
@@ -1072,7 +1137,7 @@ class DiagnosisDecisionEngine:
         if not selected:
             return False
         dtype = candidate.diagnosis_type.lower()
-        if dtype not in {"structural", "etiology", "metabolic"} and candidate.specificity < 0.88:
+        if dtype not in {"structural", "etiology", "metabolic"}:
             return False
         return any(
             self._same_family_or_explicit_related(candidate.diagnosis, item.diagnosis)
@@ -1238,6 +1303,18 @@ class DiagnosisDecisionEngine:
                     "conflict_adjudication_exams": list(
                         getattr(candidate, "conflict_adjudication_exams", []) or []
                     ),
+                    "eligibility_status": str(
+                        getattr(candidate, "eligibility_status", "") or ""
+                    ),
+                    "eligibility_reason": str(
+                        getattr(candidate, "eligibility_reason", "") or ""
+                    ),
+                    "missing_required_anchors": list(
+                        getattr(candidate, "missing_required_anchors", []) or []
+                    ),
+                    "eligibility_blockers": list(
+                        getattr(candidate, "eligibility_blockers", []) or []
+                    ),
                     "root_cause_role": str(
                         getattr(candidate, "root_cause_role", "") or ""
                     ),
@@ -1299,18 +1376,25 @@ class DiagnosisDecisionEngine:
     ) -> List[CandidateScore]:
         return sorted(candidates, key=self._candidate_sort_key, reverse=True)
 
-    def _candidate_sort_key(self, candidate: CandidateScore) -> Tuple[float, int, float, float, float, float]:
+    def _candidate_sort_key(self, candidate: CandidateScore) -> Tuple[float, ...]:
         audit_visibility_bonus = 0.0
         if candidate.source_prior >= 0.5 and candidate.matched_evidence:
             audit_visibility_bonus += 0.04
         if self._is_secondary_manifestation(candidate) and candidate.matched_evidence:
             audit_visibility_bonus += 0.20
+        eligibility_rank = {
+            PRIMARY_ELIGIBLE: 3.0,
+            DEFERRED: 2.0,
+            DIFFERENTIAL_ONLY: 1.0,
+            EXCLUDED: 0.0,
+        }.get(candidate.eligibility_status, 1.0)
         return (
+            eligibility_rank,
             self._adjudication_score(candidate) + audit_visibility_bonus,
             self._diagnosis_type_rank(candidate),
             candidate.source_prior,
             1.0 - candidate.residual_score,
-            candidate.specificity,
+            candidate.evidence_specificity_score,
             candidate.score,
         )
 
@@ -1348,8 +1432,6 @@ class DiagnosisDecisionEngine:
         dtype = candidate.diagnosis_type.lower()
         if dtype in {"etiology", "metabolic", "structural"}:
             return 4
-        if candidate.specificity >= 0.85:
-            return 3
         if dtype == "disease":
             return 2
         if dtype in {"syndrome", "state", "complication"}:
@@ -1359,10 +1441,7 @@ class DiagnosisDecisionEngine:
     @staticmethod
     def _is_etiology_priority_candidate(candidate: CandidateScore) -> bool:
         dtype = candidate.diagnosis_type.lower()
-        return (
-            dtype in {"etiology", "metabolic", "structural"}
-            or candidate.specificity >= 0.85
-        )
+        return dtype in {"etiology", "metabolic", "structural"}
 
     def render_candidate_table(self, decision: DiagnosisDecision, limit: int = 8) -> str:
         lines = ["【证据评分候选】"]
@@ -1408,6 +1487,9 @@ class DiagnosisDecisionEngine:
                     "coverage_score": item.coverage_score,
                     "residual_score": item.residual_score,
                     "causal_relation_to_selected": item.causal_relation_to_selected,
+                    "eligibility_status": item.eligibility_status,
+                    "eligibility_reason": item.eligibility_reason,
+                    "missing_required_anchors": list(item.missing_required_anchors),
                 }
             )
         return details
@@ -1543,11 +1625,13 @@ class DiagnosisDecisionEngine:
         diagnostic_evidence_score = tiered["diagnostic_score"]
         specificity = float(entry.get("specificity", 0.5) or 0.5)
         has_signal = bool(matched or prior > 0)
-        specificity_score = specificity if has_signal else 0.0
+        specificity_score = 0.0
         dtype = str(entry.get("diagnosis_type") or "disease").lower()
         etiology_structural_score = (
-            specificity
-            if has_signal and (dtype in {"etiology", "metabolic", "structural", "systemic"} or specificity >= 0.85)
+            1.0
+            if has_signal
+            and dtype in {"etiology", "metabolic", "structural", "systemic"}
+            and (core_evidence_score >= 0.20 or diagnostic_evidence_score > 0.0 or required_met)
             else 0.0
         )
         exam_match = self._expected_exam_match(entry, evidence) if has_signal else 0.0
@@ -1571,7 +1655,6 @@ class DiagnosisDecisionEngine:
         raw_score = (
             self.weights["evidence"] * support_score * 0.45
             + self.weights["prior"] * max(0.0, min(1.0, prior))
-            + self.weights["specificity"] * specificity_score
             + self.weights["explain"] * explanation
             + self.weights["core_explain"] * core_coverage
             + self.weights["generic_evidence"] * generic_evidence_score
@@ -1643,7 +1726,8 @@ class DiagnosisDecisionEngine:
             component_scores={
                 "evidence": round(support_score, 4),
                 "prior": round(max(0.0, min(1.0, prior)), 4),
-                "specificity": round(specificity_score, 4),
+                "specificity": 0.0,
+                "disease_specificity_metadata": round(specificity, 4),
                 "explain": round(explanation, 4),
                 "coverage": round(coverage_score, 4),
                 "explanatory_coverage": round(coverage_score, 4),
@@ -1746,11 +1830,9 @@ class DiagnosisDecisionEngine:
     ) -> float:
         name = str(entry.get("name") or "")
         dtype = str(entry.get("diagnosis_type") or "").lower()
-        specificity = float(entry.get("specificity", 0.5) or 0.5)
         is_generic = (
             name in _GENERIC_PARENT_DIAGNOSES
             or dtype in {"syndrome", "state", "complication"}
-            or (specificity <= 0.55 and not entry.get("generalization_suppressions"))
         )
         if not is_generic:
             return 0.0
@@ -1834,7 +1916,6 @@ class DiagnosisDecisionEngine:
                     continue
                 if (
                     generic_name not in explicit_generic_names
-                    and generic.specificity > specific.specificity
                     and generic.parent_diagnosis != specific.diagnosis
                 ):
                     continue
@@ -2368,7 +2449,7 @@ class DiagnosisDecisionEngine:
     @staticmethod
     def _is_causal_primary(candidate: CandidateScore) -> bool:
         dtype = candidate.diagnosis_type.lower()
-        return dtype in {"etiology", "metabolic", "structural"} or candidate.specificity >= 0.85
+        return dtype in {"etiology", "metabolic", "structural"}
 
     @staticmethod
     def _has_independent_state_evidence(candidate: CandidateScore) -> bool:
@@ -2382,9 +2463,21 @@ class DiagnosisDecisionEngine:
         if candidate.diagnosis != "心力衰竭":
             return False
         matched = set(candidate.matched_evidence or [])
+        return DiagnosisDecisionEngine._heart_failure_state_evidence(matched)
+
+    @staticmethod
+    def _heart_failure_state_evidence(matched: set[str]) -> bool:
         if "heart_failure_state" in matched:
             return True
-        congestion = bool(matched & {"leg_edema", "symptom:下肢水肿", "symptom:脚踝水肿"})
+        congestion = bool(
+            matched
+            & {
+                "fluid_retention_pattern",
+                "leg_edema",
+                "symptom:下肢水肿",
+                "symptom:脚踝水肿",
+            }
+        )
         positional_dyspnea = bool(
             matched
             & {

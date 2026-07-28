@@ -49,6 +49,9 @@
         "required_any_findings": [
           "ventricular_septal_defect",
           "pulmonary_valve_stenosis",
+          "mitral_regurgitation",
+          "tricuspid_regurgitation",
+          "pulmonary_valve_gradient",
           "left_to_right_shunt",
           "valve_gradient_high",
           "severe_regurgitation"
