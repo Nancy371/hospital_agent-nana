@@ -16,6 +16,7 @@ from .diagnosis_eligibility import (
     PRIMARY_ELIGIBLE,
     DiagnosisEligibilityGate,
 )
+from .disease_entity import DiseaseEntityRegistry
 from .diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter
 from .diagnosis_resolver import DiagnosisResolution, OpenWorldDiagnosisResolver
 from .evidence_conflicts import EvidenceConflictArbiter
@@ -218,6 +219,11 @@ class CandidateScore:
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
     positive_evidence_score: float = 0.0
     evidence_specificity_score: float = 0.0
+    entity_id: str = ""
+    canonical_name: str = ""
+    submission_name: str = ""
+    raw_names: List[str] = field(default_factory=list)
+    submittable: bool = True
 
     @property
     def trusted(self) -> bool:
@@ -243,6 +249,7 @@ class DiagnosisDecision:
     margin: float
     low_confidence: bool
     evidence_reasoning: str = ""
+    entity_resolutions: List[Dict[str, Any]] = field(default_factory=list)
     name_resolutions: List[Dict[str, Any]] = field(default_factory=list)
     unresolved_candidates: List[str] = field(default_factory=list)
     differential_only_diagnoses: List[Dict[str, Any]] = field(default_factory=list)
@@ -280,6 +287,7 @@ class DiagnosisDecision:
             "margin": self.margin,
             "low_confidence": self.low_confidence,
             "evidence_reasoning": self.evidence_reasoning,
+            "entity_resolutions": list(self.entity_resolutions),
             "name_resolutions": list(self.name_resolutions),
             "unresolved_candidates": list(self.unresolved_candidates),
             "differential_only_diagnoses": list(self.differential_only_diagnoses),
@@ -320,10 +328,12 @@ class DiagnosticKnowledgeBase:
         self.extensions_path = os.path.join(ref_dir, "submission_diagnosis_extensions.json")
         self.graph_path = os.path.join(ref_dir, "disease_graph.json")
         self.knowledge_path = os.path.join(ref_dir, "diagnostic_knowledge.json")
+        self.entity_registry = DiseaseEntityRegistry(ref_dir)
         self.entries: Dict[str, Dict[str, Any]] = {}
         self.aliases: Dict[str, str] = {}
         self.official_names: Set[str] = set()
         self.extension_names: Set[str] = set()
+        self.entity_id_by_name: Dict[str, str] = {}
         self.knowledge_version = ""
         self.source_registry: Dict[str, Any] = {}
         self._load()
@@ -336,6 +346,9 @@ class DiagnosticKnowledgeBase:
         text = str(value or "").strip()
         if not text:
             return None
+        entity = self.entity_registry.resolve(text)
+        if entity and entity.submittable:
+            return entity.display_name
         if text in self.entries and text in (self.official_names | self.extension_names):
             return text
         if text in self.aliases:
@@ -353,8 +366,50 @@ class DiagnosticKnowledgeBase:
         return bool(normalized and normalized in (self.official_names | self.extension_names))
 
     def get(self, name: Any) -> Dict[str, Any]:
+        entity = self.entity_registry.get(name)
+        if entity and entity.display_name in self.entries:
+            return self.entries.get(entity.display_name, {})
         normalized = self.normalize_name(name) or str(name or "")
         return self.entries.get(normalized, {})
+
+    def resolve_entity(self, value: Any):
+        return self.entity_registry.resolve(value)
+
+    def entity_id_for(self, value: Any) -> str:
+        entity = self.entity_registry.get(value)
+        if entity:
+            return entity.entity_id
+        normalized = self.normalize_name(value)
+        if normalized:
+            return self.entity_id_by_name.get(normalized, "")
+        return ""
+
+    def submission_name_for(self, value: Any) -> str:
+        entity = self.entity_registry.get(value)
+        if entity:
+            return entity.display_name
+        normalized = self.normalize_name(value)
+        return normalized or str(value or "")
+
+    def canonical_name_for(self, value: Any) -> str:
+        entity = self.entity_registry.get(value)
+        if entity:
+            return entity.canonical_name
+        normalized = self.normalize_name(value)
+        return normalized or str(value or "")
+
+    def is_submittable_entity(self, value: Any) -> bool:
+        entity = self.entity_registry.get(value)
+        if entity:
+            return bool(entity.submittable)
+        normalized = self.normalize_name(value)
+        return bool(normalized and normalized in (self.official_names | self.extension_names))
+
+    def get_exam_bundle(self, value: Any) -> List[str]:
+        return self.entity_registry.exam_bundle_for(value)
+
+    def get_discriminating_exam_bundle(self, value: Any) -> List[str]:
+        return self.entity_registry.discriminating_exam_bundle_for(value)
 
     def get_treatment_protocols(self, diagnoses: Iterable[Any]) -> List[str]:
         protocols: List[str] = []
@@ -511,6 +566,8 @@ class DiagnosticKnowledgeBase:
 
         self._merge_disease_graph()
 
+        self._merge_entity_registry()
+
         # A direct positive or negative mention is a generic evidence source for every disease.
         for name, entry in self.entries.items():
             entry["supporting_evidence"] = _dedupe_specs(
@@ -620,6 +677,73 @@ class DiagnosticKnowledgeBase:
                         list(entry.get(key, []) or []) + list(node.get(key, []) or [])
                     )
 
+    def _merge_entity_registry(self) -> None:
+        """Overlay canonical entity metadata onto legacy disease entries."""
+        for entity in self.entity_registry.entities_by_id.values():
+            name = entity.display_name
+            if not name:
+                continue
+            if entity.source_kind == "official_catalog":
+                self.official_names.add(name)
+            elif entity.submittable:
+                self.extension_names.add(name)
+            if name not in self.entries:
+                self.entries[name] = self._base_entry(name)
+            entry = self.entries[name]
+            entry["name"] = name
+            entry["entity_id"] = entity.entity_id
+            entry["canonical_name"] = entity.canonical_name
+            entry["submission_name"] = entity.display_name
+            entry["submittable"] = bool(entity.submittable)
+            entry["source_kind"] = entity.source_kind
+            if entity.parent_name:
+                entry["parent_diagnosis"] = entity.parent_name
+            if entity.department:
+                entry["department"] = entity.department
+            if entity.icd10:
+                entry["icd10"] = entity.icd10
+            if entity.diagnosis_type:
+                entry["diagnosis_type"] = entity.diagnosis_type
+            if entity.body_system:
+                entry["body_system"] = entity.body_system
+            if entity.disease_family or entity.family:
+                entry["disease_family"] = entity.disease_family or entity.family
+                entry["family"] = entity.family or entity.disease_family
+            entry["aliases"] = _dedupe_objects(
+                list(entry.get("aliases", []) or [])
+                + [entity.canonical_name, entity.display_name]
+                + list(entity.aliases or [])
+            )
+            entry["discriminating_exams"] = list(
+                dict.fromkeys(
+                    list(entry.get("discriminating_exams", []) or [])
+                    + list(entity.discriminating_exam_bundle or entity.exam_bundle or [])
+                )
+            )
+            entry["entity_exam_bundle"] = list(entity.exam_bundle or [])
+            entry["entity_discriminating_exam_bundle"] = list(
+                entity.discriminating_exam_bundle or entity.exam_bundle or []
+            )
+            evidence_profile = dict(entity.evidence_profile or {})
+            if evidence_profile.get("supporting_evidence"):
+                entry["supporting_evidence"] = _dedupe_specs(
+                    list(entry.get("supporting_evidence", []) or [])
+                    + list(evidence_profile.get("supporting_evidence") or [])
+                )
+            if evidence_profile.get("required_groups") and not entry.get("required_groups"):
+                entry["required_groups"] = list(evidence_profile.get("required_groups") or [])
+            if evidence_profile.get("contradictions"):
+                entry["contradictions"] = _dedupe_objects(
+                    list(entry.get("contradictions", []) or [])
+                    + list(evidence_profile.get("contradictions") or [])
+                )
+            self.entity_id_by_name[name] = entity.entity_id
+            self.aliases[name] = name
+            for alias in [entity.canonical_name, entity.display_name] + list(entity.aliases or []):
+                text = str(alias or "").strip()
+                if text:
+                    self.aliases[text] = name
+
 
 class DiagnosisDecisionEngine:
     """Score every allowed diagnosis and arbitrate a small final diagnosis set."""
@@ -718,15 +842,18 @@ class DiagnosisDecisionEngine:
             item.to_dict()
             for item in self.mechanism_reasoner.retrieval_views(evidence)
         ]
-        scores = [
-            self._score_entry(
-                entry,
-                priors.get(name, 0.0),
-                evidence,
-                candidate_sources=sources_by_name.get(name, []),
+        scores = []
+        for name, entry in self.knowledge.entries.items():
+            entity_id = str(entry.get("entity_id") or "")
+            source_key = entity_id or name
+            scores.append(
+                self._score_entry(
+                    entry,
+                    max(priors.get(source_key, 0.0), priors.get(name, 0.0)),
+                    evidence,
+                    candidate_sources=sources_by_name.get(source_key, sources_by_name.get(name, [])),
+                )
             )
-            for name, entry in self.knowledge.entries.items()
-        ]
         self._apply_competitive_specificity(scores)
         self._clear_submission_marks(scores)
         evidence_conflicts = self.conflict_arbiter.detect(
@@ -796,6 +923,7 @@ class DiagnosisDecisionEngine:
             margin=round(margin, 4),
             low_confidence=low_confidence,
             evidence_reasoning=reasoning,
+            entity_resolutions=self._entity_resolution_audit(candidate_pool, scores),
             name_resolutions=list(candidate_pool.name_resolutions),
             unresolved_candidates=list(candidate_pool.unresolved_candidates),
             differential_only_diagnoses=differential_only,
@@ -832,9 +960,12 @@ class DiagnosisDecisionEngine:
         if not evidence_conflicts:
             return
         by_name = {item.diagnosis: item for item in scores}
+        by_entity = {item.entity_id: item for item in scores if getattr(item, "entity_id", "")}
         for conflict in evidence_conflicts:
             diagnosis = str(conflict.get("affected_diagnosis") or "").strip()
-            candidate = by_name.get(diagnosis)
+            entity_id = str(conflict.get("entity_id") or "").strip()
+            candidate = by_entity.get(entity_id) if entity_id else None
+            candidate = candidate or by_name.get(diagnosis)
             if candidate is None:
                 continue
             candidate.evidence_conflicts.append(dict(conflict))
@@ -846,6 +977,76 @@ class DiagnosisDecisionEngine:
                 if text and text not in exams:
                     exams.append(text)
             candidate.conflict_adjudication_exams = exams
+
+    def _entity_resolution_audit(
+        self,
+        candidate_pool: CandidatePool,
+        scores: Sequence[CandidateScore],
+    ) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str, str]] = set()
+
+        def add_record(raw_name: Any, entity_id: Any, canonical_name: Any, submission_name: Any, source: Any, submittable: Any) -> None:
+            raw = str(raw_name or "").strip()
+            eid = str(entity_id or "").strip()
+            canonical = str(canonical_name or "").strip()
+            submission = str(submission_name or canonical).strip()
+            if not (raw or eid or canonical or submission):
+                return
+            key = (raw, eid, str(source or ""))
+            if key in seen:
+                return
+            seen.add(key)
+            records.append(
+                {
+                    "raw_name": raw,
+                    "entity_id": eid,
+                    "canonical_name": canonical,
+                    "submission_name": submission,
+                    "source": str(source or ""),
+                    "submittable": bool(submittable),
+                }
+            )
+
+        for resolution in candidate_pool.name_resolutions or []:
+            add_record(
+                resolution.get("raw_name"),
+                resolution.get("entity_id"),
+                resolution.get("canonical_name"),
+                resolution.get("submission_name"),
+                "resolver",
+                resolution.get("submittable"),
+            )
+        for item in candidate_pool.items or []:
+            add_record(
+                item.raw_name,
+                item.entity_id,
+                item.canonical_name,
+                item.submission_name,
+                item.source,
+                item.submittable,
+            )
+        for item in candidate_pool.open_world_candidates or []:
+            add_record(
+                item.get("raw_name"),
+                item.get("entity_id"),
+                item.get("canonical_name"),
+                item.get("submission_name"),
+                item.get("source"),
+                item.get("submittable"),
+            )
+        for score in scores or []:
+            if not getattr(score, "entity_id", ""):
+                continue
+            add_record(
+                score.diagnosis,
+                score.entity_id,
+                score.canonical_name,
+                score.submission_name,
+                "scored_candidate",
+                score.submittable,
+            )
+        return records
 
     def judge_and_submit(self, decision: DiagnosisDecision) -> DiagnosisDecision:
         """Run the replayable judge and submitter over an existing decision."""
@@ -904,19 +1105,22 @@ class DiagnosisDecisionEngine:
         if not respect_differential_only:
             self._clear_submission_marks(scores)
         score_by_name = {item.diagnosis: item for item in scores}
-        pool = [
-            score_by_name[name]
-            for name in dict.fromkeys(str(item).strip() for item in diagnosis_names if str(item).strip())
-            if name in score_by_name
-            and (
-                score_by_name[name].eligibility_status == PRIMARY_ELIGIBLE
-            )
-            and not score_by_name[name].hard_contradiction
-            and not (
-                respect_differential_only
-                and score_by_name[name].differential_only
-            )
-        ]
+        score_by_entity = {item.entity_id: item for item in scores if getattr(item, "entity_id", "")}
+        pool: List[CandidateScore] = []
+        for name in dict.fromkeys(str(item).strip() for item in diagnosis_names if str(item).strip()):
+            entity_id = self.knowledge.entity_id_for(name)
+            candidate = (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(name)
+            if candidate is None:
+                continue
+            if candidate.eligibility_status != PRIMARY_ELIGIBLE:
+                continue
+            if candidate.hard_contradiction:
+                continue
+            if respect_differential_only and candidate.differential_only:
+                continue
+            if not candidate.submittable:
+                continue
+            pool.append(candidate)
         selected = self._select_final(self._sort_candidates(pool))
         selected = self._append_independent_states(selected, scores)
         self._annotate_causal_relations(scores, selected)
@@ -937,6 +1141,11 @@ class DiagnosisDecisionEngine:
             return decision
 
         score_by_name = {item.diagnosis: item for item in decision.candidates}
+        score_by_entity = {
+            item.entity_id: item
+            for item in decision.candidates
+            if getattr(item, "entity_id", "")
+        }
         existing_blocked = list(decision.blocked_diagnoses or [])
         pre_names = list(
             dict.fromkeys(
@@ -955,7 +1164,8 @@ class DiagnosisDecisionEngine:
         eligible: List[CandidateScore] = []
         blocked: List[Dict[str, Any]] = []
         for name in pre_names:
-            candidate = score_by_name.get(name)
+            entity_id = self.knowledge.entity_id_for(name)
+            candidate = (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(name)
             reason = self._authorization_ineligible_reason(
                 candidate,
                 respect_differential_only=respect_differential_only,
@@ -1013,11 +1223,12 @@ class DiagnosisDecisionEngine:
         requested_set = set(pre_names)
         authorized_set = set(authorized_names)
         for name in pre_names:
-            if name in authorized_set or not score_by_name.get(name):
+            entity_id = self.knowledge.entity_id_for(name)
+            candidate = (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(name)
+            if name in authorized_set or not candidate:
                 continue
             if any(item.get("diagnosis") == name for item in blocked):
                 continue
-            candidate = score_by_name[name]
             reason = "not selected by final diagnosis authorization gate"
             self._mark_differential_only(candidate, reason)
             blocked.append(self._authorization_block_record(name, candidate, reason))
@@ -1050,6 +1261,8 @@ class DiagnosisDecisionEngine:
     ) -> str:
         if candidate is None:
             return "not present in evidence-first candidate table"
+        if not bool(getattr(candidate, "submittable", True)):
+            return "entity is not submittable"
         if respect_differential_only and candidate.differential_only:
             return candidate.differential_only_reason or "differential only"
         if candidate.hard_contradiction:
@@ -1085,8 +1298,11 @@ class DiagnosisDecisionEngine:
     ) -> CandidateScore:
         current_names = list(decision.final_diagnoses or [])
         for name in current_names:
+            entity_id = self.knowledge.entity_id_for(name)
             for candidate in eligible:
-                if candidate.diagnosis == name:
+                if candidate.diagnosis == name or (
+                    entity_id and getattr(candidate, "entity_id", "") == entity_id
+                ):
                     return candidate
         return self._sort_candidates(eligible)[0]
 
@@ -1231,6 +1447,8 @@ class DiagnosisDecisionEngine:
                 prior = 0.0
             metadata = item.get("metadata") or {}
             source = str(item.get("source") or "")
+            if bool(item.get("submittable", False)):
+                continue
             if prior < 0.62:
                 continue
             if source not in {"mechanism_reasoner", "external_retrieval", "llm_unresolved"}:
@@ -1279,6 +1497,10 @@ class DiagnosisDecisionEngine:
             record.update(
                 {
                     "score": candidate.score,
+                    "entity_id": str(getattr(candidate, "entity_id", "") or ""),
+                    "canonical_name": str(getattr(candidate, "canonical_name", "") or ""),
+                    "submission_name": str(getattr(candidate, "submission_name", "") or ""),
+                    "submittable": bool(getattr(candidate, "submittable", True)),
                     "coverage_score": candidate.coverage_score,
                     "residual_score": candidate.residual_score,
                     "required_met": candidate.required_met,
@@ -1347,9 +1569,20 @@ class DiagnosisDecisionEngine:
             respect_differential_only=True,
         )
         decision.differential_only_diagnoses = self.differential_only_details(decision.candidates)
-        fixed["diagnosis"] = list(decision.final_diagnoses)
-        fixed["_trusted_diagnoses"] = list(decision.trusted_diagnoses)
-        fixed["_authorized_diagnoses"] = list(decision.authorized_diagnoses or decision.final_diagnoses)
+        final_submission_names = [
+            self.knowledge.submission_name_for(item)
+            for item in decision.final_diagnoses
+            if self.knowledge.submission_name_for(item)
+        ]
+        fixed["diagnosis"] = list(dict.fromkeys(final_submission_names))
+        fixed["_trusted_diagnoses"] = [
+            self.knowledge.submission_name_for(item)
+            for item in decision.trusted_diagnoses
+        ]
+        fixed["_authorized_diagnoses"] = [
+            self.knowledge.submission_name_for(item)
+            for item in (decision.authorized_diagnoses or decision.final_diagnoses)
+        ]
         fixed["_blocked_diagnoses"] = list(decision.blocked_diagnoses)
         fixed["_retriever_top1"] = decision.retriever_top1
         fixed["_judge_primary"] = decision.judge_primary
@@ -1359,6 +1592,7 @@ class DiagnosisDecisionEngine:
         )
         fixed["_authorization_locked"] = True
         fixed["_diagnosis_decision"] = decision.to_dict()
+        fixed["_diagnosis_entity_resolution"] = list(decision.entity_resolutions)
         fixed["_diagnosis_name_resolution"] = list(decision.name_resolutions)
         fixed["_unresolved_diagnosis_candidates"] = list(decision.unresolved_candidates)
         fixed["_open_world_diagnosis_candidates"] = list(decision.open_world_candidates)
@@ -1763,6 +1997,17 @@ class DiagnosisDecisionEngine:
             diagnosis_type=str(entry.get("diagnosis_type") or "disease"),
             parent_diagnosis=str(entry.get("parent_diagnosis") or ""),
             specificity=specificity,
+            entity_id=str(entry.get("entity_id") or ""),
+            canonical_name=str(entry.get("canonical_name") or entry.get("name") or ""),
+            submission_name=str(entry.get("submission_name") or entry.get("name") or ""),
+            raw_names=list(
+                dict.fromkeys(
+                    str(item.get("raw_name") or "").strip()
+                    for item in (candidate_sources or [])
+                    if str(item.get("raw_name") or "").strip()
+                )
+            ),
+            submittable=bool(entry.get("submittable", True)),
         )
 
     @classmethod

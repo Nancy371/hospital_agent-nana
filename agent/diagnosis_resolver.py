@@ -17,10 +17,13 @@ class DiagnosisResolution:
     confidence: float
     model_confidence: float = 1.0
     alternatives: List[Dict[str, Any]] = field(default_factory=list)
+    entity_id: str = ""
+    submission_name: str = ""
+    submittable: bool = False
 
     @property
     def resolved(self) -> bool:
-        return bool(self.canonical_name)
+        return bool(self.canonical_name or self.entity_id)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -75,6 +78,10 @@ class OpenWorldDiagnosisResolver:
         clean = self.clean_name(raw)
         if not clean:
             return DiagnosisResolution(raw, None, None, "empty", 0.0, model_confidence)
+
+        entity = self._resolve_entity(clean)
+        if entity:
+            return self._resolved_entity(raw, entity, "exact_or_alias", 1.0, model_confidence)
 
         exact = self.knowledge.normalize_name(clean)
         if exact:
@@ -172,6 +179,18 @@ class OpenWorldDiagnosisResolver:
     def _build_search_terms(self) -> List[Tuple[str, str]]:
         terms: List[Tuple[str, str]] = []
         seen: set[Tuple[str, str]] = set()
+        registry = getattr(self.knowledge, "entity_registry", None)
+        if registry is not None:
+            for entity in getattr(registry, "entities_by_id", {}).values():
+                if not getattr(entity, "submittable", False):
+                    continue
+                canonical = getattr(entity, "display_name", "") or getattr(entity, "canonical_name", "")
+                for alias in [entity.canonical_name, entity.submission_name] + list(entity.aliases or []):
+                    clean = self.clean_name(alias).lower()
+                    key = (clean, canonical)
+                    if clean and key not in seen:
+                        seen.add(key)
+                        terms.append(key)
         for alias, canonical in self.knowledge.aliases.items():
             if canonical not in set(self.knowledge.allowed_names):
                 continue
@@ -256,6 +275,39 @@ class OpenWorldDiagnosisResolver:
         ranked.sort(key=lambda item: (item[0], len(item[2])), reverse=True)
         return ranked
 
+    def _resolve_entity(self, value: Any) -> Any:
+        resolver = getattr(self.knowledge, "resolve_entity", None)
+        if not callable(resolver):
+            return None
+        return resolver(value)
+
+    def _resolved_entity(
+        self,
+        raw: str,
+        entity: Any,
+        method: str,
+        confidence: float,
+        model_confidence: float,
+    ) -> DiagnosisResolution:
+        canonical = str(
+            getattr(entity, "submission_name", "")
+            or getattr(entity, "canonical_name", "")
+            or ""
+        )
+        resolution = self._resolved(raw, canonical, method, confidence, model_confidence)
+        resolution.entity_id = str(getattr(entity, "entity_id", "") or "")
+        resolution.canonical_name = canonical or str(getattr(entity, "canonical_name", "") or "")
+        resolution.submission_name = str(
+            getattr(entity, "submission_name", "")
+            or getattr(entity, "canonical_name", "")
+            or resolution.canonical_name
+            or ""
+        )
+        resolution.submittable = bool(getattr(entity, "submittable", False))
+        if not resolution.parent_name:
+            resolution.parent_name = str(getattr(entity, "parent_name", "") or "") or None
+        return resolution
+
     def _resolved(
         self,
         raw: str,
@@ -266,6 +318,7 @@ class OpenWorldDiagnosisResolver:
     ) -> DiagnosisResolution:
         entry = self.knowledge.get(canonical)
         parent = str(entry.get("parent_diagnosis") or "").strip() or None
+        entity = self._resolve_entity(canonical)
         return DiagnosisResolution(
             raw_name=raw,
             canonical_name=canonical,
@@ -273,6 +326,15 @@ class OpenWorldDiagnosisResolver:
             method=method,
             confidence=round(max(0.0, min(1.0, confidence)), 4),
             model_confidence=round(max(0.0, min(1.0, model_confidence)), 4),
+            entity_id=str(getattr(entity, "entity_id", "") or entry.get("entity_id") or ""),
+            submission_name=str(
+                getattr(entity, "submission_name", "")
+                or entry.get("submission_name")
+                or canonical
+            ),
+            submittable=bool(
+                getattr(entity, "submittable", entry.get("submittable", True))
+            ),
         )
 
 

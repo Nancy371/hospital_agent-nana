@@ -308,6 +308,10 @@ class JudgeCandidateReview:
     diagnosis: str
     role: str
     reason: str
+    entity_id: str = ""
+    canonical_name: str = ""
+    submission_name: str = ""
+    submittable: bool = True
     score: float = 0.0
     judge_score: float = 0.0
     required_met: bool = False
@@ -338,8 +342,11 @@ class JudgeCandidateReview:
 @dataclass
 class JudgeDecision:
     retriever_top1: str = ""
+    retriever_top1_entity_id: str = ""
     judge_primary: str = ""
+    judge_primary_entity_id: str = ""
     primary: str = ""
+    primary_entity_id: str = ""
     primary_status: str = "locked"
     needs_discriminating_exams: bool = False
     provisional_primary: str = ""
@@ -353,9 +360,13 @@ class JudgeDecision:
     fallback_to_pre_discrimination_primary: bool = False
     differential_pool_source: Dict[str, str] = field(default_factory=dict)
     secondary: List[str] = field(default_factory=list)
+    secondary_entity_ids: List[str] = field(default_factory=list)
     differential: List[str] = field(default_factory=list)
+    differential_entity_ids: List[str] = field(default_factory=list)
     evidence_gap_targets: List[str] = field(default_factory=list)
+    evidence_gap_target_entity_ids: List[str] = field(default_factory=list)
     final_diagnoses: List[str] = field(default_factory=list)
+    final_entity_ids: List[str] = field(default_factory=list)
     required_gap_authorized_diagnoses: List[str] = field(default_factory=list)
     blocked_diagnoses: List[Dict[str, Any]] = field(default_factory=list)
     reviews: List[JudgeCandidateReview] = field(default_factory=list)
@@ -396,6 +407,7 @@ class JudgeDecision:
     deferred_anchor_candidates: List[str] = field(default_factory=list)
     excluded_candidates: List[str] = field(default_factory=list)
     primary_eligible_candidates: List[str] = field(default_factory=list)
+    entity_resolutions: List[Dict[str, Any]] = field(default_factory=list)
     reasoning: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1351,6 +1363,7 @@ class DiagnosisJudge:
             decision.differential_pool_source = dict(pool_filter.pool_source)
             decision.evidence_conflicts = evidence_conflicts
             decision.conflict_affected_diagnoses = conflict_affected_diagnoses
+            self._apply_entity_audit(decision, ranked_all)
             decision.reasoning = self._reasoning(decision)
             return decision
 
@@ -1455,6 +1468,7 @@ class DiagnosisJudge:
                 "ranked": [
                     {
                         "diagnosis": item.diagnosis,
+                        "entity_id": str(getattr(item, "entity_id", "") or ""),
                         "primary_eligibility_score": round(
                             self._primary_eligibility_score(item),
                             4,
@@ -1485,6 +1499,7 @@ class DiagnosisJudge:
         decision.reasoning = self._reasoning(decision)
         decision.evidence_conflicts = evidence_conflicts
         decision.conflict_affected_diagnoses = conflict_affected_diagnoses
+        self._apply_entity_audit(decision, ranked_all)
         return decision
 
     def _differential_pool(self, ranked: Sequence[Any]) -> List[Any]:
@@ -2759,6 +2774,10 @@ class DiagnosisJudge:
             blocked.append(
                 {
                     "diagnosis": candidate.diagnosis,
+                    "entity_id": str(getattr(candidate, "entity_id", "") or ""),
+                    "canonical_name": str(getattr(candidate, "canonical_name", "") or candidate.diagnosis),
+                    "submission_name": str(getattr(candidate, "submission_name", "") or candidate.diagnosis),
+                    "submittable": bool(getattr(candidate, "submittable", True)),
                     "reason": reason,
                     "score": getattr(candidate, "score", 0.0),
                     "judge_score": round(self._judge_score(candidate), 4),
@@ -2785,8 +2804,70 @@ class DiagnosisJudge:
                     )[:6],
                     "hard_contradiction": bool(getattr(candidate, "hard_contradiction", False)),
                 }
-            )
+                )
         return blocked
+
+    def _apply_entity_audit(
+        self,
+        decision: JudgeDecision,
+        candidates: Sequence[Any],
+    ) -> None:
+        by_name = {self._name(item): item for item in candidates or [] if self._name(item)}
+        by_entity = {
+            str(getattr(item, "entity_id", "") or ""): item
+            for item in candidates or []
+            if str(getattr(item, "entity_id", "") or "")
+        }
+
+        def candidate_for_name(name: Any) -> Any:
+            text = str(name or "").strip()
+            if not text:
+                return None
+            entity_id = ""
+            if self.knowledge and hasattr(self.knowledge, "entity_id_for"):
+                entity_id = self.knowledge.entity_id_for(text)
+            return (by_entity.get(entity_id) if entity_id else None) or by_name.get(text)
+
+        def entity_id_for_name(name: Any) -> str:
+            candidate = candidate_for_name(name)
+            if candidate is not None:
+                return str(getattr(candidate, "entity_id", "") or "")
+            if self.knowledge and hasattr(self.knowledge, "entity_id_for"):
+                return self.knowledge.entity_id_for(name)
+            return ""
+
+        decision.retriever_top1_entity_id = entity_id_for_name(decision.retriever_top1)
+        decision.judge_primary_entity_id = entity_id_for_name(decision.judge_primary)
+        decision.primary_entity_id = entity_id_for_name(decision.primary)
+        decision.secondary_entity_ids = [
+            entity_id_for_name(name) for name in decision.secondary if entity_id_for_name(name)
+        ]
+        decision.differential_entity_ids = [
+            entity_id_for_name(name) for name in decision.differential if entity_id_for_name(name)
+        ]
+        decision.evidence_gap_target_entity_ids = [
+            entity_id_for_name(name) for name in decision.evidence_gap_targets if entity_id_for_name(name)
+        ]
+        decision.final_entity_ids = [
+            entity_id_for_name(name) for name in decision.final_diagnoses if entity_id_for_name(name)
+        ]
+        records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in candidates or []:
+            entity_id = str(getattr(candidate, "entity_id", "") or "")
+            if not entity_id or entity_id in seen:
+                continue
+            seen.add(entity_id)
+            records.append(
+                {
+                    "entity_id": entity_id,
+                    "diagnosis": self._name(candidate),
+                    "canonical_name": str(getattr(candidate, "canonical_name", "") or self._name(candidate)),
+                    "submission_name": str(getattr(candidate, "submission_name", "") or self._name(candidate)),
+                    "submittable": bool(getattr(candidate, "submittable", True)),
+                }
+            )
+        decision.entity_resolutions = records
 
     def _reviews(
         self,
@@ -2818,6 +2899,10 @@ class DiagnosisJudge:
                     diagnosis=candidate.diagnosis,
                     role=role,
                     reason=reason,
+                    entity_id=str(getattr(candidate, "entity_id", "") or ""),
+                    canonical_name=str(getattr(candidate, "canonical_name", "") or candidate.diagnosis),
+                    submission_name=str(getattr(candidate, "submission_name", "") or candidate.diagnosis),
+                    submittable=bool(getattr(candidate, "submittable", True)),
                     score=float(getattr(candidate, "score", 0.0) or 0.0),
                     judge_score=round(self._judge_score(candidate), 4),
                     required_met=bool(getattr(candidate, "required_met", False)),
@@ -3273,13 +3358,26 @@ class DiagnosisSubmitter:
         if not decision or not judge_decision:
             return decision
         score_by_name = {item.diagnosis: item for item in getattr(decision, "candidates", []) or []}
+        score_by_entity = {
+            str(getattr(item, "entity_id", "") or ""): item
+            for item in getattr(decision, "candidates", []) or []
+            if str(getattr(item, "entity_id", "") or "")
+        }
+        def candidate_for_name(name: Any) -> Any:
+            text = str(name or "").strip()
+            if not text:
+                return None
+            entity_id = ""
+            if self.knowledge and hasattr(self.knowledge, "entity_id_for"):
+                entity_id = self.knowledge.entity_id_for(text)
+            return (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(text)
         for name in judge_decision.final_diagnoses:
-            candidate = score_by_name.get(name)
+            candidate = candidate_for_name(name)
             if candidate:
                 candidate.differential_only = False
                 candidate.differential_only_reason = ""
         for item in judge_decision.blocked_diagnoses:
-            candidate = score_by_name.get(item.get("diagnosis"))
+            candidate = candidate_for_name(item.get("diagnosis"))
             if candidate and candidate.diagnosis not in set(judge_decision.final_diagnoses):
                 candidate.differential_only = True
                 candidate.differential_only_reason = str(item.get("reason") or "differential_only")
@@ -3324,8 +3422,8 @@ class DiagnosisSubmitter:
         decision.trusted_diagnoses = [
             name
             for name in judge_decision.final_diagnoses
-            if score_by_name.get(name)
-            and getattr(score_by_name[name], "trusted", False)
+            if candidate_for_name(name)
+            and getattr(candidate_for_name(name), "trusted", False)
         ]
         decision.blocked_diagnoses = list(judge_decision.blocked_diagnoses)
         decision.submission_override_count = int(judge_decision.decision_override)

@@ -15,6 +15,9 @@ class CandidateSource:
     raw_name: str
     canonical_name: str
     source: str
+    entity_id: str = ""
+    submission_name: str = ""
+    submittable: bool = True
     prior: float = 0.0
     evidence_links: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -40,6 +43,9 @@ class CandidatePool:
         prior: float = 0.0,
         evidence_links: Optional[Iterable[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        entity_id: str = "",
+        submission_name: str = "",
+        submittable: bool = True,
     ) -> None:
         canonical = str(canonical_name or "").strip()
         raw = str(raw_name or canonical).strip()
@@ -50,6 +56,9 @@ class CandidatePool:
                 raw_name=raw,
                 canonical_name=canonical,
                 source=str(source or "unknown"),
+                entity_id=str(entity_id or "").strip(),
+                submission_name=str(submission_name or canonical).strip(),
+                submittable=bool(submittable),
                 prior=max(0.0, min(1.0, float(prior or 0.0))),
                 evidence_links=list(dict.fromkeys(str(item) for item in (evidence_links or []) if str(item))),
                 metadata=dict(metadata or {}),
@@ -59,6 +68,8 @@ class CandidatePool:
     def priors(self) -> Dict[str, float]:
         result: Dict[str, float] = {}
         for item in self.items:
+            key = item.entity_id or item.canonical_name
+            result[key] = max(result.get(key, 0.0), item.prior)
             result[item.canonical_name] = max(result.get(item.canonical_name, 0.0), item.prior)
         return result
 
@@ -69,21 +80,28 @@ class CandidatePool:
         prior: float = 0.0,
         evidence_links: Optional[Iterable[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        entity_id: str = "",
+        canonical_name: str = "",
+        submission_name: str = "",
+        submittable: bool = False,
     ) -> None:
         raw = str(raw_name or "").strip()
         if not raw:
             return
         record = {
             "raw_name": raw,
+            "entity_id": str(entity_id or "").strip(),
+            "canonical_name": str(canonical_name or "").strip(),
+            "submission_name": str(submission_name or canonical_name or raw).strip(),
             "source": str(source or "unknown"),
             "prior": max(0.0, min(1.0, float(prior or 0.0))),
-            "submittable": False,
+            "submittable": bool(submittable),
             "evidence_links": list(dict.fromkeys(str(item) for item in (evidence_links or []) if str(item))),
             "metadata": dict(metadata or {}),
         }
-        key = (record["raw_name"], record["source"])
+        key = (record.get("entity_id") or record["raw_name"], record["source"])
         existing_keys = {
-            (item.get("raw_name"), item.get("source"))
+            (item.get("entity_id") or item.get("raw_name"), item.get("source"))
             for item in self.open_world_candidates
         }
         if key in existing_keys:
@@ -93,7 +111,11 @@ class CandidatePool:
     def sources_by_name(self) -> Dict[str, List[Dict[str, Any]]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for item in self.items:
-            grouped.setdefault(item.canonical_name, []).append(item.to_dict())
+            payload = item.to_dict()
+            key = item.entity_id or item.canonical_name
+            grouped.setdefault(key, []).append(payload)
+            if key != item.canonical_name:
+                grouped.setdefault(item.canonical_name, []).append(payload)
         return grouped
 
     def to_dict(self) -> Dict[str, Any]:
@@ -161,6 +183,9 @@ class CandidateGenerator:
                 "llm",
                 prior=prior,
                 metadata={"method": item.method, "parent_name": item.parent_name},
+                entity_id=getattr(item, "entity_id", ""),
+                submission_name=getattr(item, "submission_name", "") or item.canonical_name,
+                submittable=bool(getattr(item, "submittable", True)),
             )
 
     def _from_rag(self, pool: CandidatePool, rag_chunks: Sequence[Dict[str, Any]]) -> None:
@@ -193,10 +218,46 @@ class CandidateGenerator:
                     )
                     continue
                 if chunk_type == "external_medical_knowledge":
+                    if getattr(resolution, "submittable", False):
+                        pool.add(
+                            raw_name,
+                            resolution.canonical_name,
+                            "external_retrieval",
+                            prior=prior,
+                            metadata={
+                                "chunk_id": chunk.get("id"),
+                                "chunk_type": chunk_type,
+                                "unreviewed_external": bool(metadata.get("unreviewed_external")),
+                                "submittable": True,
+                            },
+                            entity_id=getattr(resolution, "entity_id", ""),
+                            submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                            submittable=True,
+                        )
+                        pool.add_open_world(
+                            raw_name,
+                            "external_retrieval_audit",
+                            prior=prior,
+                            entity_id=getattr(resolution, "entity_id", ""),
+                            canonical_name=resolution.canonical_name,
+                            submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                            submittable=True,
+                            metadata={
+                                "chunk_id": chunk.get("id"),
+                                "chunk_type": chunk_type,
+                                "controlled_entity": True,
+                                "unreviewed_external": bool(metadata.get("unreviewed_external")),
+                            },
+                        )
+                        continue
                     pool.add_open_world(
                         raw_name,
                         "external_retrieval",
                         prior=prior,
+                        entity_id=getattr(resolution, "entity_id", ""),
+                        canonical_name=resolution.canonical_name,
+                        submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                        submittable=False,
                         metadata={
                             "chunk_id": chunk.get("id"),
                             "chunk_type": chunk_type,
@@ -212,6 +273,9 @@ class CandidateGenerator:
                     "rag",
                     prior=prior,
                     metadata={"chunk_id": chunk.get("id"), "chunk_type": chunk.get("type")},
+                    entity_id=getattr(resolution, "entity_id", ""),
+                    submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                    submittable=bool(getattr(resolution, "submittable", True)),
                 )
 
     def _from_mechanisms(
@@ -236,6 +300,9 @@ class CandidateGenerator:
                             "family_id": hypothesis.family_id,
                             "body_system": hypothesis.body_system,
                         },
+                        entity_id=getattr(resolution, "entity_id", ""),
+                        submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                        submittable=bool(getattr(resolution, "submittable", True)),
                     )
                     continue
                 pool.add_open_world(
@@ -251,6 +318,25 @@ class CandidateGenerator:
                     },
                 )
             for raw_name in list(hypothesis.open_world_candidates or []):
+                resolution = self.resolver.resolve(raw_name)
+                if resolution.canonical_name and getattr(resolution, "submittable", False):
+                    pool.add(
+                        raw_name,
+                        resolution.canonical_name,
+                        "mechanism_reasoner",
+                        prior=max(0.20, prior - 0.08),
+                        evidence_links=evidence_links,
+                        metadata={
+                            "mechanism_id": hypothesis.mechanism_id,
+                            "family_id": hypothesis.family_id,
+                            "body_system": hypothesis.body_system,
+                            "promoted_open_world_entity": True,
+                        },
+                        entity_id=getattr(resolution, "entity_id", ""),
+                        submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                        submittable=True,
+                    )
+                    continue
                 pool.add_open_world(
                     raw_name,
                     "mechanism_reasoner",
@@ -282,7 +368,15 @@ class CandidateGenerator:
             for raw in names:
                 resolution = self.resolver.resolve(raw)
                 if resolution.canonical_name:
-                    pool.add(raw, resolution.canonical_name, "memory", prior=min(0.75, prior))
+                    pool.add(
+                        raw,
+                        resolution.canonical_name,
+                        "memory",
+                        prior=min(0.75, prior),
+                        entity_id=getattr(resolution, "entity_id", ""),
+                        submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                        submittable=bool(getattr(resolution, "submittable", True)),
+                    )
 
     def _from_disease_retriever(self, pool: CandidatePool, evidence: EvidenceBundle) -> None:
         hits, categories = self.disease_retriever.retrieve(evidence, top_k=20)
@@ -298,6 +392,9 @@ class CandidateGenerator:
                     "category": hit.category,
                     **dict(hit.metadata or {}),
                 },
+                entity_id=self.knowledge.entity_id_for(hit.diagnosis) if hasattr(self.knowledge, "entity_id_for") else "",
+                submission_name=self.knowledge.submission_name_for(hit.diagnosis) if hasattr(self.knowledge, "submission_name_for") else hit.diagnosis,
+                submittable=self.knowledge.is_submittable_entity(hit.diagnosis) if hasattr(self.knowledge, "is_submittable_entity") else True,
             )
 
     def _from_evidence(self, pool: CandidatePool, evidence: EvidenceBundle) -> None:
@@ -323,6 +420,9 @@ class CandidateGenerator:
                     "evidence",
                     prior=min(0.85, max(0.20, weight / 1.5)),
                     evidence_links=list(dict.fromkeys(matched)),
+                    entity_id=str(entry.get("entity_id") or ""),
+                    submission_name=str(entry.get("submission_name") or name),
+                    submittable=bool(entry.get("submittable", True)),
                 )
 
 

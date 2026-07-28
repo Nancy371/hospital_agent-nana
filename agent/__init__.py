@@ -28,6 +28,8 @@ __all__ = [
     "DiagnosisDecisionEngine",
     "DiagnosticKnowledgeBase",
     "DiagnosisDecision",
+    "DiseaseEntityRegistry",
+    "DiseaseEntity",
     "DiagnosisEligibilityGate",
     "EligibilityResult",
     "PRIMARY_ELIGIBLE",
@@ -110,6 +112,9 @@ def __getattr__(name: str):
     if name in ("DiagnosisDecisionEngine", "DiagnosticKnowledgeBase", "DiagnosisDecision"):
         from . import diagnosis_engine as _diagnosis_engine
         return getattr(_diagnosis_engine, name)
+    if name in ("DiseaseEntityRegistry", "DiseaseEntity"):
+        from . import disease_entity as _disease_entity
+        return getattr(_disease_entity, name)
     if name in (
         "DiagnosisEligibilityGate",
         "EligibilityResult",

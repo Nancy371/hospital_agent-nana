@@ -27,6 +27,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .disease_entity import DiseaseEntityRegistry
+
 logger = logging.getLogger(__name__)
 
 
@@ -195,6 +197,7 @@ class KnowledgeBase:
         self._profile_by_name: Dict[str, Dict[str, Any]] = {}
         self._alias_to_profile_name: Dict[str, str] = {}
         self._symptom_to_diseases: Dict[str, Set[str]] = {}
+        self.entity_registry = DiseaseEntityRegistry(ref_dir)
         self.exam_aliases_path = os.path.join(self.ref_dir, "exam_aliases.json")
         self.exam_aliases_auto_path = os.path.join(self.ref_dir, "exam_aliases_auto.json")
         self.exam_aliases_pending_path = os.path.join(self.ref_dir, "exam_aliases_pending.json")
@@ -392,6 +395,9 @@ class KnowledgeBase:
         if not name:
             return None
         raw = str(name).strip()
+        entity = self.entity_registry.resolve(raw)
+        if entity and entity.submittable:
+            return entity.display_name
         if raw in self._disease_by_name:
             return raw
         if raw in self._alias_to_profile_name:
@@ -405,6 +411,22 @@ class KnowledgeBase:
             if alias and (alias in raw or raw in alias):
                 return standard
         return None
+
+    def entity_id_for(self, name: Any) -> str:
+        entity = self.entity_registry.get(name)
+        return entity.entity_id if entity else ""
+
+    def submission_name_for(self, name: Any) -> str:
+        entity = self.entity_registry.get(name)
+        if entity:
+            return entity.display_name
+        return self.normalize_diagnosis(str(name or "")) or str(name or "")
+
+    def get_exam_bundle(self, name: Any) -> List[str]:
+        return self.entity_registry.exam_bundle_for(name)
+
+    def get_discriminating_exam_bundle(self, name: Any) -> List[str]:
+        return self.entity_registry.discriminating_exam_bundle_for(name)
 
     @staticmethod
     def _candidate_name(item: Any) -> Optional[str]:

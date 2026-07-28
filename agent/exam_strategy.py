@@ -566,6 +566,23 @@ class ExamStrategyAgent:
         ]
         differential_candidates = list(dict.fromkeys(differential_candidates))[:6]
         normalized, _ = self.knowledge.normalize_examinations(raw_discriminating)
+        entity_fallback_pool = self._entity_exam_fallback_pool(
+            differential_candidates or candidate_diseases or []
+        )
+        entity_fallback_normalized, _ = self.knowledge.normalize_examinations(
+            entity_fallback_pool
+        )
+        use_entity_fallback = (
+            not normalized
+            or self._lossy_special_exam_normalization(
+                raw_discriminating,
+                normalized,
+                entity_fallback_normalized,
+            )
+        )
+        entity_fallback_set = set(entity_fallback_normalized) if use_entity_fallback else set()
+        if use_entity_fallback:
+            normalized = entity_fallback_normalized
         if not normalized:
             return {}
         task_by_exam = self._normalized_exam_task_map(exam_tasks)
@@ -605,7 +622,11 @@ class ExamStrategyAgent:
         authorization_details = [
             {
                 "exam": item,
-                "exam_source": "judge_discriminating_exam",
+                "exam_source": (
+                    "entity_exam_bundle_fallback"
+                    if item in entity_fallback_set and item not in task_by_exam
+                    else "judge_discriminating_exam"
+                ),
                 "target_candidates": list(
                     task_by_exam.get(item, {}).get("target_candidates")
                     or differential_candidates
@@ -645,6 +666,53 @@ class ExamStrategyAgent:
                 if self._generic_inflammation_exam(item) and item not in set(items)
             ),
         }
+
+    def _entity_exam_fallback_pool(
+        self,
+        candidate_diseases: Optional[List[Any]],
+    ) -> List[str]:
+        pool: List[str] = []
+        if not hasattr(self.knowledge, "get_discriminating_exam_bundle"):
+            return pool
+        for candidate in candidate_diseases or []:
+            name = self.knowledge._candidate_name(candidate)
+            if not name and hasattr(candidate, "diagnosis"):
+                name = str(getattr(candidate, "diagnosis") or "")
+            if not name:
+                name = str(candidate or "")
+            bundle = self.knowledge.get_discriminating_exam_bundle(name)
+            for item in bundle or []:
+                text = str(item or "").strip()
+                if text and text not in pool:
+                    pool.append(text)
+        return pool
+
+    @staticmethod
+    def _lossy_special_exam_normalization(
+        raw_items: List[str],
+        normalized: List[str],
+        entity_fallback_normalized: List[str],
+    ) -> bool:
+        if not raw_items or not normalized or not entity_fallback_normalized:
+            return False
+        raw_text = " ".join(str(item or "") for item in raw_items).lower()
+        special_markers = (
+            "cta",
+            "\u589e\u5f3a",
+            "\u9020\u5f71",
+            "\u52a8\u8109",
+            "\u8840\u7ba1",
+        )
+        if not any(marker in raw_text for marker in special_markers):
+            return False
+        generic_normalized = {
+            "CT\u626b\u63cf\uff08CT\uff09",
+            "\u78c1\u5171\u632f\u6210\u50cf\uff08MRI\uff09",
+        }
+        normalized_set = set(normalized or [])
+        if not normalized_set or not normalized_set <= generic_normalized:
+            return False
+        return any(item not in generic_normalized for item in entity_fallback_normalized)
 
     @staticmethod
     def _judge_payload(judge_decision: Optional[Dict[str, Any]]) -> Dict[str, Any]:
