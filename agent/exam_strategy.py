@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
+from .exam_resolver import ExamResolver
 from .knowledge import KnowledgeBase
 
 _GENERIC_INFLAMMATION_EXAM_MARKERS = (
@@ -234,6 +235,7 @@ class ExamStrategyAgent:
         self.knowledge = knowledge
         self.max_new_items = max_new_items
         self.discriminating_exam_max_items = discriminating_exam_max_items
+        self.exam_resolver = ExamResolver(knowledge)
 
     def recommend(
         self,
@@ -565,12 +567,28 @@ class ExamStrategyAgent:
             if str(item).strip()
         ]
         differential_candidates = list(dict.fromkeys(differential_candidates))[:6]
-        normalized, _ = self.knowledge.normalize_examinations(raw_discriminating)
+        exam_resolutions = self.exam_resolver.resolve_many(raw_discriminating)
+        resolver_items = [
+            item.resolved_exam
+            for item in exam_resolutions
+            if item.resolved_exam
+            and item.resolution_type
+            in {"exact", "alias", "equivalent", "partial_substitute"}
+        ]
+        normalized, _ = self.knowledge.normalize_examinations(
+            resolver_items or raw_discriminating
+        )
         entity_fallback_pool = self._entity_exam_fallback_pool(
             differential_candidates or candidate_diseases or []
         )
+        entity_exam_resolutions = self.exam_resolver.resolve_many(entity_fallback_pool)
         entity_fallback_normalized, _ = self.knowledge.normalize_examinations(
-            entity_fallback_pool
+            [
+                item.resolved_exam
+                for item in entity_exam_resolutions
+                if item.resolved_exam
+            ]
+            or entity_fallback_pool
         )
         use_entity_fallback = (
             not normalized
@@ -586,6 +604,11 @@ class ExamStrategyAgent:
         if not normalized:
             return {}
         task_by_exam = self._normalized_exam_task_map(exam_tasks)
+        resolution_by_exam = {
+            item.resolved_exam: item.to_dict()
+            for item in list(exam_resolutions) + list(entity_exam_resolutions)
+            if item.resolved_exam
+        }
         ranked, information_gain = self._rank_by_information_gain(
             candidate_diseases=differential_candidates or candidate_diseases or [],
             symptoms=(collected_info or {}).get("symptoms", []),
@@ -650,6 +673,7 @@ class ExamStrategyAgent:
                     else "judge_discriminating_exam"
                 ),
                 "blocked_reason": "",
+                "exam_resolution": dict(resolution_by_exam.get(item, {})),
             }
             for item in items
         ]

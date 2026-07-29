@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from .case_board import StaleJudgeDecisionError, judge_decision_is_stale
 from .diagnosis_eligibility import DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED, PRIMARY_ELIGIBLE
 
 
@@ -335,6 +336,8 @@ class JudgeCandidateReview:
     eligibility_reason: str = ""
     missing_required_anchors: List[str] = field(default_factory=list)
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    exam_followup_authorized: bool = False
+    submission_authorized: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -409,6 +412,12 @@ class JudgeDecision:
     excluded_candidates: List[str] = field(default_factory=list)
     primary_eligible_candidates: List[str] = field(default_factory=list)
     entity_resolutions: List[Dict[str, Any]] = field(default_factory=list)
+    case_version: int = 0
+    evidence_snapshot_hash: str = ""
+    knowledge_profile_version: str = ""
+    decision_policy_version: str = ""
+    exam_catalog_version: str = ""
+    stale_decision: bool = False
     reasoning: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1264,7 +1273,10 @@ class DiagnosisJudge:
             conflict_affected_diagnoses,
         )
         pattern_force_names = self._forced_pool_names_for_pattern_deferred(ranked)
-        force_names = list(dict.fromkeys(list(force_names) + pattern_force_names))
+        claim_force_names = self._forced_pool_names_for_claims(ranked)
+        force_names = list(
+            dict.fromkeys(list(force_names) + pattern_force_names + claim_force_names)
+        )
         candidate_pool_for_workup = [
             item
             for item in ranked
@@ -1279,6 +1291,8 @@ class DiagnosisJudge:
         raw_pool_source = self._differential_pool_source(raw_differential_pool)
         for name in pattern_force_names:
             raw_pool_source[name] = "pattern_deferred_workup"
+        for name in claim_force_names:
+            raw_pool_source[name] = "critical_evidence_claim_followup"
         for name in force_names:
             raw_pool_source.setdefault(
                 name,
@@ -1300,11 +1314,12 @@ class DiagnosisJudge:
             differential_pool, pairwise, discriminating_findings
         )
         pattern_exam_tasks = self._pattern_anchor_workup_exam_tasks(differential_pool)
+        claim_exam_tasks = self._claim_followup_exam_tasks(differential_pool)
         conflict_exam_tasks = self._conflict_adjudication_exam_tasks(
             differential_pool
         )
         discriminating_exam_tasks = self._merge_discriminating_exam_tasks(
-            list(pattern_exam_tasks) + list(conflict_exam_tasks),
+            list(pattern_exam_tasks) + list(claim_exam_tasks) + list(conflict_exam_tasks),
             base_discriminating_exam_tasks,
         )
         discriminating_exams = [
@@ -1690,6 +1705,64 @@ class DiagnosisJudge:
                 break
         return names
 
+    def _forced_pool_names_for_claims(
+        self,
+        ranked: Sequence[Any],
+    ) -> List[str]:
+        names: List[str] = []
+        limit = max(
+            4,
+            int(getattr(self, "filtered_pool_max_size", 0) or 0),
+            int(getattr(self, "differential_top_k", 0) or 0),
+        )
+        candidates = [
+            item for item in ranked or []
+            if self._critical_claim_followup_candidate(item)
+        ]
+        for item in sorted(
+            candidates,
+            key=self._claim_followup_sort_key,
+            reverse=True,
+        ):
+            name = str(getattr(item, "diagnosis", "") or "")
+            if name and name not in names:
+                names.append(name)
+            if len(names) >= limit:
+                break
+        return names
+
+    def _critical_claim_followup_candidate(self, candidate: Any) -> bool:
+        if not candidate or getattr(candidate, "hard_contradiction", False):
+            return False
+        claims = [
+            item for item in getattr(candidate, "unresolved_critical_evidence_claims", []) or []
+            if isinstance(item, dict)
+        ]
+        if not claims:
+            return False
+        if getattr(candidate, "claim_followup_exams", None):
+            return True
+        return any(str(item.get("recommended_exam") or "").strip() for item in claims)
+
+    def _claim_followup_sort_key(self, candidate: Any) -> tuple:
+        claims = [
+            item for item in getattr(candidate, "unresolved_critical_evidence_claims", []) or []
+            if isinstance(item, dict)
+        ]
+        confidence = 0.0
+        for claim in claims:
+            try:
+                confidence = max(confidence, float(claim.get("confidence", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+        return (
+            len(claims),
+            confidence,
+            1 if self._priority(candidate) else 0,
+            1 if self._systemic_primary(candidate) else 0,
+            self._judge_score(candidate),
+        )
+
     def _pattern_deferred_workup_candidate(self, candidate: Any) -> bool:
         if not candidate or getattr(candidate, "hard_contradiction", False):
             return False
@@ -1975,7 +2048,35 @@ class DiagnosisJudge:
     def _high_value_unresolved_contender(self, primary: Any, contender: Any) -> bool:
         if not contender or getattr(contender, "hard_contradiction", False):
             return False
+        if getattr(contender, "differential_only", False):
+            return False
         if not self._has_signal(contender):
+            return False
+        if (
+            str(getattr(contender, "entity_id", "") or "") == "D100055"
+            and self._intracardiac_shunt_primary(primary)
+        ):
+            return False
+        if self._generic_parent_of(primary, contender):
+            return False
+        if (
+            self._stable_structural_primary(primary)
+            and self._eligibility_status(contender) == DEFERRED
+            and not self._same_family(primary, contender)
+            and not self._same_body_system(primary, contender)
+        ):
+            return False
+        if not self._high_value_contender_competes_with_primary(primary, contender):
+            return False
+        if self._critical_claim_followup_candidate(contender):
+            return self._claim_followup_blocks_primary(primary, contender)
+        if (
+            primary
+            and self._trusted(primary)
+            and self._eligibility_status(contender) == DEFERRED
+            and f"diagnosis:{getattr(primary, 'diagnosis', '')}" in set(getattr(primary, "matched_evidence", []) or [])
+            and not self._pattern_deferred_workup_candidate(contender)
+        ):
             return False
         if self._trusted(contender) and self._judge_score(contender) > self._judge_score(primary):
             return True
@@ -2010,6 +2111,95 @@ class DiagnosisJudge:
         ):
             return contender_score >= primary_score - max(self.pairwise_close_margin, 0.26)
         return contender_score >= primary_score - self.pairwise_close_margin
+
+    def _claim_followup_blocks_primary(self, primary: Any, contender: Any) -> bool:
+        if not self._critical_claim_followup_candidate(contender):
+            return False
+        if not self._high_value_contender_competes_with_primary(primary, contender):
+            return False
+        entity_id = str(getattr(contender, "entity_id", "") or "")
+        if entity_id in {"D000025", "D100055"}:
+            return True
+        if not (self._priority(contender) or self._systemic_primary(contender)):
+            return False
+        if not primary:
+            return True
+        try:
+            source_prior = float(getattr(contender, "source_prior", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            source_prior = 0.0
+        if source_prior < 0.65 and self._judge_score(contender) < self._judge_score(primary) - 0.18:
+            return False
+        return bool(
+            self._candidate_discriminating_exams(contender)
+            and self._core_or_diagnostic_signal(contender)
+            and source_prior >= 0.45
+        )
+
+    def _high_value_contender_competes_with_primary(
+        self,
+        primary: Any,
+        contender: Any,
+    ) -> bool:
+        if not contender:
+            return False
+        if not primary:
+            return True
+        if self._same_family(primary, contender) or self._causally_related(primary, contender):
+            return True
+        if self._same_body_system(primary, contender):
+            return bool(
+                self._core_or_diagnostic_signal(primary)
+                or self._core_or_diagnostic_signal(contender)
+            )
+        primary_signals = self._candidate_core_diagnostic_signals(primary)
+        contender_signals = self._candidate_core_diagnostic_signals(contender)
+        return bool(primary_signals & contender_signals)
+
+    @staticmethod
+    def _candidate_core_diagnostic_signals(candidate: Any) -> set[str]:
+        if not candidate:
+            return set()
+        signals = set(getattr(candidate, "core_matched_evidence", []) or [])
+        signals.update(getattr(candidate, "diagnostic_matched_evidence", []) or [])
+        return {
+            str(item)
+            for item in signals
+            if item
+            and not str(item).startswith(("field:", "diagnosis:"))
+            and str(item) not in _BROAD_EVIDENCE_TOKENS
+        }
+
+    def _stable_structural_primary(self, candidate: Any) -> bool:
+        if not candidate or not self._trusted(candidate):
+            return False
+        dtype = str(getattr(candidate, "diagnosis_type", "") or "").lower()
+        if dtype not in {"structural", "anatomical_diagnosis"}:
+            return False
+        return bool(
+            self._component_score(candidate, "objective_evidence") >= 1.0
+            or getattr(candidate, "diagnostic_matched_evidence", None)
+            or getattr(candidate, "satisfied_required_anchors", None)
+        )
+
+    @staticmethod
+    def _intracardiac_shunt_primary(primary: Any) -> bool:
+        if not primary:
+            return False
+        matched = set(getattr(primary, "matched_evidence", []) or [])
+        if "right_to_left_shunt" not in matched:
+            return False
+        return bool(
+            matched
+            & {
+                "ventricular_septal_defect",
+                "atrial_septal_defect",
+                "congenital_heart_defect",
+                "diagnosis:\u5ba4\u95f4\u9694\u7f3a\u635f\uff08VSD\uff09",
+                "diagnosis:\u623f\u95f4\u9694\u7f3a\u635f",
+                "diagnosis:\u5148\u5929\u6027\u5fc3\u810f\u75c5",
+            }
+        )
 
     def _required_gap_by_candidate(
         self, pool: Sequence[Any]
@@ -2271,6 +2461,52 @@ class DiagnosisJudge:
                 )
         return tasks
 
+    def _claim_followup_exam_tasks(
+        self,
+        pool: Sequence[Any],
+    ) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        pool_size = max(1, len([item for item in pool or [] if item]))
+        for candidate in sorted(
+            [item for item in pool or [] if self._critical_claim_followup_candidate(item)],
+            key=self._claim_followup_sort_key,
+            reverse=True,
+        ):
+            diagnosis = str(getattr(candidate, "diagnosis", "") or "")
+            if not diagnosis:
+                continue
+            claims = [
+                item for item in getattr(candidate, "unresolved_critical_evidence_claims", []) or []
+                if isinstance(item, dict)
+            ]
+            for claim in claims:
+                exam = str(claim.get("recommended_exam") or "").strip()
+                finding = str(claim.get("target_evidence") or "").strip()
+                claim_id = str(claim.get("claim_id") or "").strip()
+                if not exam:
+                    continue
+                key = (diagnosis, claim_id, exam)
+                if key in seen:
+                    continue
+                seen.add(key)
+                tasks.append(
+                    {
+                        "exam": exam,
+                        "target_candidates": [diagnosis],
+                        "target_findings": [finding] if finding else [],
+                        "target_claims": [claim_id] if claim_id else [],
+                        "exam_type": "evidence_claim_verification",
+                        "expected_effect": "verify_or_reject_reasoner_evidence_claim",
+                        "source": ["evidence_claim_followup"],
+                        "pool_candidate_count": pool_size,
+                        "target_candidate_count": 1,
+                        "information_gain_hint": 0.99,
+                        "exam_source": "evidence_claim_followup_exam",
+                    }
+                )
+        return tasks
+
     def _merge_discriminating_exam_tasks(
         self,
         conflict_tasks: Sequence[Dict[str, Any]],
@@ -2325,8 +2561,18 @@ class DiagnosisJudge:
                     "resolve_reasoning_structured_polarity_conflict"
                 )
             elif (
-                task.get("exam_source") == "pattern_anchor_workup_exam"
+                task.get("exam_source") == "evidence_claim_followup_exam"
                 and current.get("exam_source") != "conflict_adjudication_exam"
+            ):
+                current["exam_source"] = "evidence_claim_followup_exam"
+                current["exam_type"] = "evidence_claim_verification"
+                current["expected_effect"] = "verify_or_reject_reasoner_evidence_claim"
+            elif (
+                task.get("exam_source") == "pattern_anchor_workup_exam"
+                and current.get("exam_source") not in {
+                    "conflict_adjudication_exam",
+                    "evidence_claim_followup_exam",
+                }
             ):
                 current["exam_source"] = "pattern_anchor_workup_exam"
                 current["exam_type"] = "pattern_anchor_workup"
@@ -2465,6 +2711,10 @@ class DiagnosisJudge:
         for exam in _DIFFERENTIAL_EXAM_HINTS.get(name, []):
             if exam and exam not in exams:
                 exams.append(exam)
+        for exam in getattr(candidate, "claim_followup_exams", []) or []:
+            text = str(exam).strip()
+            if text and text not in exams:
+                exams.append(text)
         return exams[:6]
 
     def _choose_primary(self, ranked: Sequence[Any]) -> Optional[Any]:
@@ -2617,7 +2867,7 @@ class DiagnosisJudge:
             key=lambda item: (
                 1
                 if (
-                    self._causally_related(primary, item)
+                    self._secondary_causally_related(primary, item)
                     and self._is_manifestation(item)
                     and self._independent_objective(item)
                 )
@@ -2654,7 +2904,7 @@ class DiagnosisJudge:
                 if self._same_family(primary, candidate) and self._independent_objective(candidate):
                     result.append(candidate)
                 continue
-            if self._causally_related(primary, candidate):
+            if self._secondary_causally_related(primary, candidate):
                 if self._is_manifestation(candidate):
                     if self._independent_objective(candidate):
                         result.append(candidate)
@@ -2668,6 +2918,26 @@ class DiagnosisJudge:
                 result.append(candidate)
         return result
 
+    def _secondary_causally_related(self, primary: Any, candidate: Any) -> bool:
+        if self._causally_related(primary, candidate):
+            return True
+        primary_name = str(getattr(primary, "diagnosis", "") or "")
+        candidate_name = str(getattr(candidate, "diagnosis", "") or "")
+        relation = str(getattr(candidate, "causal_relation_to_selected", "") or "")
+        if primary_name and relation in {
+            f"caused_by:{primary_name}",
+            f"complication_of:{primary_name}",
+            f"downstream_of:{primary_name}",
+        }:
+            return True
+        primary_relation = str(getattr(primary, "causal_relation_to_selected", "") or "")
+        if candidate_name and primary_relation in {
+            f"causes:{candidate_name}",
+            f"explains:{candidate_name}",
+        }:
+            return True
+        return False
+
     def _evidence_gap_targets(
         self,
         primary: Any,
@@ -2676,7 +2946,7 @@ class DiagnosisJudge:
     ) -> List[str]:
         targets: List[str] = []
         final_set = set(final or [])
-        if getattr(primary, "required_gaps", None):
+        if getattr(primary, "required_gaps", None) or self._critical_claim_followup_candidate(primary):
             targets.append(primary.diagnosis)
         for candidate in ranked:
             if len(targets) >= self.gap_target_limit:
@@ -2685,7 +2955,7 @@ class DiagnosisJudge:
                 continue
             if self._eligibility_status(candidate) != DEFERRED:
                 continue
-            if not getattr(candidate, "required_gaps", None):
+            if not getattr(candidate, "required_gaps", None) and not self._critical_claim_followup_candidate(candidate):
                 continue
             if self._deferred_explains_better_than_primary(primary, candidate):
                 targets.append(candidate.diagnosis)
@@ -2696,7 +2966,7 @@ class DiagnosisJudge:
                 continue
             if self._eligibility_status(candidate) != DEFERRED:
                 continue
-            if not getattr(candidate, "required_gaps", None):
+            if not getattr(candidate, "required_gaps", None) and not self._critical_claim_followup_candidate(candidate):
                 continue
             if (
                 self._same_family(primary, candidate)
@@ -2775,6 +3045,7 @@ class DiagnosisJudge:
             if not (
                 getattr(candidate, "required_gaps", None)
                 or self._candidate_discriminating_exams(candidate)
+                or self._critical_claim_followup_candidate(candidate)
             ):
                 continue
             if candidate.diagnosis == getattr(primary, "diagnosis", ""):
@@ -2823,6 +3094,7 @@ class DiagnosisJudge:
             if self._eligibility_status(candidate) == DEFERRED and (
                 getattr(candidate, "required_gaps", None)
                 or self._candidate_discriminating_exams(candidate)
+                or self._critical_claim_followup_candidate(candidate)
             ):
                 targets.append(candidate.diagnosis)
                 continue
@@ -3197,6 +3469,11 @@ class DiagnosisJudge:
                     evidence_pattern_matches=list(
                         getattr(candidate, "evidence_pattern_matches", []) or []
                     )[:4],
+                    exam_followup_authorized=bool(role == "evidence_gap"),
+                    submission_authorized=bool(
+                        role in {"primary", "secondary"}
+                        and self._eligibility_status(candidate) == PRIMARY_ELIGIBLE
+                    ),
                 )
             )
         return reviews
@@ -3611,6 +3888,103 @@ class DiagnosisJudge:
             text += " Evidence-gap targets: " + ", ".join(decision.evidence_gap_targets) + "."
         return text
 
+    def apply_root_cause_arbitration(
+        self,
+        judge_decision: JudgeDecision,
+        result: Any,
+        *,
+        max_final_diagnoses: int = 3,
+    ) -> JudgeDecision:
+        """Judge-owned adoption of root-cause arbitration opinions."""
+        if not judge_decision or not result:
+            return judge_decision
+        payload = result.to_dict() if hasattr(result, "to_dict") else dict(result or {})
+        judge_decision.root_cause_arbitration = dict(payload)
+        judge_decision.root_cause_primary = str(
+            getattr(result, "root_cause_primary", "") or payload.get("root_cause_primary") or ""
+        )
+        judge_decision.root_cause_secondary = list(
+            getattr(result, "root_cause_secondary", None)
+            or payload.get("root_cause_secondary")
+            or []
+        )
+        judge_decision.candidate_explanation_edges = list(
+            getattr(result, "candidate_explanation_edges", None)
+            or payload.get("candidate_explanation_edges")
+            or []
+        )
+        if not bool(getattr(result, "applied", False) or payload.get("applied")):
+            return judge_decision
+
+        primary = str(
+            getattr(result, "root_cause_primary", "") or payload.get("root_cause_primary") or ""
+        )
+        final_secondary = list(
+            getattr(result, "root_cause_final_secondary", None)
+            or payload.get("root_cause_final_secondary")
+            or []
+        )
+        audit_secondary = list(
+            getattr(result, "root_cause_secondary", None)
+            or payload.get("root_cause_secondary")
+            or []
+        )
+        blocked_secondary = set(audit_secondary) - set(final_secondary)
+        existing_final = [
+            name
+            for name in list(judge_decision.final_diagnoses or [])
+            if name not in blocked_secondary and name != primary
+        ]
+        final = list(
+            dict.fromkeys(
+                [primary]
+                + [name for name in final_secondary if name != primary]
+                + existing_final
+            )
+        )[: max(1, int(max_final_diagnoses or 1))]
+        if not primary or not final:
+            return judge_decision
+
+        judge_decision.primary = primary
+        judge_decision.judge_primary = primary
+        judge_decision.locked_primary = primary
+        judge_decision.provisional_primary = ""
+        judge_decision.primary_status = "locked"
+        judge_decision.needs_discriminating_exams = False
+        judge_decision.defer_reason = ""
+        judge_decision.secondary = [name for name in final if name != primary]
+        judge_decision.final_diagnoses = final
+        judge_decision.root_cause_primary_override = bool(
+            getattr(result, "primary_override", False) or payload.get("primary_override")
+        )
+        judge_decision.primary_override_source = "judge_root_cause_arbitration"
+        judge_decision.root_cause_coverage = float(
+            getattr(result, "root_cause_coverage", 0.0)
+            or payload.get("root_cause_coverage")
+            or 0.0
+        )
+        judge_decision.required_gap_authorized_diagnoses = []
+        trace = list(judge_decision.dynamic_rerank_trace or [])
+        trace.append(
+            {
+                "stage": "judge_root_cause_arbitration",
+                "primary_before": str(
+                    getattr(result, "primary_before", "") or payload.get("primary_before") or ""
+                ),
+                "primary_after": str(
+                    getattr(result, "primary_after", "") or payload.get("primary_after") or primary
+                ),
+                "primary_override": bool(judge_decision.root_cause_primary_override),
+                "root_cause_secondary": list(audit_secondary),
+                "root_cause_final_secondary": list(final_secondary),
+                "root_cause_coverage": judge_decision.root_cause_coverage,
+                "candidate_explanation_edges": list(judge_decision.candidate_explanation_edges),
+            }
+        )
+        judge_decision.dynamic_rerank_trace = trace
+        judge_decision.reasoning = self._reasoning(judge_decision)
+        return judge_decision
+
 
 class DiagnosisSubmitter:
     """Write a JudgeDecision into the mutable DiagnosisDecision audit object."""
@@ -3621,6 +3995,11 @@ class DiagnosisSubmitter:
     def apply(self, decision: Any, judge_decision: JudgeDecision) -> Any:
         if not decision or not judge_decision:
             return decision
+        if judge_decision_is_stale(decision, judge_decision):
+            setattr(decision, "stale_decision", True)
+            raise StaleJudgeDecisionError(
+                "JudgeDecision is stale for the current evidence snapshot"
+            )
         score_by_name = {item.diagnosis: item for item in getattr(decision, "candidates", []) or []}
         score_by_entity = {
             str(getattr(item, "entity_id", "") or ""): item
@@ -3635,20 +4014,33 @@ class DiagnosisSubmitter:
             if self.knowledge and hasattr(self.knowledge, "entity_id_for"):
                 entity_id = self.knowledge.entity_id_for(text)
             return (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(text)
-        for name in judge_decision.final_diagnoses:
+        for candidate in list(getattr(decision, "candidates", []) or []):
+            setattr(candidate, "submission_authorized", False)
+            setattr(candidate, "exam_followup_authorized", False)
+        submission_allowed = (
+            str(getattr(judge_decision, "primary_status", "") or "") == "locked"
+            and not bool(getattr(judge_decision, "needs_discriminating_exams", False))
+        )
+        final_from_judge = list(judge_decision.final_diagnoses) if submission_allowed else []
+        for name in final_from_judge:
             candidate = candidate_for_name(name)
             if candidate:
                 candidate.differential_only = False
                 candidate.differential_only_reason = ""
+                candidate.submission_authorized = True
+        for name in list(getattr(judge_decision, "evidence_gap_targets", []) or []):
+            candidate = candidate_for_name(name)
+            if candidate:
+                candidate.exam_followup_authorized = True
         for item in judge_decision.blocked_diagnoses:
             candidate = candidate_for_name(item.get("diagnosis"))
-            if candidate and candidate.diagnosis not in set(judge_decision.final_diagnoses):
+            if candidate and candidate.diagnosis not in set(final_from_judge):
                 candidate.differential_only = True
                 candidate.differential_only_reason = str(item.get("reason") or "differential_only")
 
         decision.retriever_top1 = judge_decision.retriever_top1
         decision.judge_primary = judge_decision.judge_primary
-        decision.submitter_final = list(judge_decision.final_diagnoses)
+        decision.submitter_final = list(final_from_judge)
         decision.decision_override = bool(judge_decision.decision_override)
         decision.required_gap_authorized_diagnoses = []
         decision.evidence_conflicts = list(judge_decision.evidence_conflicts)
@@ -3679,13 +4071,47 @@ class DiagnosisSubmitter:
         decision.candidate_explanation_edges = list(
             getattr(judge_decision, "candidate_explanation_edges", []) or []
         )
+        decision.case_version = int(getattr(judge_decision, "case_version", 0) or getattr(decision, "case_version", 0) or 0)
+        decision.evidence_snapshot_hash = str(
+            getattr(judge_decision, "evidence_snapshot_hash", "")
+            or getattr(decision, "evidence_snapshot_hash", "")
+            or ""
+        )
+        decision.knowledge_profile_version = str(
+            getattr(judge_decision, "knowledge_profile_version", "")
+            or getattr(decision, "knowledge_profile_version", "")
+            or ""
+        )
+        decision.decision_policy_version = str(
+            getattr(judge_decision, "decision_policy_version", "")
+            or getattr(decision, "decision_policy_version", "")
+            or ""
+        )
+        decision.exam_catalog_version = str(
+            getattr(judge_decision, "exam_catalog_version", "")
+            or getattr(decision, "exam_catalog_version", "")
+            or ""
+        )
         decision.judge_decision = judge_decision.to_dict()
+        if isinstance(getattr(decision, "case_board", None), dict):
+            case_board = dict(decision.case_board)
+            case_board["case_version"] = decision.case_version
+            case_board["evidence_snapshot_hash"] = decision.evidence_snapshot_hash
+            case_board["knowledge_profile_version"] = decision.knowledge_profile_version
+            case_board["decision_policy_version"] = decision.decision_policy_version
+            case_board["exam_catalog_version"] = decision.exam_catalog_version
+            case_board["judge_decision"] = judge_decision.to_dict()
+            case_board["candidate_decisions"] = [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in list(getattr(judge_decision, "reviews", []) or [])
+            ]
+            decision.case_board = case_board
         decision.pre_authorization_diagnoses = list(judge_decision.final_diagnoses)
-        decision.final_diagnoses = list(judge_decision.final_diagnoses)
-        decision.authorized_diagnoses = list(judge_decision.final_diagnoses)
+        decision.final_diagnoses = list(final_from_judge)
+        decision.authorized_diagnoses = list(final_from_judge)
         decision.trusted_diagnoses = [
             name
-            for name in judge_decision.final_diagnoses
+            for name in final_from_judge
             if candidate_for_name(name)
             and getattr(candidate_for_name(name), "trusted", False)
         ]

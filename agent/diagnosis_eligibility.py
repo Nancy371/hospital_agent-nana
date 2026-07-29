@@ -376,6 +376,10 @@ class DiagnosisEligibilityGate:
                 if self._deferred_worth_followup(candidate):
                     return self._result(candidate, DEFERRED, NEEDS_ANCHOR, missing, satisfied, blockers)
                 return self._result(candidate, DIFFERENTIAL_ONLY, WEAK_DIFFERENTIAL_SIGNAL, missing, satisfied, blockers)
+        claim_missing = self._claim_missing_anchors(candidate)
+        if claim_missing:
+            missing = list(dict.fromkeys(list(missing) + claim_missing))
+            return self._result(candidate, DEFERRED, NEEDS_ANCHOR, missing, satisfied, blockers)
         if bool(getattr(candidate, "differential_only", False)):
             reason = str(getattr(candidate, "differential_only_reason", "") or WEAK_DIFFERENTIAL_SIGNAL)
             return self._result(candidate, DIFFERENTIAL_ONLY, reason, missing, satisfied, blockers)
@@ -493,6 +497,20 @@ class DiagnosisEligibilityGate:
                 return ""
             return "mycoplasma_pneumonia_requires_pathogen_or_interstitial_anchor"
         return ""
+
+    @staticmethod
+    def _claim_missing_anchors(candidate: Any) -> List[str]:
+        missing: List[str] = []
+        for claim in getattr(candidate, "unresolved_critical_evidence_claims", []) or []:
+            if not isinstance(claim, dict):
+                continue
+            target = str(claim.get("target_evidence") or "").strip()
+            claim_id = str(claim.get("claim_id") or "").strip()
+            if target and claim_id:
+                missing.append(f"{claim_id}:{target}")
+            elif target:
+                missing.append(target)
+        return list(dict.fromkeys(item for item in missing if item))
 
     @staticmethod
     def _append_evidence_patterns(candidate: Any, patterns: Sequence[Dict[str, Any]]) -> None:

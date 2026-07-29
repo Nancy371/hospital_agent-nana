@@ -172,6 +172,32 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
         self.assertNotIn("atrial_septal_defect", positives)
         self.assertNotIn("diagnosis:房间隔缺损", positives)
 
+    def test_cbc_and_smear_create_leukemia_atomic_evidence(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09": {
+                    "status": "abnormal",
+                    "result": {
+                        "WBC": "18.6 x 10^9/L\uff08\u53c2\u8003\u8303\u56f4\uff1a4.0-10.0\uff09",
+                        "Hgb": "66 g/L\uff08\u53c2\u8003\u8303\u56f4\uff1a115-150\uff09",
+                        "PLT": "8 x 10^9/L\uff08\u53c2\u8003\u8303\u56f4\uff1a100-300\uff09",
+                    },
+                },
+                "\u5916\u5468\u8840\u6d82\u7247": {
+                    "status": "abnormal",
+                    "result": {
+                        "\u7ed3\u8bba": "\u5916\u5468\u8840\u53ef\u89c1\u5927\u91cf\u5faa\u73af\u6bcd\u7ec6\u80de\u7ea625%",
+                    },
+                },
+            },
+        )
+        positives = set(bundle.findings("positive"))
+        self.assertIn("hemoglobin_low", positives)
+        self.assertIn("platelet_low", positives)
+        self.assertIn("white_blood_cell_abnormal", positives)
+        self.assertIn("blast_present", positives)
+
     def test_vasculitis_serology_and_red_cell_casts_are_structured(self):
         bundle = self.normalizer.normalize(
             {},

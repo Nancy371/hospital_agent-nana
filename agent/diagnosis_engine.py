@@ -8,6 +8,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .candidate_generator import CandidateGenerator, CandidatePool
+from .case_board import (
+    ConsultationEvidencePipeline,
+    StaleJudgeDecisionError,
+    evidence_snapshot_hash,
+    judge_decision_is_stale,
+)
 from .clinical_evidence import EvidenceBundle, Observation
 from .diagnosis_eligibility import (
     DEFERRED,
@@ -224,6 +230,13 @@ class CandidateScore:
     submission_name: str = ""
     raw_names: List[str] = field(default_factory=list)
     submittable: bool = True
+    unresolved_high_value: bool = False
+    exam_followup_authorized: bool = False
+    submission_authorized: bool = False
+    evidence_claims: List[Dict[str, Any]] = field(default_factory=list)
+    unresolved_critical_evidence_claims: List[Dict[str, Any]] = field(default_factory=list)
+    claim_followup_exams: List[str] = field(default_factory=list)
+    claim_verification_status: str = ""
 
     @property
     def trusted(self) -> bool:
@@ -276,6 +289,13 @@ class DiagnosisDecision:
     deferred_anchor_candidates: List[str] = field(default_factory=list)
     excluded_candidates: List[str] = field(default_factory=list)
     primary_eligible_candidates: List[str] = field(default_factory=list)
+    case_board: Dict[str, Any] = field(default_factory=dict)
+    case_version: int = 0
+    evidence_snapshot_hash: str = ""
+    knowledge_profile_version: str = ""
+    decision_policy_version: str = ""
+    exam_catalog_version: str = ""
+    stale_decision: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -316,6 +336,13 @@ class DiagnosisDecision:
             "deferred_anchor_candidates": list(self.deferred_anchor_candidates),
             "excluded_candidates": list(self.excluded_candidates),
             "primary_eligible_candidates": list(self.primary_eligible_candidates),
+            "case_board": dict(self.case_board),
+            "case_version": int(self.case_version or 0),
+            "evidence_snapshot_hash": self.evidence_snapshot_hash,
+            "knowledge_profile_version": self.knowledge_profile_version,
+            "decision_policy_version": self.decision_policy_version,
+            "exam_catalog_version": self.exam_catalog_version,
+            "stale_decision": bool(self.stale_decision),
         }
 
 
@@ -573,6 +600,7 @@ class DiagnosticKnowledgeBase:
         self._merge_disease_graph()
 
         self._merge_entity_registry()
+        self._apply_consultation_pattern_overlays()
 
         # A direct positive or negative mention is a generic evidence source for every disease.
         for name, entry in self.entries.items():
@@ -756,6 +784,222 @@ class DiagnosticKnowledgeBase:
                 if text:
                     self.aliases[text] = name
 
+    def _apply_consultation_pattern_overlays(self) -> None:
+        leukemia = "\u767d\u8840\u75c5"
+        bph = "\u524d\u5217\u817a\u589e\u751f"
+        pavm = "\u80ba\u52a8\u9759\u8109\u7618"
+        self._overlay_entry(
+            leukemia,
+            supporting_evidence=[
+                {"finding": "blast_present", "weight": 0.9},
+                {"finding": "multilineage_cytopenia", "weight": 0.78},
+                {"finding": "acute_leukemia_pattern", "weight": 0.96},
+                {"finding": "hemoglobin_low", "weight": 0.45},
+                {"finding": "anemia", "weight": 0.36},
+                {"finding": "platelet_low", "weight": 0.45},
+                {"finding": "thrombocytopenia", "weight": 0.36},
+                {"finding": "white_blood_cell_abnormal", "weight": 0.42},
+                {"finding": "leukocytosis", "weight": 0.32},
+                {"finding": "leukopenia", "weight": 0.32},
+                {"finding": "bleeding_tendency", "weight": 0.24},
+                {"finding": "bone_pain", "weight": 0.24},
+            ],
+            discriminating_exams=[
+                "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09",
+                "\u5916\u5468\u8840\u6d82\u7247",
+                "\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09",
+                "\u7ec4\u7ec7\u75c5\u7406\u5b66\u68c0\u67e5",
+            ],
+            diagnostic_patterns=[
+                {
+                    "pattern_id": "acute_leukemia_confirmed_pattern",
+                    "pattern_type": "anchor_pattern",
+                    "logic": "all_of",
+                    "required": [
+                        {"any_of": ["blast_present", "acute_leukemia_pattern"]},
+                        {
+                            "any_of": [
+                                "multilineage_cytopenia",
+                                "hemoglobin_low",
+                                "platelet_low",
+                                "white_blood_cell_abnormal",
+                            ]
+                        },
+                    ],
+                    "requires_objective_source": True,
+                    "effect": {"eligibility": "PrimaryEligible"},
+                },
+                {
+                    "pattern_id": "acute_leukemia_suspected_workup_pattern",
+                    "pattern_type": "anchor_pattern",
+                    "logic": "min_count",
+                    "min_count": 2,
+                    "required": [
+                        "fever",
+                        "fatigue",
+                        "weakness",
+                        "bleeding_tendency",
+                        "bone_pain",
+                        "hemoglobin_low",
+                        "platelet_low",
+                        "white_blood_cell_abnormal",
+                    ],
+                    "effect": {
+                        "eligibility": "Deferred",
+                        "reason": "NeedsAnchor",
+                    },
+                },
+            ],
+        )
+        self._overlay_entry(
+            bph,
+            supporting_evidence=[
+                {"finding": "prostate_enlargement", "weight": 0.42},
+                {"finding": "urinary_frequency", "weight": 0.28},
+                {"finding": "urinary_urgency", "weight": 0.28},
+                {"finding": "nocturia", "weight": 0.28},
+                {"finding": "urinary_retention", "weight": 0.38},
+                {"finding": "difficulty_urinating", "weight": 0.32},
+                {"finding": "weak_stream", "weight": 0.3},
+                {"finding": "postvoid_residual_high", "weight": 0.35},
+            ],
+            diagnostic_patterns=[
+                {
+                    "pattern_id": "bph_luts_obstruction_pattern",
+                    "pattern_type": "anchor_pattern",
+                    "logic": "all_of",
+                    "required": [
+                        {
+                            "any_of": [
+                                "prostate_enlargement",
+                                f"diagnosis:{bph}",
+                            ]
+                        },
+                        {
+                            "any_of": [
+                                "urinary_frequency",
+                                "urinary_urgency",
+                                "nocturia",
+                                "urinary_retention",
+                                "difficulty_urinating",
+                                "weak_stream",
+                                "incomplete_emptying",
+                                "postvoid_residual_high",
+                            ]
+                        },
+                    ],
+                    "effect": {"eligibility": "PrimaryEligible"},
+                }
+            ],
+        )
+        self._replace_diagnostic_patterns(
+            pavm,
+            {
+                "pulmonary_avm_initial_shunt_pattern",
+                "pulmonary_avm_confirmed_vascular_pattern",
+            },
+            [
+                {
+                    "pattern_id": "pulmonary_avm_initial_shunt_pattern",
+                    "pattern_type": "anchor_pattern",
+                    "logic": "all_of",
+                    "required": [
+                        {"any_of": ["hemoptysis", "hypoxemia", "cyanosis"]},
+                        {
+                            "any_of": [
+                                "right_to_left_shunt",
+                                "pulmonary_vascular_shunt",
+                                "pulmonary_avm_mechanism",
+                                "pulmonary_avm_imaging",
+                                "pulmonary_cta_positive",
+                                "enhanced_ct_vascular_malformation",
+                                "bubble_echo_right_to_left_shunt",
+                            ]
+                        },
+                    ],
+                    "effect": {
+                        "eligibility": "Deferred",
+                        "reason": "NeedsAnchor",
+                    },
+                },
+                {
+                    "pattern_id": "pulmonary_avm_confirmed_vascular_pattern",
+                    "pattern_type": "anchor_pattern",
+                    "logic": "all_of",
+                    "required": [
+                        {"any_of": ["hemoptysis", "hypoxemia", "cyanosis"]},
+                        {
+                            "any_of": [
+                                "right_to_left_shunt",
+                                "pulmonary_vascular_shunt",
+                                "pulmonary_avm_mechanism",
+                                "pulmonary_avm_imaging",
+                            ]
+                        },
+                        {
+                            "any_of": [
+                                "pulmonary_cta_positive",
+                                "enhanced_ct_vascular_malformation",
+                                "bubble_echo_right_to_left_shunt",
+                                "pulmonary_av_fistula_pattern",
+                            ]
+                        },
+                    ],
+                    "requires_objective_source": True,
+                    "effect": {"eligibility": "PrimaryEligible"},
+                },
+            ],
+        )
+
+    def _overlay_entry(
+        self,
+        name: str,
+        *,
+        supporting_evidence: Optional[Sequence[Dict[str, Any]]] = None,
+        discriminating_exams: Optional[Sequence[str]] = None,
+        diagnostic_patterns: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> None:
+        normalized = self.normalize_name(name) or name
+        entry = self.entries.get(normalized)
+        if not entry:
+            return
+        if supporting_evidence:
+            entry["supporting_evidence"] = _dedupe_specs(
+                list(entry.get("supporting_evidence", []) or [])
+                + list(supporting_evidence)
+            )
+        if discriminating_exams:
+            entry["discriminating_exams"] = list(
+                dict.fromkeys(
+                    list(entry.get("discriminating_exams", []) or [])
+                    + [str(item) for item in discriminating_exams if str(item)]
+                )
+            )
+        if diagnostic_patterns:
+            entry["diagnostic_patterns"] = _dedupe_objects(
+                list(entry.get("diagnostic_patterns", []) or [])
+                + list(diagnostic_patterns)
+            )
+
+    def _replace_diagnostic_patterns(
+        self,
+        name: str,
+        pattern_ids: Set[str],
+        replacements: Sequence[Dict[str, Any]],
+    ) -> None:
+        normalized = self.normalize_name(name) or name
+        entry = self.entries.get(normalized)
+        if not entry:
+            return
+        blocked = {str(item) for item in pattern_ids if str(item)}
+        entry["diagnostic_patterns"] = _dedupe_objects(
+            [
+                item for item in list(entry.get("diagnostic_patterns", []) or [])
+                if str((item or {}).get("pattern_id") or "") not in blocked
+            ]
+            + list(replacements or [])
+        )
+
 
 class DiagnosisDecisionEngine:
     """Score every allowed diagnosis and arbitrate a small final diagnosis set."""
@@ -796,6 +1040,9 @@ class DiagnosisDecisionEngine:
         self.conflict_arbiter = EvidenceConflictArbiter(self.knowledge)
         self.root_cause_arbiter = RootCauseArbiter(self.knowledge, ref_dir=ref_dir)
         self.eligibility_gate = DiagnosisEligibilityGate(self.knowledge)
+        self.consultation_pipeline = ConsultationEvidencePipeline()
+        self.decision_policy_version = "judge_single_authority_v1"
+        self.exam_catalog_version = "exam_resolver_v1"
 
     @staticmethod
     def _load_weights(configured: Dict[str, Any]) -> Dict[str, float]:
@@ -846,10 +1093,23 @@ class DiagnosisDecisionEngine:
         evidence: EvidenceBundle,
         llm_result: Optional[Dict[str, Any]] = None,
     ) -> DiagnosisDecision:
+        case_id = str((llm_result or {}).get("patient_id") or (llm_result or {}).get("case_id") or "")
+        case_board, evidence = self.consultation_pipeline.run(
+            evidence,
+            llm_result=llm_result or {},
+            candidate_pool=candidate_pool,
+            case_id=case_id,
+            knowledge_profile_version=self.knowledge.knowledge_version,
+            decision_policy_version=self.decision_policy_version,
+            exam_catalog_version=self.exam_catalog_version,
+        )
         priors = candidate_pool.priors()
         sources_by_name = candidate_pool.sources_by_name()
         mechanism_hypotheses = list(candidate_pool.mechanism_hypotheses)
-        open_world_candidates = list(candidate_pool.open_world_candidates)
+        open_world_candidates = self._annotate_open_world_candidates(
+            list(candidate_pool.open_world_candidates),
+            mechanism_hypotheses,
+        )
         retrieval_views = [
             item.to_dict()
             for item in self.mechanism_reasoner.retrieval_views(evidence)
@@ -866,6 +1126,7 @@ class DiagnosisDecisionEngine:
                     candidate_sources=sources_by_name.get(source_key, sources_by_name.get(name, [])),
                 )
             )
+        self._apply_case_board_claims(scores, case_board)
         self._apply_competitive_specificity(scores)
         self._clear_submission_marks(scores)
         evidence_conflicts = self.conflict_arbiter.detect(
@@ -960,6 +1221,12 @@ class DiagnosisDecisionEngine:
             primary_eligible_candidates=list(
                 eligibility_summary.get("primary_eligible_candidates") or []
             ),
+            case_board=case_board.to_dict(),
+            case_version=case_board.case_version,
+            evidence_snapshot_hash=case_board.evidence_snapshot_hash,
+            knowledge_profile_version=case_board.knowledge_profile_version,
+            decision_policy_version=case_board.decision_policy_version,
+            exam_catalog_version=case_board.exam_catalog_version,
         )
         self.judge_and_submit(decision)
         return decision
@@ -989,6 +1256,229 @@ class DiagnosisDecisionEngine:
                 if text and text not in exams:
                     exams.append(text)
             candidate.conflict_adjudication_exams = exams
+
+    def _apply_case_board_claims(
+        self,
+        scores: Sequence[CandidateScore],
+        case_board: Any,
+    ) -> None:
+        if not scores or not case_board:
+            return
+        latest_claims: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for event in getattr(case_board, "events", []) or []:
+            event_type = str(getattr(event, "event_type", "") or "")
+            if event_type not in {"evidence_claim", "evidence_claim_verification"}:
+                continue
+            payload = dict(getattr(event, "payload", {}) or {})
+            claim_id = str(payload.get("claim_id") or "").strip()
+            target = str(payload.get("target_evidence") or "").strip()
+            hypothesis = str(payload.get("diagnosis_hypothesis") or "").strip()
+            if not claim_id or not target:
+                continue
+            latest_claims[(hypothesis, claim_id, target)] = payload
+        if not latest_claims:
+            return
+
+        for claim in latest_claims.values():
+            targets = self._claim_target_candidates(scores, claim)
+            for candidate in targets:
+                self._append_candidate_claim(candidate, claim)
+
+    def _claim_target_candidates(
+        self,
+        scores: Sequence[CandidateScore],
+        claim: Dict[str, Any],
+    ) -> List[CandidateScore]:
+        hypothesis = str(claim.get("diagnosis_hypothesis") or "").strip()
+        if not hypothesis:
+            return []
+        normalized = self.knowledge.normalize_name(hypothesis) if self.knowledge else None
+        entity_id = self.knowledge.entity_id_for(hypothesis) if self.knowledge else ""
+        candidates: List[CandidateScore] = []
+        lower_hypothesis = hypothesis.lower()
+        for candidate in scores or []:
+            candidate_keys = self._claim_candidate_keys(candidate)
+            if entity_id and entity_id == str(getattr(candidate, "entity_id", "") or ""):
+                candidates.append(candidate)
+                continue
+            if normalized and normalized in candidate_keys:
+                candidates.append(candidate)
+                continue
+            if self._hypothesis_mentions_candidate(lower_hypothesis, candidate, candidate_keys):
+                candidates.append(candidate)
+        result: List[CandidateScore] = []
+        seen: set[int] = set()
+        for candidate in candidates:
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            result.append(candidate)
+        return result
+
+    def _claim_candidate_keys(self, candidate: CandidateScore) -> set[str]:
+        keys = {
+            str(getattr(candidate, "diagnosis", "") or ""),
+            str(getattr(candidate, "canonical_name", "") or ""),
+            str(getattr(candidate, "submission_name", "") or ""),
+            str(getattr(candidate, "entity_id", "") or ""),
+        }
+        keys.update(str(item or "") for item in getattr(candidate, "raw_names", []) or [])
+        if self.knowledge:
+            entry = self.knowledge.get(str(getattr(candidate, "diagnosis", "") or ""))
+            keys.update(str(item or "") for item in entry.get("aliases", []) or [])
+        return {item.strip() for item in keys if item and item.strip()}
+
+    @staticmethod
+    def _hypothesis_mentions_candidate(
+        lower_hypothesis: str,
+        candidate: CandidateScore,
+        candidate_keys: set[str],
+    ) -> bool:
+        if not lower_hypothesis:
+            return False
+        for key in candidate_keys:
+            text = str(key or "").strip()
+            if not text or len(text) < 2:
+                continue
+            lower_key = text.lower()
+            if lower_key in lower_hypothesis or lower_hypothesis == lower_key:
+                return True
+        entity_id = str(getattr(candidate, "entity_id", "") or "")
+        target = str((getattr(candidate, "canonical_name", "") or getattr(candidate, "diagnosis", "")) or "")
+        target_lower = target.lower()
+        if entity_id == "D000025" and any(token in lower_hypothesis for token in ("leukemia", " aml", " all")):
+            return True
+        if entity_id == "D100055" and any(token in lower_hypothesis for token in ("pavm", "pulmonary avm")):
+            return True
+        if "leukemia" in lower_hypothesis and "leukemia" in target_lower:
+            return True
+        return False
+
+    @staticmethod
+    def _append_candidate_claim(candidate: CandidateScore, claim: Dict[str, Any]) -> None:
+        payload = dict(claim)
+        existing = list(getattr(candidate, "evidence_claims", []) or [])
+        key = (
+            str(payload.get("claim_id") or ""),
+            str(payload.get("target_evidence") or ""),
+        )
+        replaced = False
+        for index, item in enumerate(existing):
+            current_key = (
+                str(item.get("claim_id") or ""),
+                str(item.get("target_evidence") or ""),
+            )
+            if current_key == key:
+                existing[index] = payload
+                replaced = True
+                break
+        if not replaced:
+            existing.append(payload)
+        candidate.evidence_claims = existing
+
+        status = str(payload.get("status") or "Unresolved")
+        importance = str(payload.get("importance") or "")
+        if status not in {"Verified", "Derived"} and importance == "critical":
+            unresolved = list(getattr(candidate, "unresolved_critical_evidence_claims", []) or [])
+            if not any(
+                str(item.get("claim_id") or "") == str(payload.get("claim_id") or "")
+                for item in unresolved
+            ):
+                unresolved.append(payload)
+            candidate.unresolved_critical_evidence_claims = unresolved
+            exam = str(payload.get("recommended_exam") or "").strip()
+            if exam:
+                exams = list(getattr(candidate, "claim_followup_exams", []) or [])
+                if exam not in exams:
+                    exams.append(exam)
+                candidate.claim_followup_exams = exams
+            candidate.claim_verification_status = "unresolved_critical_claims"
+            candidate.exam_followup_authorized = True
+        elif existing:
+            unresolved_left = [
+                item for item in existing
+                if str(item.get("status") or "Unresolved") not in {"Verified", "Derived"}
+                and str(item.get("importance") or "") == "critical"
+            ]
+            candidate.unresolved_critical_evidence_claims = unresolved_left
+            candidate.claim_verification_status = (
+                "unresolved_critical_claims" if unresolved_left else "claims_verified_or_noncritical"
+            )
+
+    def _annotate_open_world_candidates(
+        self,
+        open_world_candidates: Sequence[Dict[str, Any]],
+        mechanism_hypotheses: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not open_world_candidates:
+            return []
+        sources_by_identity: Dict[str, set[str]] = {}
+        for item in open_world_candidates or []:
+            if not isinstance(item, dict):
+                continue
+            identity = self._open_world_identity(item)
+            if not identity:
+                continue
+            sources_by_identity.setdefault(identity, set()).add(str(item.get("source") or ""))
+        mechanism_ids = {
+            str(item.get("mechanism_id") or "")
+            for item in mechanism_hypotheses or []
+            if isinstance(item, dict) and str(item.get("mechanism_id") or "")
+        }
+        result: List[Dict[str, Any]] = []
+        for raw in open_world_candidates:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            if bool(item.get("submittable", False)):
+                item["open_world_status"] = "ResolvedSubmittableEntity"
+                result.append(item)
+                continue
+            identity = self._open_world_identity(item)
+            metadata = item.get("metadata") or {}
+            sources = sources_by_identity.get(identity, set())
+            stable_identity = bool(identity)
+            high_specific = bool(
+                item.get("evidence_links")
+                or metadata.get("mechanism_id")
+                or metadata.get("unreviewed_external")
+                or (metadata.get("mechanism_id") in mechanism_ids)
+            )
+            actionable = bool(
+                item.get("recommended_exams")
+                or metadata.get("recommended_exams")
+                or self.knowledge.get_discriminating_exam_bundle(
+                    item.get("entity_id")
+                    or item.get("canonical_name")
+                    or item.get("raw_name")
+                    or item.get("name")
+                )
+            )
+            independent = len({source for source in sources if source}) >= 2
+            if independent and high_specific and actionable and stable_identity:
+                item["open_world_status"] = "UnresolvedHighValue"
+                item["blocks_low_confidence_lock"] = True
+            else:
+                item["open_world_status"] = "OpenWorldDifferential"
+                item["blocks_low_confidence_lock"] = False
+            item["independent_source_count"] = len({source for source in sources if source})
+            item["stable_canonical_identity"] = stable_identity
+            item["high_specific_signal"] = high_specific
+            item["actionable_exam_available"] = actionable
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _open_world_identity(item: Dict[str, Any]) -> str:
+        return str(
+            item.get("entity_id")
+            or item.get("canonical_name")
+            or item.get("submission_name")
+            or item.get("raw_name")
+            or item.get("name")
+            or ""
+        ).strip()
 
     def _entity_resolution_audit(
         self,
@@ -1064,6 +1554,7 @@ class DiagnosisDecisionEngine:
         """Run the replayable judge and submitter over an existing decision."""
         if not decision:
             return decision
+        self._ensure_decision_metadata(decision)
         if not any(
             str(getattr(item, "eligibility_status", "") or "")
             for item in decision.candidates or []
@@ -1089,24 +1580,61 @@ class DiagnosisDecisionEngine:
             preselected=decision.final_diagnoses,
             max_final_diagnoses=self.max_final_diagnoses,
         )
+        self._bind_judge_metadata(decision, judge_decision)
         root_cause = self.root_cause_arbiter.arbitrate(
             judge_decision,
             decision.candidates,
             mechanism_hypotheses=decision.mechanism_hypotheses,
             max_final_diagnoses=self.max_final_diagnoses,
         )
-        self.root_cause_arbiter.apply_to_judge_decision(
+        self.judge.apply_root_cause_arbitration(
             judge_decision,
             root_cause,
             max_final_diagnoses=self.max_final_diagnoses,
         )
+        self._bind_judge_metadata(decision, judge_decision)
         self.submitter.apply(decision, judge_decision)
         self.authorize_final_diagnoses(
             decision,
-            decision.final_diagnoses,
+            decision.pre_authorization_diagnoses or decision.final_diagnoses,
             respect_differential_only=True,
         )
         return decision
+
+    def _ensure_decision_metadata(self, decision: DiagnosisDecision) -> None:
+        if not getattr(decision, "case_version", 0):
+            decision.case_version = 1
+        if not getattr(decision, "evidence_snapshot_hash", ""):
+            decision.evidence_snapshot_hash = evidence_snapshot_hash(EvidenceBundle([]))
+        if not getattr(decision, "knowledge_profile_version", ""):
+            decision.knowledge_profile_version = self.knowledge.knowledge_version
+        if not getattr(decision, "decision_policy_version", ""):
+            decision.decision_policy_version = self.decision_policy_version
+        if not getattr(decision, "exam_catalog_version", ""):
+            decision.exam_catalog_version = self.exam_catalog_version
+
+    @staticmethod
+    def _bind_judge_metadata(
+        decision: DiagnosisDecision,
+        judge_decision: Any,
+    ) -> None:
+        if not decision or not judge_decision:
+            return
+        for field_name in (
+            "case_version",
+            "evidence_snapshot_hash",
+            "knowledge_profile_version",
+            "decision_policy_version",
+            "exam_catalog_version",
+        ):
+            setattr(judge_decision, field_name, getattr(decision, field_name, ""))
+
+    @staticmethod
+    def _decision_judge_stale(decision: DiagnosisDecision) -> bool:
+        judge_payload = getattr(decision, "judge_decision", None)
+        if not judge_payload:
+            return False
+        return judge_decision_is_stale(decision, judge_payload)
 
     def filter_final_diagnoses(
         self,
@@ -1151,6 +1679,78 @@ class DiagnosisDecisionEngine:
         """
         if not decision:
             return decision
+        if self._decision_judge_stale(decision):
+            pre_names = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (
+                        requested_names
+                        if requested_names is not None
+                        else decision.final_diagnoses
+                    )
+                    if str(item).strip()
+                )
+            )
+            decision.stale_decision = True
+            decision.pre_authorization_diagnoses = pre_names
+            decision.authorized_diagnoses = []
+            decision.final_diagnoses = []
+            decision.trusted_diagnoses = []
+            decision.confidence = 0.0
+            decision.blocked_diagnoses = [
+                {
+                    "diagnosis": name,
+                    "reason": "stale judge decision for current evidence snapshot",
+                }
+                for name in pre_names
+            ]
+            decision.submission_override_count = len(pre_names)
+            return decision
+
+        judge_decision = dict(getattr(decision, "judge_decision", {}) or {})
+        judge_status = str(judge_decision.get("primary_status") or "").strip()
+        if judge_status and (
+            judge_status != "locked"
+            or bool(judge_decision.get("needs_discriminating_exams", False))
+        ):
+            pre_names = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (
+                        requested_names
+                        if requested_names is not None
+                        else decision.final_diagnoses
+                    )
+                    if str(item).strip()
+                )
+            )
+            reason = "judge decision deferred pending discriminating exams"
+            decision.pre_authorization_diagnoses = pre_names
+            decision.authorized_diagnoses = []
+            decision.final_diagnoses = []
+            decision.trusted_diagnoses = []
+            decision.confidence = 0.0
+            decision.blocked_diagnoses = [
+                self._authorization_block_record(
+                    name,
+                    self._candidate_for_name(decision.candidates, name),
+                    reason,
+                )
+                for name in pre_names
+            ]
+            for candidate in decision.candidates or []:
+                candidate.submission_authorized = False
+                if (
+                    candidate.eligibility_status == DEFERRED
+                    or candidate.diagnosis in set(decision.deferred_anchor_candidates)
+                    or getattr(candidate, "unresolved_critical_evidence_claims", None)
+                ):
+                    candidate.exam_followup_authorized = True
+            decision.submission_override_count = len(pre_names)
+            decision.differential_only_diagnoses = self.differential_only_details(
+                decision.candidates
+            )
+            return decision
 
         score_by_name = {item.diagnosis: item for item in decision.candidates}
         score_by_entity = {
@@ -1194,6 +1794,10 @@ class DiagnosisDecisionEngine:
         if not eligible:
             if not blocked and not pre_names:
                 blocked = existing_blocked
+            for candidate in decision.candidates or []:
+                candidate.submission_authorized = False
+                if candidate.eligibility_status == DEFERRED or candidate.diagnosis in set(decision.deferred_anchor_candidates):
+                    candidate.exam_followup_authorized = True
             decision.pre_authorization_diagnoses = pre_names
             decision.authorized_diagnoses = []
             decision.blocked_diagnoses = blocked
@@ -1232,6 +1836,10 @@ class DiagnosisDecisionEngine:
                 break
 
         authorized_names = [item.diagnosis for item in authorized]
+        for candidate in decision.candidates or []:
+            candidate.submission_authorized = candidate in authorized
+            if candidate.eligibility_status == DEFERRED or candidate.diagnosis in set(decision.deferred_anchor_candidates):
+                candidate.exam_followup_authorized = True
         requested_set = set(pre_names)
         authorized_set = set(authorized_names)
         for name in pre_names:
@@ -1281,6 +1889,8 @@ class DiagnosisDecisionEngine:
             return "hard contradiction present"
         if getattr(candidate, "unresolved_evidence_conflict", False):
             return "unresolved reasoning-structured evidence conflict"
+        if bool(getattr(candidate, "required_gap_authorized", False)):
+            return "required_gap_authorized is audit-only, not submission authorization"
         status = str(getattr(candidate, "eligibility_status", "") or "")
         if status and status != PRIMARY_ELIGIBLE:
             if status == DEFERRED:
@@ -1317,6 +1927,23 @@ class DiagnosisDecisionEngine:
                 ):
                     return candidate
         return self._sort_candidates(eligible)[0]
+
+    def _candidate_for_name(
+        self,
+        candidates: Sequence[CandidateScore],
+        name: Any,
+    ) -> Optional[CandidateScore]:
+        text = str(name or "").strip()
+        if not text:
+            return None
+        score_by_name = {item.diagnosis: item for item in candidates or []}
+        score_by_entity = {
+            item.entity_id: item
+            for item in candidates or []
+            if getattr(item, "entity_id", "")
+        }
+        entity_id = self.knowledge.entity_id_for(text) if self.knowledge else ""
+        return (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(text)
 
     def _secondary_authorization_block_reason(
         self,
@@ -1461,6 +2088,12 @@ class DiagnosisDecisionEngine:
             source = str(item.get("source") or "")
             if bool(item.get("submittable", False)):
                 continue
+            status = str(item.get("open_world_status") or "")
+            if status == "OpenWorldDifferential":
+                continue
+            if status == "UnresolvedHighValue":
+                contenders.append(dict(item))
+                continue
             if prior < 0.62:
                 continue
             if source not in {"mechanism_reasoner", "external_retrieval", "llm_unresolved"}:
@@ -1563,6 +2196,18 @@ class DiagnosisDecisionEngine:
                     ),
                     "root_cause_coverage": float(
                         getattr(candidate, "root_cause_coverage", 0.0) or 0.0
+                    ),
+                    "evidence_claims": list(
+                        getattr(candidate, "evidence_claims", []) or []
+                    )[:6],
+                    "unresolved_critical_evidence_claims": list(
+                        getattr(candidate, "unresolved_critical_evidence_claims", []) or []
+                    )[:6],
+                    "claim_followup_exams": list(
+                        getattr(candidate, "claim_followup_exams", []) or []
+                    ),
+                    "claim_verification_status": str(
+                        getattr(candidate, "claim_verification_status", "") or ""
                     ),
                 }
             )
@@ -1716,6 +2361,8 @@ class DiagnosisDecisionEngine:
             item.differential_only = False
             item.differential_only_reason = ""
             item.required_gap_authorized = False
+            item.exam_followup_authorized = False
+            item.submission_authorized = False
 
     def differential_only_details(
         self,

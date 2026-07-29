@@ -1599,6 +1599,28 @@ class ClinicalEvidenceNormalizer:
                     return True
             return False
 
+        if any(
+            token in context
+            for token in (
+                "\u5916\u5468\u8840\u6d82\u7247",
+                "\u8840\u6d82\u7247",
+                "\u9aa8\u9ad3",
+                "smear",
+                "blast",
+            )
+        ) and assertive_term(
+            (
+                "\u539f\u59cb\u7ec6\u80de",
+                "\u5e7c\u7a1a\u7ec6\u80de",
+                "\u6bcd\u7ec6\u80de",
+                "blast",
+                "lymphoblast",
+                "myeloblast",
+            )
+        ):
+            findings.append(("blast_present", 0.98))
+            findings.append(("hematologic_malignancy_blast_evidence", 0.92))
+
         if "尿培养" in context or "culture" in context:
             if any(token in result_compact for token in ("阴性", "无生长", "未培养出", "未检出")):
                 findings.append(("urine_culture_no_growth", 0.96))
@@ -1835,8 +1857,21 @@ class ClinicalEvidenceNormalizer:
             findings.append(("hemoconcentration", 0.92))
         elif any(token in key for token in ("门静脉内径", "门静脉直径", "门静脉宽度")) and value is not None and value >= 13:
             findings.append(("portal_vein_dilation", 0.92))
+        elif any(
+            token in key
+            for token in ("血红蛋白", "hemoglobin", "hgb", "hb")
+        ) and direction == "low":
+            findings.append(("hemoglobin_low", 0.94))
+            findings.append(("anemia", 0.88))
+        elif any(
+            token in key
+            for token in ("白细胞计数", "血白细胞", "whitebloodcell", "white blood cell", "wbc")
+        ) and not any(token in key for token in ("尿", "urine", "urinary")) and direction in {"high", "low"}:
+            findings.append(("white_blood_cell_abnormal", 0.92))
+            findings.append(("leukocytosis" if direction == "high" else "leukopenia", 0.86))
         elif any(token in key for token in ("血小板", "platelet", "plt")) and direction == "low":
             findings.append(("thrombocytopenia", 0.9))
+            findings.append(("platelet_low", 0.94))
         elif any(token in key for token in ("尿红细胞", "rbc")) and direction == "high":
             findings.append(("microscopic_hematuria", 0.94))
         elif any(token in key for token in ("尿白细胞", "白细胞尿", "wbc")) and direction == "high":

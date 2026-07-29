@@ -31,6 +31,18 @@ __all__ = [
     "DiseaseEntityRegistry",
     "DiseaseEntity",
     "DiagnosticPatternEvaluator",
+    "CaseBoard",
+    "CaseBoardEvent",
+    "CaseBoardPermissionError",
+    "ConsultationEvidencePipeline",
+    "EvidenceClaim",
+    "EvidenceClaimGenerator",
+    "PatternCompiler",
+    "StaleJudgeDecisionError",
+    "TargetedEvidenceVerifier",
+    "evidence_snapshot_hash",
+    "ExamResolver",
+    "ExamResolution",
     "DiagnosisEligibilityGate",
     "EligibilityResult",
     "PRIMARY_ELIGIBLE",
@@ -119,6 +131,23 @@ def __getattr__(name: str):
     if name == "DiagnosticPatternEvaluator":
         from .diagnostic_patterns import DiagnosticPatternEvaluator
         return DiagnosticPatternEvaluator
+    if name in (
+        "CaseBoard",
+        "CaseBoardEvent",
+        "CaseBoardPermissionError",
+        "ConsultationEvidencePipeline",
+        "EvidenceClaim",
+        "EvidenceClaimGenerator",
+        "PatternCompiler",
+        "StaleJudgeDecisionError",
+        "TargetedEvidenceVerifier",
+        "evidence_snapshot_hash",
+    ):
+        from . import case_board as _case_board
+        return getattr(_case_board, name)
+    if name in ("ExamResolver", "ExamResolution"):
+        from . import exam_resolver as _exam_resolver
+        return getattr(_exam_resolver, name)
     if name in (
         "DiagnosisEligibilityGate",
         "EligibilityResult",
