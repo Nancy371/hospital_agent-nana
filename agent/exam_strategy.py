@@ -615,6 +615,21 @@ class ExamStrategyAgent:
             proposed_items=list(dict.fromkeys(normalized + proposed_items)),
             exam_tasks=exam_tasks,
         )
+        priority_task_items = [
+            exam
+            for exam, task in task_by_exam.items()
+            if str(task.get("exam_source") or "") in {
+                "conflict_adjudication_exam",
+                "deferred_gap_closure_exam",
+                "evidence_claim_followup_exam",
+                "pattern_anchor_workup_exam",
+            }
+            and bool(
+                task.get("priority_override")
+                or str(task.get("exam_source") or "")
+                in {"conflict_adjudication_exam", "deferred_gap_closure_exam"}
+            )
+        ]
         high_value_proposed = [
             item
             for item in proposed_items
@@ -622,10 +637,19 @@ class ExamStrategyAgent:
         ]
         if payload.get("needs_discriminating_exams"):
             high_value_proposed = []
-            ordered = [item for item in ranked if item in set(normalized)]
+            ordered = list(
+                dict.fromkeys(
+                    priority_task_items
+                    + [item for item in ranked if item in set(normalized)]
+                )
+            )
         else:
             ordered = list(
-                dict.fromkeys(high_value_proposed + [item for item in ranked if item in set(normalized)])
+                dict.fromkeys(
+                    priority_task_items
+                    + high_value_proposed
+                    + [item for item in ranked if item in set(normalized)]
+                )
             )
         items = self.prepare_order_items(
             list(dict.fromkeys(ordered)),
@@ -646,9 +670,12 @@ class ExamStrategyAgent:
             {
                 "exam": item,
                 "exam_source": (
-                    "entity_exam_bundle_fallback"
-                    if item in entity_fallback_set and item not in task_by_exam
-                    else "judge_discriminating_exam"
+                    str(task_by_exam.get(item, {}).get("exam_source") or "")
+                    or (
+                        "entity_exam_bundle_fallback"
+                        if item in entity_fallback_set and item not in task_by_exam
+                        else "judge_discriminating_exam"
+                    )
                 ),
                 "target_candidates": list(
                     task_by_exam.get(item, {}).get("target_candidates")
@@ -668,12 +695,18 @@ class ExamStrategyAgent:
                 ),
                 "information_gain": information_gain.get(item, 0.0),
                 "allowed_reason": (
-                    "needs_discriminating_exams"
+                    "exam_priority_override"
+                    if bool(task_by_exam.get(item, {}).get("priority_override"))
+                    else "needs_discriminating_exams"
                     if payload.get("needs_discriminating_exams")
                     else "judge_discriminating_exam"
                 ),
                 "blocked_reason": "",
                 "exam_resolution": dict(resolution_by_exam.get(item, {})),
+                "target_gap": str(task_by_exam.get(item, {}).get("target_gap") or ""),
+                "target_gaps": list(task_by_exam.get(item, {}).get("target_gaps") or []),
+                "priority_override": bool(task_by_exam.get(item, {}).get("priority_override")),
+                "override_reason": str(task_by_exam.get(item, {}).get("override_reason") or ""),
             }
             for item in items
         ]
@@ -776,10 +809,25 @@ class ExamStrategyAgent:
                 [str(task.get("exam") or "")]
             )
             if not normalized:
+                resolution = self.exam_resolver.resolve(str(task.get("exam") or ""))
+                if resolution.resolved_exam:
+                    normalized, _ = self.knowledge.normalize_examinations(
+                        [resolution.resolved_exam]
+                    )
+                    if not normalized and resolution.resolution_type in {
+                        "exact",
+                        "alias",
+                        "equivalent",
+                        "partial_substitute",
+                    }:
+                        normalized = [resolution.resolved_exam]
+            if not normalized:
                 continue
             current = dict(task)
-            current["exam"] = normalized[0]
-            result[normalized[0]] = current
+            for exam in normalized:
+                current_for_exam = dict(current)
+                current_for_exam["exam"] = exam
+                result[exam] = current_for_exam
         return result
 
     def _strict_authorized_exam_plan(
@@ -1181,6 +1229,10 @@ class ExamStrategyAgent:
             relevance[exam] = relevance.get(exam, 0.0) + float(
                 task.get("information_gain_hint", 0.8) or 0.8
             )
+            if task.get("priority_override"):
+                relevance[exam] = relevance.get(exam, 0.0) + 1.25
+            if str(task.get("exam_source") or "") == "deferred_gap_closure_exam":
+                relevance[exam] = relevance.get(exam, 0.0) + 1.0
         for rank, disease in enumerate(candidates):
             profile = self.knowledge.get_disease_profile(disease) or {}
             raw_items: List[str] = []
@@ -1234,6 +1286,10 @@ class ExamStrategyAgent:
                 + 0.12 * finding_score
                 + 0.10 * relevance_score
             )
+            if task_by_exam.get(exam, {}).get("priority_override"):
+                score += 0.35
+            if str(task_by_exam.get(exam, {}).get("exam_source") or "") == "deferred_gap_closure_exam":
+                score += 0.25
             if exam_type == "generic_inflammation" and coverage < 2:
                 score *= 0.45
             scores[exam] = round(score, 4)
@@ -1270,6 +1326,10 @@ class ExamStrategyAgent:
     @staticmethod
     def _exam_type_score(exam_type: str) -> float:
         return {
+            "conflict_adjudication": 1.2,
+            "deferred_gap_closure": 1.12,
+            "evidence_claim_verification": 1.05,
+            "pattern_anchor_workup": 1.02,
             "special_discriminator": 1.0,
             "shared_discriminator": 0.78,
             "confirmatory": 0.50,

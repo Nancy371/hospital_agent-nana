@@ -15,6 +15,11 @@ DIFFERENTIAL_ONLY = "DifferentialOnly"
 EXCLUDED = "Excluded"
 
 NEEDS_ANCHOR = "NeedsAnchor"
+DEFERRED_NEEDS_OBSERVED_EVIDENCE = "DeferredNeedsObservedEvidence"
+DEFERRED_NEEDS_DERIVED_PATTERN = "DeferredNeedsDerivedPattern"
+DEFERRED_NEEDS_CONFIRMATORY_EXAM = "DeferredNeedsConfirmatoryExam"
+DEFERRED_UNRESOLVED_NAMING = "DeferredUnresolvedNaming"
+DEFERRED_LOW_PRIORITY = "DeferredLowPriority"
 CONFLICT_NEEDS_ADJUDICATION = "ConflictNeedsAdjudication"
 HARD_CONTRADICTION = "HardContradiction"
 NO_SUPPORTING_EVIDENCE = "NoSupportingEvidence"
@@ -404,6 +409,7 @@ class DiagnosisEligibilityGate:
         setattr(candidate, "evidence_pattern_matches", list(result.evidence_pattern_matches))
         setattr(candidate, "positive_evidence_score", result.positive_evidence_score)
         setattr(candidate, "evidence_specificity_score", result.evidence_specificity_score)
+        setattr(candidate, "eligibility_substatus", self._deferred_substatus(candidate, result))
         if result.status == PRIMARY_ELIGIBLE:
             setattr(candidate, "required_met", True)
             setattr(candidate, "required_gaps", [])
@@ -457,6 +463,43 @@ class DiagnosisEligibilityGate:
             positive_evidence_score=float(getattr(candidate, "positive_evidence_score", 0.0) or 0.0),
             evidence_specificity_score=float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0),
         )
+
+    def _deferred_substatus(self, candidate: Any, result: EligibilityResult) -> str:
+        if result.status != DEFERRED:
+            return ""
+        if not bool(getattr(candidate, "submittable", True)):
+            return DEFERRED_UNRESOLVED_NAMING
+        if result.reason == CONFLICT_NEEDS_ADJUDICATION:
+            return DEFERRED_NEEDS_OBSERVED_EVIDENCE
+        claims = [
+            item
+            for item in getattr(candidate, "unresolved_critical_evidence_claims", []) or []
+            if isinstance(item, dict)
+        ]
+        if claims:
+            if any(
+                str(item.get("claim_type") or "") == "derived_pattern"
+                or item.get("required_inputs")
+                for item in claims
+            ):
+                return DEFERRED_NEEDS_DERIVED_PATTERN
+            return DEFERRED_NEEDS_OBSERVED_EVIDENCE
+        for pattern in getattr(candidate, "evidence_pattern_matches", []) or []:
+            if isinstance(pattern, dict) and pattern.get("missing_required_groups"):
+                return DEFERRED_NEEDS_DERIVED_PATTERN
+        entry = self._entry(candidate)
+        if (
+            result.missing_required_anchors
+            and (
+                entry.get("discriminating_exams")
+                or entry.get("strong_verification_exams")
+                or entry.get("required_exams")
+            )
+        ):
+            return DEFERRED_NEEDS_CONFIRMATORY_EXAM
+        if result.missing_required_anchors:
+            return DEFERRED_NEEDS_CONFIRMATORY_EXAM
+        return DEFERRED_LOW_PRIORITY
 
     @staticmethod
     def _satisfied_anchors(candidate: Any) -> List[str]:

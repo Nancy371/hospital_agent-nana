@@ -77,6 +77,43 @@ class ExamInformationGainTests(unittest.TestCase):
         self.assertNotIn("泌尿道超声", result["items"])
         self.assertNotIn("尿动力学检查（UDS）", result["items"])
 
+    def test_deferred_gap_closure_task_beats_generic_exam_ranking(self):
+        deferred_exam = "鑳搁儴CT鎵弿锛圕hest CT锛?"
+        generic_exam = "鍏ㄨ缁嗚優璁℃暟锛圕BC锛?"
+
+        ranked, scores = self.strategy._rank_by_information_gain(
+            candidate_diseases=["鑲哄姩闈欒剦鐦?", "鑲虹檶"],
+            symptoms=["鍜"],
+            proposed_items=[deferred_exam, generic_exam],
+            exam_tasks=[
+                {
+                    "exam": deferred_exam,
+                    "target_candidates": ["鑲哄姩闈欒剦鐦?"],
+                    "target_findings": ["pulmonary_vascular_malformation_confirmed"],
+                    "target_gaps": ["G-PAVF-01"],
+                    "exam_type": "deferred_gap_closure",
+                    "exam_source": "deferred_gap_closure_exam",
+                    "priority_override": True,
+                    "information_gain_hint": 0.99,
+                },
+                {
+                    "exam": generic_exam,
+                    "target_candidates": ["鑲哄姩闈欒剦鐦?", "鑲虹檶"],
+                    "target_findings": ["inflammation"],
+                    "exam_type": "generic_inflammation",
+                    "information_gain_hint": 0.5,
+                },
+            ],
+        )
+
+        normalized_deferred, _ = self.strategy.knowledge.normalize_examinations([deferred_exam])
+        normalized_generic, _ = self.strategy.knowledge.normalize_examinations([generic_exam])
+        expected_deferred = normalized_deferred[0] if normalized_deferred else deferred_exam
+        expected_generic = normalized_generic[0] if normalized_generic else generic_exam
+
+        self.assertEqual(ranked[0], expected_deferred)
+        self.assertGreater(scores[expected_deferred], scores[expected_generic])
+
     def test_tb_mpa_lung_cancer_special_exams_beat_generic_inflammation(self):
         result = self.strategy.recommend(
             collected_info={"symptoms": ["咳嗽", "咯血", "夜汗", "尿色深"]},

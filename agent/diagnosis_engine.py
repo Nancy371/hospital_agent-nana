@@ -233,6 +233,15 @@ class CandidateScore:
     unresolved_high_value: bool = False
     exam_followup_authorized: bool = False
     submission_authorized: bool = False
+    eligibility_substatus: str = ""
+    evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    deferred_priority: float = 0.0
+    deferred_priority_components: Dict[str, float] = field(default_factory=dict)
+    exam_priority_override: bool = False
+    exam_priority_override_reason: str = ""
+    deferred_priority_status: str = ""
+    deferred_rounds: int = 0
+    gap_closure_attempts: int = 0
     evidence_claims: List[Dict[str, Any]] = field(default_factory=list)
     unresolved_critical_evidence_claims: List[Dict[str, Any]] = field(default_factory=list)
     claim_followup_exams: List[str] = field(default_factory=list)
@@ -2176,6 +2185,9 @@ class DiagnosisDecisionEngine:
                     "eligibility_reason": str(
                         getattr(candidate, "eligibility_reason", "") or ""
                     ),
+                    "eligibility_substatus": str(
+                        getattr(candidate, "eligibility_substatus", "") or ""
+                    ),
                     "missing_required_anchors": list(
                         getattr(candidate, "missing_required_anchors", []) or []
                     ),
@@ -2208,6 +2220,21 @@ class DiagnosisDecisionEngine:
                     ),
                     "claim_verification_status": str(
                         getattr(candidate, "claim_verification_status", "") or ""
+                    ),
+                    "evidence_gaps": list(
+                        getattr(candidate, "evidence_gaps", []) or []
+                    )[:6],
+                    "deferred_priority": float(
+                        getattr(candidate, "deferred_priority", 0.0) or 0.0
+                    ),
+                    "deferred_priority_components": dict(
+                        getattr(candidate, "deferred_priority_components", {}) or {}
+                    ),
+                    "exam_priority_override": bool(
+                        getattr(candidate, "exam_priority_override", False)
+                    ),
+                    "exam_priority_override_reason": str(
+                        getattr(candidate, "exam_priority_override_reason", "") or ""
                     ),
                 }
             )

@@ -12,7 +12,11 @@ from agent.case_board import (
     TargetedEvidenceVerifier,
 )
 from agent.clinical_evidence import EvidenceBundle, Observation
-from agent.diagnosis_eligibility import DEFERRED, PRIMARY_ELIGIBLE
+from agent.diagnosis_eligibility import (
+    DEFERRED,
+    DEFERRED_NEEDS_CONFIRMATORY_EXAM,
+    PRIMARY_ELIGIBLE,
+)
 from agent.candidate_generator import CandidatePool
 from agent.diagnosis_engine import CandidateScore, DiagnosisDecision, DiagnosisDecisionEngine
 from agent.diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter, JudgeDecision
@@ -290,7 +294,8 @@ class CaseBoardTests(unittest.TestCase):
         tasks = decision.judge_decision.get("discriminating_exam_tasks", [])
         self.assertTrue(
             any(
-                task.get("exam_source") == "evidence_claim_followup_exam"
+                task.get("exam_source")
+                in {"evidence_claim_followup_exam", "deferred_gap_closure_exam"}
                 and leukemia in task.get("target_candidates", [])
                 for task in tasks
             )
@@ -347,6 +352,75 @@ class CaseBoardTests(unittest.TestCase):
         pavm.core_matched_evidence = ["hemoptysis"]
 
         self.assertTrue(judge._high_value_unresolved_contender(coronary, pavm))
+
+    def test_high_value_deferred_gap_generates_priority_closure_exam(self):
+        judge = DiagnosisJudge(load_config())
+        lung_cancer = candidate("\u80ba\u764c")
+        lung_cancer.entity_id = "D000006"
+        lung_cancer.core_matched_evidence = ["hemoptysis"]
+        lung_cancer.matched_evidence = ["hemoptysis", "pulmonary_nodule"]
+
+        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7626")
+        pavm.entity_id = "D100055"
+        pavm.eligibility_status = DEFERRED
+        pavm.eligibility_substatus = DEFERRED_NEEDS_CONFIRMATORY_EXAM
+        pavm.required_met = False
+        pavm.required_gaps = ["pulmonary_cta_positive"]
+        pavm.matched_evidence = ["hemoptysis"]
+        pavm.core_matched_evidence = ["hemoptysis"]
+        pavm.claim_followup_exams = ["\u80ba\u52a8\u8109CTA"]
+        pavm.evidence_specificity_score = 0.8
+        pavm.source_prior = 0.8
+
+        decision = judge.judge([lung_cancer, pavm])
+
+        self.assertEqual(decision.primary_status, "deferred")
+        self.assertIn("\u80ba\u52a8\u9759\u8109\u7626", decision.high_value_gap_candidates)
+        self.assertTrue(decision.exam_priority_overrides)
+        self.assertTrue(decision.deferred_evidence_gaps)
+        self.assertTrue(
+            any(
+                task.get("exam_source") == "deferred_gap_closure_exam"
+                and task.get("priority_override")
+                and "\u80ba\u52a8\u9759\u8109\u7626" in task.get("target_candidates", [])
+                for task in decision.discriminating_exam_tasks
+            )
+        )
+
+    def test_low_value_deferred_gap_does_not_get_priority_override(self):
+        judge = DiagnosisJudge(load_config())
+        pulmonary_valve = candidate("\u80ba\u52a8\u8109\u74e3\u72ed\u7a84")
+        pulmonary_valve.eligibility_status = DEFERRED
+        pulmonary_valve.eligibility_substatus = DEFERRED_NEEDS_CONFIRMATORY_EXAM
+        pulmonary_valve.required_met = False
+        pulmonary_valve.required_gaps = ["pulmonary_valve_gradient"]
+        pulmonary_valve.matched_evidence = ["diagnosis:\u80ba\u52a8\u8109\u74e3\u72ed\u7a84"]
+        pulmonary_valve.core_matched_evidence = []
+        pulmonary_valve.evidence_specificity_score = 0.2
+        pulmonary_valve.diagnosis_type = "disease"
+
+        judge._annotate_deferred_gap_priorities([pulmonary_valve])
+
+        self.assertFalse(pulmonary_valve.exam_priority_override)
+        self.assertTrue(pulmonary_valve.evidence_gaps)
+
+    def test_broad_support_only_deferred_candidate_does_not_steal_exam_priority(self):
+        judge = DiagnosisJudge(load_config())
+        tb_pericarditis = candidate("\u7ed3\u6838\u6027\u5fc3\u5305\u708e")
+        tb_pericarditis.eligibility_status = DEFERRED
+        tb_pericarditis.eligibility_substatus = DEFERRED_NEEDS_CONFIRMATORY_EXAM
+        tb_pericarditis.required_met = False
+        tb_pericarditis.required_gaps = ["pericardial_effusion"]
+        tb_pericarditis.matched_evidence = ["fever"]
+        tb_pericarditis.core_matched_evidence = []
+        tb_pericarditis.diagnostic_matched_evidence = []
+        tb_pericarditis.claim_followup_exams = ["\u5fc3\u810f\u8d85\u58f0"]
+        tb_pericarditis.evidence_specificity_score = 0.9
+
+        judge._annotate_deferred_gap_priorities([tb_pericarditis])
+
+        self.assertFalse(tb_pericarditis.exam_priority_override)
+        self.assertTrue(tb_pericarditis.evidence_gaps)
 
     def test_deferred_cross_system_candidate_does_not_block_structural_primary(self):
         judge = DiagnosisJudge(load_config())

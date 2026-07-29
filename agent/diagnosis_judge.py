@@ -11,7 +11,22 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from .case_board import StaleJudgeDecisionError, judge_decision_is_stale
-from .diagnosis_eligibility import DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED, PRIMARY_ELIGIBLE
+from .diagnosis_eligibility import (
+    DEFERRED,
+    DEFERRED_NEEDS_CONFIRMATORY_EXAM,
+    DEFERRED_NEEDS_DERIVED_PATTERN,
+    DEFERRED_NEEDS_OBSERVED_EVIDENCE,
+    DIFFERENTIAL_ONLY,
+    EXCLUDED,
+    PRIMARY_ELIGIBLE,
+)
+
+
+_DEFERRED_EXAM_OVERRIDE_SUBSTATUSES = {
+    DEFERRED_NEEDS_CONFIRMATORY_EXAM,
+    DEFERRED_NEEDS_DERIVED_PATTERN,
+    DEFERRED_NEEDS_OBSERVED_EVIDENCE,
+}
 
 
 _GENERIC_PARENT_DIAGNOSES = {
@@ -123,6 +138,7 @@ _BROAD_EVIDENCE_TOKENS = {
     "pain",
     "pruritus",
     "rash",
+    "dyspnea",
     "visual_blurring",
     "abdominal_pain",
     "symptom:发热",
@@ -334,10 +350,16 @@ class JudgeCandidateReview:
     required_gap_state: str = ""
     eligibility_status: str = ""
     eligibility_reason: str = ""
+    eligibility_substatus: str = ""
     missing_required_anchors: List[str] = field(default_factory=list)
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
     exam_followup_authorized: bool = False
     submission_authorized: bool = False
+    evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    deferred_priority: float = 0.0
+    deferred_priority_components: Dict[str, float] = field(default_factory=dict)
+    exam_priority_override: bool = False
+    exam_priority_override_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -388,6 +410,12 @@ class JudgeDecision:
     discriminating_exam_tasks: List[Dict[str, Any]] = field(default_factory=list)
     required_gap_by_candidate: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
     high_value_gap_candidates: List[str] = field(default_factory=list)
+    deferred_evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    exam_priority_overrides: List[Dict[str, Any]] = field(default_factory=list)
+    deferred_gap_closure_tasks: List[Dict[str, Any]] = field(default_factory=list)
+    deferred_gap_closure_exam_coverage: float = 0.0
+    exam_priority_alignment: float = 0.0
+    wrong_primary_exam_drift: float = 0.0
     explanatory_coverage: float = 0.0
     core_explanatory_coverage: float = 0.0
     residual_evidence_score: float = 0.0
@@ -408,6 +436,7 @@ class JudgeDecision:
     candidate_explanation_edges: List[Dict[str, Any]] = field(default_factory=list)
     primary_override_source: str = ""
     eligibility_distribution: Dict[str, int] = field(default_factory=dict)
+    deferred_substatus_distribution: Dict[str, int] = field(default_factory=dict)
     deferred_anchor_candidates: List[str] = field(default_factory=list)
     excluded_candidates: List[str] = field(default_factory=list)
     primary_eligible_candidates: List[str] = field(default_factory=list)
@@ -1272,10 +1301,17 @@ class DiagnosisJudge:
             ranked,
             conflict_affected_diagnoses,
         )
+        self._annotate_deferred_gap_priorities(ranked)
         pattern_force_names = self._forced_pool_names_for_pattern_deferred(ranked)
         claim_force_names = self._forced_pool_names_for_claims(ranked)
+        gap_force_names = self._forced_pool_names_for_deferred_gap_override(ranked)
         force_names = list(
-            dict.fromkeys(list(force_names) + pattern_force_names + claim_force_names)
+            dict.fromkeys(
+                list(force_names)
+                + pattern_force_names
+                + claim_force_names
+                + gap_force_names
+            )
         )
         candidate_pool_for_workup = [
             item
@@ -1293,6 +1329,8 @@ class DiagnosisJudge:
             raw_pool_source[name] = "pattern_deferred_workup"
         for name in claim_force_names:
             raw_pool_source[name] = "critical_evidence_claim_followup"
+        for name in gap_force_names:
+            raw_pool_source[name] = "deferred_gap_priority_override"
         for name in force_names:
             raw_pool_source.setdefault(
                 name,
@@ -1318,8 +1356,14 @@ class DiagnosisJudge:
         conflict_exam_tasks = self._conflict_adjudication_exam_tasks(
             differential_pool
         )
+        deferred_gap_exam_tasks = self._deferred_gap_closure_exam_tasks(
+            differential_pool
+        )
         discriminating_exam_tasks = self._merge_discriminating_exam_tasks(
-            list(pattern_exam_tasks) + list(claim_exam_tasks) + list(conflict_exam_tasks),
+            list(conflict_exam_tasks)
+            + list(deferred_gap_exam_tasks)
+            + list(pattern_exam_tasks)
+            + list(claim_exam_tasks),
             base_discriminating_exam_tasks,
         )
         discriminating_exams = [
@@ -1383,6 +1427,11 @@ class DiagnosisJudge:
             decision.discriminating_findings = discriminating_findings
             decision.discriminating_exams = discriminating_exams
             decision.discriminating_exam_tasks = discriminating_exam_tasks
+            self._apply_deferred_gap_decision_audit(
+                decision,
+                differential_pool,
+                discriminating_exam_tasks,
+            )
             decision.required_gap_by_candidate = required_gap_by_candidate
             decision.differential_pool_source = dict(pool_filter.pool_source)
             decision.evidence_conflicts = evidence_conflicts
@@ -1441,6 +1490,7 @@ class DiagnosisJudge:
             and (
                 self._high_value_unresolved_contender(primary, item)
                 or self._pattern_deferred_workup_candidate(item)
+                or self._exam_priority_override_candidate(item)
             )
         ][: self.gap_target_limit]
         decision.explanatory_coverage = self._coverage(primary)
@@ -1474,6 +1524,11 @@ class DiagnosisJudge:
         decision.discriminating_findings = discriminating_findings
         decision.discriminating_exams = discriminating_exams
         decision.discriminating_exam_tasks = discriminating_exam_tasks
+        self._apply_deferred_gap_decision_audit(
+            decision,
+            differential_pool,
+            discriminating_exam_tasks,
+        )
         decision.required_gap_by_candidate = required_gap_by_candidate
         decision.differential_pool_source = dict(pool_filter.pool_source)
         decision.evidence_conflicts = evidence_conflicts
@@ -2068,6 +2123,8 @@ class DiagnosisJudge:
             return False
         if not self._high_value_contender_competes_with_primary(primary, contender):
             return False
+        if self._exam_priority_override_candidate(contender):
+            return True
         if self._critical_claim_followup_candidate(contender):
             return self._claim_followup_blocks_primary(primary, contender)
         if (
@@ -2119,7 +2176,7 @@ class DiagnosisJudge:
             return False
         entity_id = str(getattr(contender, "entity_id", "") or "")
         if entity_id in {"D000025", "D100055"}:
-            return True
+            return self._critical_context_signal(contender)
         if not (self._priority(contender) or self._systemic_primary(contender)):
             return False
         if not primary:
@@ -2507,6 +2564,566 @@ class DiagnosisJudge:
                 )
         return tasks
 
+    def _annotate_deferred_gap_priorities(self, candidates: Sequence[Any]) -> None:
+        for candidate in candidates or []:
+            if not candidate:
+                continue
+            if self._eligibility_status(candidate) != DEFERRED:
+                setattr(candidate, "evidence_gaps", [])
+                setattr(candidate, "deferred_priority", 0.0)
+                setattr(candidate, "deferred_priority_components", {})
+                setattr(candidate, "exam_priority_override", False)
+                setattr(candidate, "exam_priority_override_reason", "")
+                setattr(candidate, "deferred_priority_status", "")
+                continue
+            gaps = self._candidate_evidence_gaps(candidate)
+            components = self._deferred_priority_components(candidate, gaps)
+            priority = round(
+                components["clinical_value"]
+                + components["evidence_support"]
+                + components["expected_information_gain"]
+                + components["eligibility_change_potential"]
+                + components["missed_diagnosis_risk"]
+                - components["exam_cost"]
+                - components["exam_risk"]
+                - components["redundancy"],
+                4,
+            )
+            override = self._deferred_gap_priority_override(candidate, gaps, components)
+            setattr(candidate, "evidence_gaps", gaps)
+            setattr(candidate, "deferred_priority", priority)
+            setattr(candidate, "deferred_priority_components", components)
+            setattr(candidate, "exam_priority_override", override)
+            setattr(
+                candidate,
+                "exam_priority_override_reason",
+                (
+                    "high-value Deferred candidate has a closable critical evidence gap"
+                    if override
+                    else ""
+                ),
+            )
+            setattr(
+                candidate,
+                "deferred_priority_status",
+                "active" if override else "inactive",
+            )
+            if override:
+                setattr(candidate, "exam_followup_authorized", True)
+
+    def _candidate_evidence_gaps(self, candidate: Any) -> List[Dict[str, Any]]:
+        diagnosis = self._name(candidate)
+        entity_id = str(getattr(candidate, "entity_id", "") or "")
+        base_exams = self._candidate_discriminating_exams(candidate)
+        gaps: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add_gap(
+            *,
+            target: str,
+            gap_type: str,
+            importance: str = "high",
+            closure_exams: Optional[Sequence[str]] = None,
+            source: str = "",
+            source_claims: Optional[Sequence[str]] = None,
+        ) -> None:
+            text = str(target or "").strip()
+            if not text:
+                return
+            key = f"{diagnosis}:{gap_type}:{text}"
+            if key in seen:
+                return
+            seen.add(key)
+            exams = list(
+                dict.fromkeys(
+                    str(item or "").strip()
+                    for item in list(closure_exams or []) + list(base_exams or [])
+                    if str(item or "").strip()
+                )
+            )
+            gaps.append(
+                {
+                    "gap_id": self._gap_id(candidate, gap_type, text, len(gaps) + 1),
+                    "candidate": diagnosis,
+                    "entity_id": entity_id,
+                    "target_evidence": text,
+                    "importance": importance,
+                    "gap_type": gap_type,
+                    "closure_exams": exams[:6],
+                    "source": source,
+                    "source_claims": list(source_claims or []),
+                    "expected_transition": {
+                        "positive": PRIMARY_ELIGIBLE,
+                        "negative": DIFFERENTIAL_ONLY,
+                    },
+                }
+            )
+
+        for claim in getattr(candidate, "unresolved_critical_evidence_claims", []) or []:
+            if not isinstance(claim, dict):
+                continue
+            claim_type = str(claim.get("claim_type") or "")
+            if claim_type == "derived_pattern" or claim.get("required_inputs"):
+                gap_type = "derived_pattern_gap"
+            else:
+                gap_type = "observed_evidence_gap"
+            target = str(claim.get("target_evidence") or "").strip()
+            exam = str(claim.get("recommended_exam") or "").strip()
+            add_gap(
+                target=target,
+                gap_type=gap_type,
+                importance=str(claim.get("importance") or "critical"),
+                closure_exams=[exam] if exam else [],
+                source="evidence_claim",
+                source_claims=[str(claim.get("claim_id") or "").strip()],
+            )
+
+        for pattern in getattr(candidate, "evidence_pattern_matches", []) or []:
+            if not isinstance(pattern, dict):
+                continue
+            pattern_id = str(pattern.get("pattern_id") or "").strip()
+            for index, group in enumerate(pattern.get("missing_required_groups", []) or []):
+                if not isinstance(group, dict):
+                    continue
+                findings = [
+                    str(item or "").strip()
+                    for item in group.get("missing_findings", []) or []
+                    if str(item or "").strip()
+                ]
+                target = "|".join(findings) or f"{pattern_id}:missing_group:{index + 1}"
+                add_gap(
+                    target=target,
+                    gap_type="derived_pattern_gap",
+                    importance="critical",
+                    closure_exams=base_exams,
+                    source="diagnostic_pattern",
+                    source_claims=[pattern_id] if pattern_id else [],
+                )
+
+        for gap in getattr(candidate, "required_gaps", []) or []:
+            add_gap(
+                target=str(gap or "").strip(),
+                gap_type="confirmation_gap",
+                importance="critical" if self._priority(candidate) else "high",
+                closure_exams=base_exams,
+                source="required_anchor",
+            )
+        return gaps
+
+    @staticmethod
+    def _gap_id(candidate: Any, gap_type: str, target: str, index: int) -> str:
+        entity_id = str(getattr(candidate, "entity_id", "") or "").strip()
+        name = entity_id or str(getattr(candidate, "diagnosis", "") or "candidate")
+        safe_name = "".join(ch if ch.isalnum() else "_" for ch in name)[:32] or "candidate"
+        safe_type = "".join(ch if ch.isalnum() else "_" for ch in gap_type)[:24]
+        safe_target = "".join(ch if ch.isalnum() else "_" for ch in target)[:32]
+        return f"G-{safe_name}-{safe_type}-{index}-{safe_target}"
+
+    def _deferred_priority_components(
+        self,
+        candidate: Any,
+        gaps: Sequence[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        closure_exams = [
+            exam
+            for gap in gaps or []
+            for exam in gap.get("closure_exams", []) or []
+            if str(exam or "").strip()
+        ]
+        return {
+            "clinical_value": self._deferred_clinical_value(candidate),
+            "evidence_support": self._verified_support_score(candidate),
+            "expected_information_gain": 1.0 if closure_exams else 0.0,
+            "eligibility_change_potential": 1.0 if gaps else 0.0,
+            "missed_diagnosis_risk": self._missed_diagnosis_risk(candidate),
+            "exam_cost": self._exam_cost(closure_exams),
+            "exam_risk": self._exam_risk(closure_exams),
+            "redundancy": min(0.35, 0.06 * max(0, len(closure_exams) - 3)),
+        }
+
+    def _deferred_gap_priority_override(
+        self,
+        candidate: Any,
+        gaps: Sequence[Dict[str, Any]],
+        components: Dict[str, float],
+    ) -> bool:
+        if self._eligibility_status(candidate) != DEFERRED:
+            return False
+        if getattr(candidate, "hard_contradiction", False):
+            return False
+        if getattr(candidate, "unresolved_evidence_conflict", False):
+            return False
+        substatus = str(getattr(candidate, "eligibility_substatus", "") or "")
+        if substatus not in _DEFERRED_EXAM_OVERRIDE_SUBSTATUSES:
+            return False
+        if not gaps or not any(gap.get("closure_exams") for gap in gaps):
+            return False
+        support_score = components.get("evidence_support", 0.0)
+        if support_score <= 0.0:
+            return False
+        if self._critical_risk_candidate(candidate):
+            if not self._critical_context_signal(candidate):
+                return False
+        elif support_score < 0.25:
+            return False
+        if not self._deferred_high_value_candidate(candidate):
+            return False
+        return (
+            components.get("expected_information_gain", 0.0) > 0.0
+            and components.get("eligibility_change_potential", 0.0) > 0.0
+        )
+
+    def _deferred_high_value_candidate(self, candidate: Any) -> bool:
+        if self._explicit_deferred_high_value(candidate):
+            return True
+        if self._critical_risk_candidate(candidate):
+            return True
+        if self._critical_claim_followup_candidate(candidate) and self._verified_support_score(candidate) >= 0.25:
+            return True
+        return False
+
+    @staticmethod
+    def _explicit_deferred_high_value(candidate: Any) -> bool:
+        if bool(getattr(candidate, "unresolved_high_value", False)):
+            return True
+        value = str(getattr(candidate, "candidate_value", "") or "").lower()
+        risk = str(getattr(candidate, "risk_level", "") or "").lower()
+        return value in {"high", "critical"} or risk in {"high", "critical"}
+
+    @staticmethod
+    def _critical_risk_candidate(candidate: Any) -> bool:
+        entity_id = str(getattr(candidate, "entity_id", "") or "")
+        name = str(getattr(candidate, "diagnosis", "") or "")
+        canonical = str(getattr(candidate, "canonical_name", "") or "")
+        text = f"{name} {canonical}".lower()
+        critical_names = (
+            "\u767d\u8840\u75c5",
+            "\u80ba\u52a8\u9759\u8109\u7626",
+            "\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e",
+            "\u7ed3\u6838\u6027\u5fc3\u5305\u708e",
+        )
+        return bool(
+            entity_id in {"D000025", "D100055"}
+            or "leukemia" in text
+            or "pavm" in text
+            or any(item in name or item in canonical for item in critical_names)
+        )
+
+    def _critical_context_signal(self, candidate: Any) -> bool:
+        entity_id = str(getattr(candidate, "entity_id", "") or "")
+        name = str(getattr(candidate, "diagnosis", "") or "")
+        canonical = str(getattr(candidate, "canonical_name", "") or "")
+        text = f"{name} {canonical}".lower()
+        support = {
+            str(item or "").strip()
+            for item in self._specific_support_evidence(candidate)
+            if str(item or "").strip()
+        }
+        if entity_id == "D100055" or "pavm" in text or "\u80ba\u52a8\u9759\u8109\u7626" in name:
+            return bool(
+                support
+                & {
+                    "hemoptysis",
+                    "hypoxemia",
+                    "pulmonary_nodule",
+                    "pulmonary_vascular_shunt",
+                    "pulmonary_avm_mechanism",
+                    "vascular_pulmonary_nodule_suspected",
+                    "enhanced_ct_vascular_malformation",
+                    "pulmonary_cta_positive",
+                    "bubble_echo_right_to_left_shunt",
+                }
+            )
+        if entity_id == "D000025" or "leukemia" in text or "\u767d\u8840\u75c5" in name:
+            return bool(
+                support
+                & {
+                    "blast_present",
+                    "blast_percentage_high",
+                    "multilineage_cytopenia",
+                    "acute_leukemia_pattern",
+                    "anemia",
+                    "platelet_low",
+                    "white_blood_cell_abnormal",
+                    "bleeding_tendency",
+                }
+            )
+        if "\u7ed3\u6838\u6027\u5fc3\u5305\u708e" in name or "tuberculous pericarditis" in text:
+            return bool(
+                any(item.startswith("pericard") for item in support)
+                or support
+                & {
+                    "tb_exposure",
+                    "tuberculosis_exposure",
+                    "tuberculosis_pattern",
+                    "tb_naat_positive",
+                    "afb_positive",
+                    "xpert_mtb_positive",
+                    "diagnosis:\u80ba\u7ed3\u6838",
+                }
+            )
+        if "\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e" in name or "polyangiitis" in text:
+            return bool(
+                support
+                & {
+                    "anca_positive",
+                    "microscopic_hematuria",
+                    "red_cell_casts",
+                    "renal_impairment",
+                    "pulmonary_hemorrhage",
+                    "hemoptysis",
+                }
+            )
+        return bool(support)
+
+    def _verified_support_score(self, candidate: Any) -> float:
+        matched = [
+            str(item or "")
+            for item in getattr(candidate, "matched_evidence", []) or []
+            if str(item or "")
+        ]
+        concrete = [
+            item
+            for item in matched
+            if self._specific_evidence_token(item)
+        ]
+        core = [
+            str(item or "")
+            for item in getattr(candidate, "core_matched_evidence", []) or []
+            if self._specific_evidence_token(str(item or ""))
+        ]
+        diagnostic = [
+            str(item or "")
+            for item in getattr(candidate, "diagnostic_matched_evidence", []) or []
+            if self._specific_evidence_token(str(item or ""))
+        ]
+        verified_claims = [
+            item
+            for item in getattr(candidate, "evidence_claims", []) or []
+            if isinstance(item, dict)
+            and str(item.get("status") or "") in {"Verified", "Derived"}
+        ]
+        score = 0.0
+        if concrete:
+            score += 0.25
+        score += min(0.30, 0.10 * len(core))
+        score += min(0.30, 0.15 * len(diagnostic))
+        score += min(0.25, 0.12 * len(verified_claims))
+        return round(min(1.0, score), 4)
+
+    @staticmethod
+    def _specific_evidence_token(item: str) -> bool:
+        text = str(item or "").strip()
+        if not text:
+            return False
+        if text.startswith("field:") or text.startswith("diagnosis:"):
+            return False
+        lower = text.lower()
+        return text not in _BROAD_EVIDENCE_TOKENS and lower not in _BROAD_EVIDENCE_TOKENS
+
+    def _specific_support_evidence(self, candidate: Any) -> List[str]:
+        items = list(getattr(candidate, "matched_evidence", []) or [])
+        items.extend(getattr(candidate, "core_matched_evidence", []) or [])
+        items.extend(getattr(candidate, "diagnostic_matched_evidence", []) or [])
+        return [
+            str(item or "").strip()
+            for item in items
+            if self._specific_evidence_token(str(item or ""))
+        ]
+
+    def _deferred_clinical_value(self, candidate: Any) -> float:
+        if self._critical_risk_candidate(candidate):
+            return 1.0
+        if self._priority(candidate):
+            return 0.72
+        if self._critical_claim_followup_candidate(candidate):
+            return 0.68
+        return 0.35
+
+    def _missed_diagnosis_risk(self, candidate: Any) -> float:
+        if self._critical_risk_candidate(candidate):
+            return 0.9
+        if self._priority(candidate):
+            return 0.55
+        return 0.25
+
+    @staticmethod
+    def _exam_cost(exams: Sequence[str]) -> float:
+        if not exams:
+            return 0.0
+        cost = 0.0
+        for exam in exams:
+            text = str(exam or "")
+            if any(token in text for token in ("\u9aa8\u9ad3", "\u6d3b\u68c0", "\u9020\u5f71", "\u5bfc\u7ba1")):
+                cost += 0.12
+            elif any(token in text for token in ("CT", "CTA", "MRI", "\u589e\u5f3a")):
+                cost += 0.07
+            else:
+                cost += 0.03
+        return round(min(0.35, cost), 4)
+
+    @staticmethod
+    def _exam_risk(exams: Sequence[str]) -> float:
+        if not exams:
+            return 0.0
+        risk = 0.0
+        for exam in exams:
+            text = str(exam or "")
+            if any(token in text for token in ("\u9aa8\u9ad3", "\u6d3b\u68c0", "\u9020\u5f71", "\u5bfc\u7ba1")):
+                risk += 0.08
+            elif any(token in text for token in ("CTA", "\u589e\u5f3a")):
+                risk += 0.04
+            else:
+                risk += 0.01
+        return round(min(0.25, risk), 4)
+
+    def _exam_priority_override_candidate(self, candidate: Any) -> bool:
+        return bool(getattr(candidate, "exam_priority_override", False))
+
+    def _forced_pool_names_for_deferred_gap_override(
+        self,
+        candidates: Sequence[Any],
+    ) -> List[str]:
+        return [
+            self._name(item)
+            for item in candidates or []
+            if self._exam_priority_override_candidate(item) and self._name(item)
+        ][: self.gap_target_limit]
+
+    def _deferred_gap_closure_exam_tasks(
+        self,
+        pool: Sequence[Any],
+    ) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        pool_size = max(1, len([item for item in pool or [] if item]))
+        candidates = sorted(
+            [item for item in pool or [] if self._exam_priority_override_candidate(item)],
+            key=lambda item: (
+                float(getattr(item, "deferred_priority", 0.0) or 0.0),
+                self._verified_support_score(item),
+                self._judge_score(item),
+            ),
+            reverse=True,
+        )
+        for candidate in candidates[: self.gap_target_limit]:
+            diagnosis = self._name(candidate)
+            candidate_task_count = 0
+            candidate_task_limit = 2
+            for gap in getattr(candidate, "evidence_gaps", []) or []:
+                if candidate_task_count >= candidate_task_limit:
+                    break
+                if not isinstance(gap, dict):
+                    continue
+                gap_id = str(gap.get("gap_id") or "").strip()
+                target = str(gap.get("target_evidence") or "").strip()
+                for exam in gap.get("closure_exams", []) or []:
+                    if candidate_task_count >= candidate_task_limit:
+                        break
+                    text = str(exam or "").strip()
+                    if not text:
+                        continue
+                    key = (diagnosis, gap_id, text)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidate_task_count += 1
+                    tasks.append(
+                        {
+                            "exam": text,
+                            "target_candidates": [diagnosis],
+                            "target_findings": [target] if target else [],
+                            "target_gap": gap_id,
+                            "target_gaps": [gap_id] if gap_id else [],
+                            "evidence_gap": dict(gap),
+                            "exam_type": "deferred_gap_closure",
+                            "expected_effect": "close_high_value_deferred_evidence_gap",
+                            "expected_transition": dict(gap.get("expected_transition") or {}),
+                            "source": ["deferred_gap_closure"],
+                            "pool_candidate_count": pool_size,
+                            "target_candidate_count": 1,
+                            "information_gain_hint": min(
+                                1.0,
+                                max(0.82, float(getattr(candidate, "deferred_priority", 0.0) or 0.0) / 4.0),
+                            ),
+                            "exam_source": "deferred_gap_closure_exam",
+                            "priority_override": True,
+                            "override_reason": str(
+                                getattr(candidate, "exam_priority_override_reason", "") or ""
+                            ),
+                        }
+                    )
+        return tasks
+
+    def _apply_deferred_gap_decision_audit(
+        self,
+        decision: JudgeDecision,
+        pool: Sequence[Any],
+        tasks: Sequence[Dict[str, Any]],
+    ) -> None:
+        gaps = [
+            dict(gap)
+            for candidate in pool or []
+            for gap in getattr(candidate, "evidence_gaps", []) or []
+            if isinstance(gap, dict)
+        ]
+        overrides = []
+        for candidate in pool or []:
+            if not self._exam_priority_override_candidate(candidate):
+                continue
+            overrides.append(
+                {
+                    "candidate": self._name(candidate),
+                    "entity_id": str(getattr(candidate, "entity_id", "") or ""),
+                    "eligibility_status": self._eligibility_status(candidate),
+                    "eligibility_substatus": str(
+                        getattr(candidate, "eligibility_substatus", "") or ""
+                    ),
+                    "deferred_priority": float(
+                        getattr(candidate, "deferred_priority", 0.0) or 0.0
+                    ),
+                    "deferred_priority_components": dict(
+                        getattr(candidate, "deferred_priority_components", {}) or {}
+                    ),
+                    "evidence_gaps": list(
+                        getattr(candidate, "evidence_gaps", []) or []
+                    ),
+                    "override_reason": str(
+                        getattr(candidate, "exam_priority_override_reason", "") or ""
+                    ),
+                    "priority_status": str(
+                        getattr(candidate, "deferred_priority_status", "") or ""
+                    ),
+                }
+            )
+        closure_tasks = [
+            dict(task)
+            for task in tasks or []
+            if isinstance(task, dict)
+            and str(task.get("exam_source") or "") == "deferred_gap_closure_exam"
+        ]
+        override_gap_ids = {
+            str(gap.get("gap_id") or "")
+            for item in overrides
+            for gap in item.get("evidence_gaps", []) or []
+            if str(gap.get("gap_id") or "")
+        }
+        covered_gap_ids = {
+            str(gap_id or "")
+            for task in closure_tasks
+            for gap_id in task.get("target_gaps", []) or []
+            if str(gap_id or "")
+        }
+        decision.deferred_evidence_gaps = gaps
+        decision.exam_priority_overrides = overrides
+        decision.deferred_gap_closure_tasks = closure_tasks
+        decision.deferred_gap_closure_exam_coverage = round(
+            len(override_gap_ids & covered_gap_ids) / max(1, len(override_gap_ids)),
+            4,
+        ) if override_gap_ids else 0.0
+        decision.exam_priority_alignment = decision.deferred_gap_closure_exam_coverage
+        decision.wrong_primary_exam_drift = 0.0
+
     def _merge_discriminating_exam_tasks(
         self,
         conflict_tasks: Sequence[Dict[str, Any]],
@@ -2561,8 +3178,32 @@ class DiagnosisJudge:
                     "resolve_reasoning_structured_polarity_conflict"
                 )
             elif (
-                task.get("exam_source") == "evidence_claim_followup_exam"
+                task.get("exam_source") == "deferred_gap_closure_exam"
                 and current.get("exam_source") != "conflict_adjudication_exam"
+            ):
+                current["exam_source"] = "deferred_gap_closure_exam"
+                current["exam_type"] = "deferred_gap_closure"
+                current["expected_effect"] = "close_high_value_deferred_evidence_gap"
+                current["priority_override"] = True
+                current["override_reason"] = str(
+                    task.get("override_reason")
+                    or current.get("override_reason")
+                    or ""
+                )
+                current["target_gaps"] = list(
+                    dict.fromkeys(
+                        list(current.get("target_gaps") or [])
+                        + list(task.get("target_gaps") or [])
+                    )
+                )
+                if task.get("evidence_gap") and not current.get("evidence_gap"):
+                    current["evidence_gap"] = dict(task.get("evidence_gap") or {})
+            elif (
+                task.get("exam_source") == "evidence_claim_followup_exam"
+                and current.get("exam_source") not in {
+                    "conflict_adjudication_exam",
+                    "deferred_gap_closure_exam",
+                }
             ):
                 current["exam_source"] = "evidence_claim_followup_exam"
                 current["exam_type"] = "evidence_claim_verification"
@@ -2571,6 +3212,7 @@ class DiagnosisJudge:
                 task.get("exam_source") == "pattern_anchor_workup_exam"
                 and current.get("exam_source") not in {
                     "conflict_adjudication_exam",
+                    "deferred_gap_closure_exam",
                     "evidence_claim_followup_exam",
                 }
             ):
@@ -2611,6 +3253,10 @@ class DiagnosisJudge:
     @staticmethod
     def _exam_type_priority(exam_type: str) -> int:
         return {
+            "conflict_adjudication": 6,
+            "deferred_gap_closure": 5,
+            "evidence_claim_verification": 5,
+            "pattern_anchor_workup": 5,
             "special_discriminator": 4,
             "shared_discriminator": 3,
             "confirmatory": 2,
@@ -2946,7 +3592,11 @@ class DiagnosisJudge:
     ) -> List[str]:
         targets: List[str] = []
         final_set = set(final or [])
-        if getattr(primary, "required_gaps", None) or self._critical_claim_followup_candidate(primary):
+        if (
+            getattr(primary, "required_gaps", None)
+            or getattr(primary, "evidence_gaps", None)
+            or self._critical_claim_followup_candidate(primary)
+        ):
             targets.append(primary.diagnosis)
         for candidate in ranked:
             if len(targets) >= self.gap_target_limit:
@@ -2955,9 +3605,16 @@ class DiagnosisJudge:
                 continue
             if self._eligibility_status(candidate) != DEFERRED:
                 continue
-            if not getattr(candidate, "required_gaps", None) and not self._critical_claim_followup_candidate(candidate):
+            if not (
+                getattr(candidate, "required_gaps", None)
+                or getattr(candidate, "evidence_gaps", None)
+                or self._critical_claim_followup_candidate(candidate)
+            ):
                 continue
-            if self._deferred_explains_better_than_primary(primary, candidate):
+            if (
+                self._deferred_explains_better_than_primary(primary, candidate)
+                or self._exam_priority_override_candidate(candidate)
+            ):
                 targets.append(candidate.diagnosis)
         for candidate in ranked:
             if len(targets) >= self.gap_target_limit:
@@ -2966,12 +3623,17 @@ class DiagnosisJudge:
                 continue
             if self._eligibility_status(candidate) != DEFERRED:
                 continue
-            if not getattr(candidate, "required_gaps", None) and not self._critical_claim_followup_candidate(candidate):
+            if not (
+                getattr(candidate, "required_gaps", None)
+                or getattr(candidate, "evidence_gaps", None)
+                or self._critical_claim_followup_candidate(candidate)
+            ):
                 continue
             if (
                 self._same_family(primary, candidate)
                 or self._causally_related(primary, candidate)
                 or self._high_value_unresolved_contender(primary, candidate)
+                or self._exam_priority_override_candidate(candidate)
             ):
                 targets.append(candidate.diagnosis)
         for candidate in ranked:
@@ -3044,6 +3706,7 @@ class DiagnosisJudge:
                 continue
             if not (
                 getattr(candidate, "required_gaps", None)
+                or getattr(candidate, "evidence_gaps", None)
                 or self._candidate_discriminating_exams(candidate)
                 or self._critical_claim_followup_candidate(candidate)
             ):
@@ -3058,11 +3721,16 @@ class DiagnosisJudge:
                 continue
             if self._eligibility_status(candidate) != DEFERRED:
                 continue
-            if not getattr(candidate, "required_gaps", None):
+            if not (
+                getattr(candidate, "required_gaps", None)
+                or getattr(candidate, "evidence_gaps", None)
+                or self._critical_claim_followup_candidate(candidate)
+            ):
                 continue
             if (
                 self._deferred_explains_better_than_primary(primary, candidate)
                 or self._high_value_unresolved_contender(primary, candidate)
+                or self._exam_priority_override_candidate(candidate)
             ):
                 targets.append(candidate.diagnosis)
         pattern_targets: List[str] = []
@@ -3093,13 +3761,14 @@ class DiagnosisJudge:
                 continue
             if self._eligibility_status(candidate) == DEFERRED and (
                 getattr(candidate, "required_gaps", None)
+                or getattr(candidate, "evidence_gaps", None)
                 or self._candidate_discriminating_exams(candidate)
                 or self._critical_claim_followup_candidate(candidate)
             ):
                 targets.append(candidate.diagnosis)
                 continue
         for candidate in ordered_pool:
-            if self._high_value_unresolved_contender(primary, candidate):
+            if self._high_value_unresolved_contender(primary, candidate) or self._exam_priority_override_candidate(candidate):
                 targets.append(candidate.diagnosis)
             if len(targets) >= self.gap_target_limit:
                 break
@@ -3126,6 +3795,7 @@ class DiagnosisJudge:
         ranked: Sequence[Any],
     ) -> None:
         distribution: Dict[str, int] = {}
+        substatus_distribution: Dict[str, int] = {}
         primary: List[str] = []
         deferred: List[str] = []
         excluded: List[str] = []
@@ -3138,9 +3808,13 @@ class DiagnosisJudge:
                 primary.append(candidate.diagnosis)
             elif status == DEFERRED:
                 deferred.append(candidate.diagnosis)
+                substatus = str(getattr(candidate, "eligibility_substatus", "") or "")
+                if substatus:
+                    substatus_distribution[substatus] = substatus_distribution.get(substatus, 0) + 1
             elif status == EXCLUDED:
                 excluded.append(candidate.diagnosis)
         decision.eligibility_distribution = distribution
+        decision.deferred_substatus_distribution = substatus_distribution
         decision.primary_eligible_candidates = primary
         decision.deferred_anchor_candidates = deferred
         decision.excluded_candidates = excluded
@@ -3164,7 +3838,13 @@ class DiagnosisJudge:
         if status == PRIMARY_ELIGIBLE:
             return "satisfied"
         if status == DEFERRED:
-            return "actionable_gap" if getattr(candidate, "required_gaps", None) else "partially_satisfied"
+            return (
+                "actionable_gap"
+                if getattr(candidate, "required_gaps", None)
+                or getattr(candidate, "evidence_gaps", None)
+                or self._critical_claim_followup_candidate(candidate)
+                else "partially_satisfied"
+            )
         if status == DIFFERENTIAL_ONLY:
             return "unsupported_gap"
         if status == EXCLUDED:
@@ -3326,6 +4006,9 @@ class DiagnosisJudge:
                     "required_gaps": list(getattr(candidate, "required_gaps", []) or [])[:4],
                     "eligibility_status": status,
                     "eligibility_reason": eligibility_reason,
+                    "eligibility_substatus": str(
+                        getattr(candidate, "eligibility_substatus", "") or ""
+                    ),
                     "missing_required_anchors": list(
                         getattr(candidate, "missing_required_anchors", []) or []
                     )[:6],
@@ -3335,6 +4018,21 @@ class DiagnosisJudge:
                     "eligibility_blockers": list(
                         getattr(candidate, "eligibility_blockers", []) or []
                     )[:6],
+                    "evidence_gaps": list(
+                        getattr(candidate, "evidence_gaps", []) or []
+                    )[:4],
+                    "deferred_priority": float(
+                        getattr(candidate, "deferred_priority", 0.0) or 0.0
+                    ),
+                    "deferred_priority_components": dict(
+                        getattr(candidate, "deferred_priority_components", {}) or {}
+                    ),
+                    "exam_priority_override": bool(
+                        getattr(candidate, "exam_priority_override", False)
+                    ),
+                    "exam_priority_override_reason": str(
+                        getattr(candidate, "exam_priority_override_reason", "") or ""
+                    ),
                     "hard_contradiction": bool(getattr(candidate, "hard_contradiction", False)),
                 }
                 )
@@ -3463,6 +4161,9 @@ class DiagnosisJudge:
                     eligibility_reason=str(
                         getattr(candidate, "eligibility_reason", "") or ""
                     ),
+                    eligibility_substatus=str(
+                        getattr(candidate, "eligibility_substatus", "") or ""
+                    ),
                     missing_required_anchors=list(
                         getattr(candidate, "missing_required_anchors", []) or []
                     )[:6],
@@ -3473,6 +4174,19 @@ class DiagnosisJudge:
                     submission_authorized=bool(
                         role in {"primary", "secondary"}
                         and self._eligibility_status(candidate) == PRIMARY_ELIGIBLE
+                    ),
+                    evidence_gaps=list(getattr(candidate, "evidence_gaps", []) or [])[:4],
+                    deferred_priority=float(
+                        getattr(candidate, "deferred_priority", 0.0) or 0.0
+                    ),
+                    deferred_priority_components=dict(
+                        getattr(candidate, "deferred_priority_components", {}) or {}
+                    ),
+                    exam_priority_override=bool(
+                        getattr(candidate, "exam_priority_override", False)
+                    ),
+                    exam_priority_override_reason=str(
+                        getattr(candidate, "exam_priority_override_reason", "") or ""
                     ),
                 )
             )

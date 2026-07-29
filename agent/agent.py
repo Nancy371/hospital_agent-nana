@@ -1916,6 +1916,27 @@ class MyDoctorAgent(BaseDoctorAgent):
         differential_candidates = _names(judge_payload.get("differential_candidates"))
         discriminating_exams = _names(judge_payload.get("discriminating_exams"))
         discriminating_findings = _names(judge_payload.get("discriminating_findings"))
+        deferred_evidence_gaps = [
+            item
+            for item in judge_payload.get("deferred_evidence_gaps", []) or []
+            if isinstance(item, dict)
+        ]
+        exam_priority_overrides = [
+            item
+            for item in judge_payload.get("exam_priority_overrides", []) or []
+            if isinstance(item, dict)
+        ]
+        deferred_gap_closure_tasks = [
+            item
+            for item in judge_payload.get("deferred_gap_closure_tasks", []) or []
+            if isinstance(item, dict)
+        ]
+        deferred_gap_target_ids = {
+            str(gap.get("gap_id") or "")
+            for item in exam_priority_overrides
+            for gap in item.get("evidence_gaps", []) or []
+            if isinstance(gap, dict) and str(gap.get("gap_id") or "")
+        }
         dynamic_trace = list(judge_payload.get("dynamic_rerank_trace") or [])
         dynamic_rerank_changed_primary = bool(
             judge_payload.get("dynamic_rerank_changed_primary")
@@ -2099,6 +2120,34 @@ class MyDoctorAgent(BaseDoctorAgent):
             for detail in exam_authorization_details
             if str(detail.get("exam") or "") in ordered_exam_set
         ]
+        deferred_ordered_details = [
+            detail
+            for detail in ordered_authorization_details
+            if str(detail.get("exam_source") or "") == "deferred_gap_closure_exam"
+            or bool(detail.get("priority_override"))
+        ]
+        ordered_deferred_gap_ids = {
+            str(gap_id or "")
+            for detail in deferred_ordered_details
+            for gap_id in detail.get("target_gaps", []) or []
+            if str(gap_id or "")
+        }
+        deferred_exam_coverage = (
+            len(deferred_gap_target_ids & ordered_deferred_gap_ids)
+            / max(1, len(deferred_gap_target_ids))
+            if deferred_gap_target_ids
+            else None
+        )
+        exam_priority_alignment = (
+            len(deferred_ordered_details) / max(1, len(ordered_exam_names))
+            if ordered_exam_names and deferred_gap_target_ids
+            else None
+        )
+        wrong_primary_exam_drift = (
+            1.0 - float(exam_priority_alignment or 0.0)
+            if ordered_exam_names and deferred_gap_target_ids
+            else None
+        )
         special_discriminator_rate = (
             sum(
                 1
@@ -2410,6 +2459,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "differential_exam_precision": differential_exam_precision,
                 "discriminating_exam_recall": discriminating_exam_recall,
                 "exam_information_gain": exam_information_gain,
+                "deferred_gap_closure_rate": deferred_exam_coverage,
+                "deferred_exam_coverage": deferred_exam_coverage,
+                "exam_priority_alignment": exam_priority_alignment,
+                "wrong_primary_exam_drift": wrong_primary_exam_drift,
+                "deferred_gap_count": len(deferred_evidence_gaps),
+                "exam_priority_override_count": len(exam_priority_overrides),
                 "special_discriminator_rate": special_discriminator_rate,
                 "multi_candidate_exam_rate": multi_candidate_exam_rate,
                 "generic_exam_suppression_count": generic_exam_suppression_count,
@@ -2565,6 +2620,15 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "residual_core_evidence_count": residual_core_evidence_count,
                 "high_value_gap_candidates": _names(
                     judge_payload.get("high_value_gap_candidates")
+                ),
+                "deferred_evidence_gaps": deferred_evidence_gaps,
+                "exam_priority_overrides": exam_priority_overrides,
+                "deferred_gap_closure_tasks": deferred_gap_closure_tasks,
+                "deferred_exam_coverage": deferred_exam_coverage,
+                "exam_priority_alignment": exam_priority_alignment,
+                "wrong_primary_exam_drift": wrong_primary_exam_drift,
+                "deferred_substatus_distribution": dict(
+                    judge_payload.get("deferred_substatus_distribution") or {}
                 ),
                 "root_cause_arbitration": root_cause_payload,
                 "root_cause_primary": str(
