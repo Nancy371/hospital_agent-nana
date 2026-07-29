@@ -20,6 +20,7 @@ from .diagnosis_eligibility import (
     EXCLUDED,
     PRIMARY_ELIGIBLE,
 )
+from .exam_resolver import ALIAS, EQUIVALENT, EXACT, PARTIAL_SUBSTITUTE, ExamResolver
 
 
 _DEFERRED_EXAM_OVERRIDE_SUBSTATUSES = {
@@ -27,6 +28,17 @@ _DEFERRED_EXAM_OVERRIDE_SUBSTATUSES = {
     DEFERRED_NEEDS_DERIVED_PATTERN,
     DEFERRED_NEEDS_OBSERVED_EVIDENCE,
 }
+_FULL_CLOSURE_RESOLUTION_TYPES = {EXACT, ALIAS, EQUIVALENT}
+_USABLE_CLOSURE_RESOLUTION_TYPES = {
+    EXACT,
+    ALIAS,
+    EQUIVALENT,
+    PARTIAL_SUBSTITUTE,
+}
+
+
+def _compact_text(value: Any) -> str:
+    return "".join(str(value or "").strip().lower().split())
 
 
 _GENERIC_PARENT_DIAGNOSES = {
@@ -1196,6 +1208,7 @@ class DiagnosisJudge:
         diagnosis_section = (config or {}).get("diagnosis") or {}
         section = diagnosis_section.get("judge") or {}
         self.knowledge = knowledge
+        self.exam_resolver = ExamResolver(knowledge) if knowledge is not None else None
         self.top_k = int(section.get("top_k", 20) or 20)
         self.differential_top_k = int(
             section.get(
@@ -3009,7 +3022,7 @@ class DiagnosisJudge:
         for candidate in candidates[: self.gap_target_limit]:
             diagnosis = self._name(candidate)
             candidate_task_count = 0
-            candidate_task_limit = 2
+            candidate_task_limit = min(3, max(1, self.discriminating_exam_max_items))
             for gap in getattr(candidate, "evidence_gaps", []) or []:
                 if candidate_task_count >= candidate_task_limit:
                     break
@@ -3017,20 +3030,51 @@ class DiagnosisJudge:
                     continue
                 gap_id = str(gap.get("gap_id") or "").strip()
                 target = str(gap.get("target_evidence") or "").strip()
-                for exam in gap.get("closure_exams", []) or []:
+                closure_exam_items = [
+                    (index, str(exam or "").strip())
+                    for index, exam in enumerate(gap.get("closure_exams", []) or [])
+                    if str(exam or "").strip()
+                ]
+                closure_exam_items.sort(
+                    key=lambda item: self._gap_closure_exam_sort_key(
+                        candidate,
+                        gap,
+                        item[1],
+                        item[0],
+                    ),
+                    reverse=True,
+                )
+                for closure_rank, (original_index, exam) in enumerate(
+                    closure_exam_items,
+                    start=1,
+                ):
                     if candidate_task_count >= candidate_task_limit:
                         break
-                    text = str(exam or "").strip()
-                    if not text:
-                        continue
-                    key = (diagnosis, gap_id, text)
+                    key = (diagnosis, gap_id, exam)
                     if key in seen:
                         continue
                     seen.add(key)
+                    resolution = self._gap_closure_exam_resolution(exam, candidate)
+                    resolution_type = str(resolution.get("resolution_type") or "")
+                    diagnostic_coverage = float(
+                        resolution.get("diagnostic_coverage") or 0.0
+                    )
+                    gap_coverage = self._gap_specific_exam_coverage(
+                        candidate,
+                        gap,
+                        exam,
+                        resolution,
+                    )
+                    closure_priority = self._gap_specific_exam_preference(
+                        candidate,
+                        gap,
+                        exam,
+                        resolution,
+                    )
                     candidate_task_count += 1
                     tasks.append(
                         {
-                            "exam": text,
+                            "exam": exam,
                             "target_candidates": [diagnosis],
                             "target_findings": [target] if target else [],
                             "target_gap": gap_id,
@@ -3048,12 +3092,145 @@ class DiagnosisJudge:
                             ),
                             "exam_source": "deferred_gap_closure_exam",
                             "priority_override": True,
+                            "priority_bucket": "high_value_deferred_gap_closure",
+                            "closure_rank": closure_rank,
+                            "closure_priority": closure_priority,
+                            "original_closure_exam_index": original_index,
+                            "requested_exam": str(
+                                resolution.get("requested_exam") or exam
+                            ),
+                            "resolved_exam": str(resolution.get("resolved_exam") or ""),
+                            "resolution_type": resolution_type,
+                            "diagnostic_coverage": diagnostic_coverage,
+                            "gap_diagnostic_coverage": gap_coverage,
+                            "exam_resolution": dict(resolution),
                             "override_reason": str(
                                 getattr(candidate, "exam_priority_override_reason", "") or ""
                             ),
                         }
                     )
         return tasks
+
+    def _gap_closure_exam_resolution(
+        self,
+        exam: str,
+        candidate: Any,
+    ) -> Dict[str, Any]:
+        if self.exam_resolver is None:
+            return {
+                "requested_exam": str(exam or ""),
+                "resolved_exam": str(exam or ""),
+                "resolution_type": "unresolved",
+                "diagnostic_coverage": 0.0,
+                "reason": "no exam resolver available",
+                "candidate": self._name(candidate),
+            }
+        return self.exam_resolver.resolve(exam, candidate=self._name(candidate)).to_dict()
+
+    def _gap_closure_exam_sort_key(
+        self,
+        candidate: Any,
+        gap: Dict[str, Any],
+        exam: str,
+        original_index: int,
+    ) -> tuple:
+        resolution = self._gap_closure_exam_resolution(exam, candidate)
+        resolution_type = str(resolution.get("resolution_type") or "")
+        resolution_rank = (
+            3
+            if resolution_type in _FULL_CLOSURE_RESOLUTION_TYPES
+            else 2
+            if resolution_type == PARTIAL_SUBSTITUTE
+            else 0
+        )
+        diagnostic_coverage = float(resolution.get("diagnostic_coverage") or 0.0)
+        closure_priority = self._gap_specific_exam_preference(
+            candidate,
+            gap,
+            exam,
+            resolution,
+        )
+        gap_coverage = self._gap_specific_exam_coverage(
+            candidate,
+            gap,
+            exam,
+            resolution,
+        )
+        return (
+            closure_priority,
+            gap_coverage,
+            resolution_rank,
+            diagnostic_coverage,
+            -original_index,
+        )
+
+    def _gap_specific_exam_coverage(
+        self,
+        candidate: Any,
+        gap: Dict[str, Any],
+        exam: str,
+        resolution: Dict[str, Any],
+    ) -> float:
+        preference = self._gap_specific_exam_preference(candidate, gap, exam, resolution)
+        if self._pulmonary_avm_gap(candidate, gap):
+            if preference >= 90:
+                return round(preference / 100.0, 4)
+            if preference >= 80:
+                return 0.82
+            if preference >= 40:
+                return 0.45
+            if preference >= 20:
+                return 0.25
+        return float(resolution.get("diagnostic_coverage") or 0.0)
+
+    def _gap_specific_exam_preference(
+        self,
+        candidate: Any,
+        gap: Dict[str, Any],
+        exam: str,
+        resolution: Dict[str, Any],
+    ) -> int:
+        requested = str(resolution.get("requested_exam") or exam or "")
+        resolved = str(resolution.get("resolved_exam") or "")
+        text = f"{requested} {resolved}"
+        compact = _compact_text(text)
+        if self._pulmonary_avm_gap(candidate, gap):
+            if "cta" in compact or "\u80ba\u52a8\u8109ct" in compact or "\u80ba\u8840\u7ba1cta" in compact:
+                return 100
+            if "bubble" in compact or "\u53f3\u5fc3\u58f0\u5b66\u9020\u5f71" in compact:
+                return 96
+            if "\u589e\u5f3a" in compact or "cect" in compact:
+                return 92
+            if "\u8840\u7ba1\u9020\u5f71" in compact:
+                return 86
+            if "\u80f8\u90e8ct" in compact or "chestct" in compact:
+                return 42
+            if "ct" in compact:
+                return 35
+            if "abg" in compact or "\u8840\u6c14" in compact or "spo2" in compact:
+                return 24
+            return 20
+        resolution_type = str(resolution.get("resolution_type") or "")
+        if resolution_type in _FULL_CLOSURE_RESOLUTION_TYPES:
+            return 80
+        if resolution_type == PARTIAL_SUBSTITUTE:
+            return 45
+        return 10
+
+    @staticmethod
+    def _pulmonary_avm_gap(candidate: Any, gap: Dict[str, Any]) -> bool:
+        entity_id = str(getattr(candidate, "entity_id", "") or "")
+        name = str(getattr(candidate, "diagnosis", "") or "")
+        canonical = str(getattr(candidate, "canonical_name", "") or "")
+        target = str((gap or {}).get("target_evidence") or "")
+        text = f"{entity_id} {name} {canonical} {target}".lower()
+        return bool(
+            entity_id == "D100055"
+            or "pavm" in text
+            or "\u80ba\u52a8\u9759\u8109\u7626" in text
+            or "pulmonary_avm" in text
+            or "pulmonary_vascular" in text
+        )
 
     def _apply_deferred_gap_decision_audit(
         self,
@@ -3171,7 +3348,10 @@ class DiagnosisJudge:
                 float(current.get("information_gain_hint") or 0.0),
                 float(task.get("information_gain_hint") or 0.0),
             )
-            if task.get("exam_source") == "conflict_adjudication_exam":
+            if (
+                task.get("exam_source") == "conflict_adjudication_exam"
+                and current.get("exam_source") != "deferred_gap_closure_exam"
+            ):
                 current["exam_source"] = "conflict_adjudication_exam"
                 current["exam_type"] = "conflict_adjudication"
                 current["expected_effect"] = (
@@ -3179,7 +3359,7 @@ class DiagnosisJudge:
                 )
             elif (
                 task.get("exam_source") == "deferred_gap_closure_exam"
-                and current.get("exam_source") != "conflict_adjudication_exam"
+                and not current.get("urgent_safety")
             ):
                 current["exam_source"] = "deferred_gap_closure_exam"
                 current["exam_type"] = "deferred_gap_closure"
@@ -3198,6 +3378,30 @@ class DiagnosisJudge:
                 )
                 if task.get("evidence_gap") and not current.get("evidence_gap"):
                     current["evidence_gap"] = dict(task.get("evidence_gap") or {})
+                for key in (
+                    "priority_bucket",
+                    "requested_exam",
+                    "resolved_exam",
+                    "resolution_type",
+                    "diagnostic_coverage",
+                    "gap_diagnostic_coverage",
+                    "exam_resolution",
+                    "target_gap",
+                    "expected_transition",
+                ):
+                    if task.get(key) not in (None, "", [], {}):
+                        current[key] = (
+                            dict(task.get(key))
+                            if isinstance(task.get(key), dict)
+                            else task.get(key)
+                        )
+                current["closure_priority"] = max(
+                    int(current.get("closure_priority") or 0),
+                    int(task.get("closure_priority") or 0),
+                )
+                incoming_rank = int(task.get("closure_rank") or 9999)
+                current_rank = int(current.get("closure_rank") or 9999)
+                current["closure_rank"] = min(current_rank, incoming_rank)
             elif (
                 task.get("exam_source") == "evidence_claim_followup_exam"
                 and current.get("exam_source") not in {
@@ -3224,7 +3428,39 @@ class DiagnosisJudge:
             add(task)
         for task in base_tasks or []:
             add(task)
+        merged.sort(key=self._merged_exam_task_priority_key, reverse=True)
         return merged[: self.discriminating_exam_max_items]
+
+    @staticmethod
+    def _merged_exam_task_priority_key(task: Dict[str, Any]) -> tuple:
+        source = str((task or {}).get("exam_source") or "")
+        exam_type = str((task or {}).get("exam_type") or "")
+        if bool((task or {}).get("urgent_safety")):
+            bucket = 7
+        elif source == "deferred_gap_closure_exam" and bool(
+            (task or {}).get("priority_override")
+        ):
+            bucket = 6
+        elif source == "deferred_gap_closure_exam":
+            bucket = 5
+        elif source in {
+            "evidence_claim_followup_exam",
+            "pattern_anchor_workup_exam",
+        }:
+            bucket = 4
+        elif source == "conflict_adjudication_exam":
+            bucket = 3
+        else:
+            bucket = DiagnosisJudge._exam_type_priority(exam_type)
+        closure_priority = int((task or {}).get("closure_priority") or 0)
+        closure_rank = int((task or {}).get("closure_rank") or 9999)
+        return (
+            bucket,
+            closure_priority,
+            -closure_rank,
+            float((task or {}).get("information_gain_hint") or 0.0),
+            int((task or {}).get("target_candidate_count") or 0),
+        )
 
     def _exam_task_type(
         self,
@@ -3342,9 +3578,7 @@ class DiagnosisJudge:
             return []
         name = str(getattr(candidate, "diagnosis", "") or "")
         exams: List[str] = []
-        entry: Dict[str, Any] = {}
-        if self.knowledge:
-            entry = self.knowledge.get(name) or {}
+        entry: Dict[str, Any] = self._knowledge_entry(name)
         for field_name in (
             "discriminating_exams",
             "strong_verification_exams",
@@ -3354,6 +3588,21 @@ class DiagnosisJudge:
                 text = str(exam).strip()
                 if text and text not in exams:
                     exams.append(text)
+        if self.knowledge and hasattr(self.knowledge, "get_discriminating_exam_bundle"):
+            lookups = [
+                str(getattr(candidate, "entity_id", "") or ""),
+                name,
+                str(getattr(candidate, "canonical_name", "") or ""),
+                str(getattr(candidate, "submission_name", "") or ""),
+            ]
+            for lookup in list(dict.fromkeys(item for item in lookups if item)):
+                before_count = len(exams)
+                for exam in self.knowledge.get_discriminating_exam_bundle(lookup) or []:
+                    text = str(exam).strip()
+                    if text and text not in exams:
+                        exams.append(text)
+                if len(exams) > before_count:
+                    break
         for exam in _DIFFERENTIAL_EXAM_HINTS.get(name, []):
             if exam and exam not in exams:
                 exams.append(exam)
@@ -3362,6 +3611,16 @@ class DiagnosisJudge:
             if text and text not in exams:
                 exams.append(text)
         return exams[:6]
+
+    def _knowledge_entry(self, diagnosis: Any) -> Dict[str, Any]:
+        if not self.knowledge:
+            return {}
+        name = str(diagnosis or "")
+        if hasattr(self.knowledge, "get_disease_profile"):
+            return self.knowledge.get_disease_profile(name) or {}
+        if hasattr(self.knowledge, "get"):
+            return self.knowledge.get(name) or {}
+        return {}
 
     def _choose_primary(self, ranked: Sequence[Any]) -> Optional[Any]:
         if not ranked:
@@ -4463,7 +4722,7 @@ class DiagnosisJudge:
             return diagnosis
         if not self.knowledge:
             return ""
-        entry = self.knowledge.get(diagnosis)
+        entry = self._knowledge_entry(diagnosis)
         for item in getattr(self.knowledge, "entries", {}).values():
             if str(item.get("parent_diagnosis") or "") == diagnosis:
                 return diagnosis
@@ -4481,8 +4740,8 @@ class DiagnosisJudge:
     def _same_family(self, left: Any, right: Any) -> bool:
         if not self.knowledge or not left or not right:
             return False
-        left_entry = self.knowledge.get(left.diagnosis)
-        right_entry = self.knowledge.get(right.diagnosis)
+        left_entry = self._knowledge_entry(left.diagnosis)
+        right_entry = self._knowledge_entry(right.diagnosis)
         left_system = str(left_entry.get("body_system") or "")
         right_system = str(right_entry.get("body_system") or "")
         left_family = str(left_entry.get("disease_family") or left_entry.get("family") or "")
@@ -4496,8 +4755,8 @@ class DiagnosisJudge:
     def _same_body_system(self, left: Any, right: Any) -> bool:
         if not self.knowledge or not left or not right:
             return False
-        left_entry = self.knowledge.get(left.diagnosis)
-        right_entry = self.knowledge.get(right.diagnosis)
+        left_entry = self._knowledge_entry(left.diagnosis)
+        right_entry = self._knowledge_entry(right.diagnosis)
         left_system = str(left_entry.get("body_system") or "")
         right_system = str(right_entry.get("body_system") or "")
         return bool(left_system and right_system and left_system == right_system)
@@ -4505,8 +4764,8 @@ class DiagnosisJudge:
     def _causally_related(self, left: Any, right: Any) -> bool:
         if not self.knowledge or not left or not right:
             return False
-        left_entry = self.knowledge.get(left.diagnosis)
-        right_entry = self.knowledge.get(right.diagnosis)
+        left_entry = self._knowledge_entry(left.diagnosis)
+        right_entry = self._knowledge_entry(right.diagnosis)
         return (
             right.diagnosis in set(str(item) for item in left_entry.get("causes", []) or [])
             or left.diagnosis in set(str(item) for item in right_entry.get("caused_by", []) or [])

@@ -20,6 +20,7 @@ from agent.diagnosis_eligibility import (
 from agent.candidate_generator import CandidatePool
 from agent.diagnosis_engine import CandidateScore, DiagnosisDecision, DiagnosisDecisionEngine
 from agent.diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter, JudgeDecision
+from agent.knowledge import KnowledgeBase
 
 
 def load_config():
@@ -385,6 +386,33 @@ class CaseBoardTests(unittest.TestCase):
                 and "\u80ba\u52a8\u9759\u8109\u7626" in task.get("target_candidates", [])
                 for task in decision.discriminating_exam_tasks
             )
+        )
+
+    def test_pavm_deferred_gap_tasks_prioritize_entity_confirmatory_bundle(self):
+        judge = DiagnosisJudge(load_config(), knowledge=KnowledgeBase("data/ref_data"))
+        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7626")
+        pavm.entity_id = "D100055"
+        pavm.eligibility_status = DEFERRED
+        pavm.eligibility_substatus = DEFERRED_NEEDS_CONFIRMATORY_EXAM
+        pavm.required_met = False
+        pavm.required_gaps = ["pulmonary_cta_positive"]
+        pavm.matched_evidence = ["hemoptysis", "pulmonary_vascular_shunt"]
+        pavm.core_matched_evidence = ["hemoptysis", "pulmonary_vascular_shunt"]
+        pavm.evidence_specificity_score = 0.92
+        pavm.source_prior = 0.85
+        pavm.candidate_value = "high"
+
+        judge._annotate_deferred_gap_priorities([pavm])
+        tasks = judge._deferred_gap_closure_exam_tasks([pavm])
+
+        self.assertTrue(tasks)
+        self.assertLessEqual(len(tasks), 3)
+        self.assertEqual(tasks[0]["exam"], "\u80ba\u52a8\u8109CTA")
+        self.assertEqual(tasks[0]["priority_bucket"], "high_value_deferred_gap_closure")
+        self.assertEqual(tasks[0]["closure_rank"], 1)
+        self.assertEqual(tasks[0]["target_candidates"], ["\u80ba\u52a8\u9759\u8109\u7626"])
+        self.assertTrue(
+            any("\u58f0\u5b66\u9020\u5f71" in task["exam"] for task in tasks)
         )
 
     def test_low_value_deferred_gap_does_not_get_priority_override(self):

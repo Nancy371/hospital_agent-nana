@@ -114,6 +114,128 @@ class ExamInformationGainTests(unittest.TestCase):
         self.assertEqual(ranked[0], expected_deferred)
         self.assertGreater(scores[expected_deferred], scores[expected_generic])
 
+    def test_high_value_pavm_gap_closure_is_reserved_over_conflict_and_generic(self):
+        strategy = ExamStrategyAgent(
+            KnowledgeBase("data/ref_data"),
+            max_new_items=3,
+            discriminating_exam_max_items=3,
+        )
+        pavm = "\u80ba\u52a8\u9759\u8109\u7626"
+        mpa = "\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e"
+        lung_cancer = "\u80ba\u764c"
+        anca = "\u6297\u4e2d\u6027\u7c92\u7ec6\u80de\u80de\u8d28\u6297\u4f53\uff08ANCA\uff09\u8c31"
+        cbc = "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09"
+        crp = "C\u53cd\u5e94\u86cb\u767d\uff08CRP\uff09"
+        chest_ct = "\u80f8\u90e8CT\u626b\u63cf\uff08Chest CT\uff09"
+        cta = "\u80ba\u52a8\u8109CTA"
+        bubble_echo = "\u53f3\u5fc3\u58f0\u5b66\u9020\u5f71"
+        enhanced_ct = "\u80f8\u90e8\u589e\u5f3aCT"
+
+        result = strategy.recommend(
+            collected_info={"symptoms": ["\u54af\u8840", "\u4f4e\u6c27", "\u53d1\u7ec0"]},
+            candidate_diseases=[pavm, mpa, lung_cancer],
+            proposed_items=[anca, cbc, crp, chest_ct],
+            existing_results={},
+            judge_decision={
+                "primary": lung_cancer,
+                "primary_status": "deferred",
+                "needs_discriminating_exams": True,
+                "differential_candidates": [pavm, mpa, lung_cancer],
+                "discriminating_exam_tasks": [
+                    {
+                        "exam": anca,
+                        "target_candidates": [mpa],
+                        "target_findings": ["anca_positive"],
+                        "exam_type": "conflict_adjudication",
+                        "exam_source": "conflict_adjudication_exam",
+                        "information_gain_hint": 0.98,
+                    },
+                    {
+                        "exam": cbc,
+                        "target_candidates": [mpa, lung_cancer],
+                        "target_findings": ["inflammation"],
+                        "exam_type": "generic_inflammation",
+                        "information_gain_hint": 0.70,
+                    },
+                    {
+                        "exam": chest_ct,
+                        "target_candidates": [pavm, lung_cancer],
+                        "target_findings": ["pulmonary_nodule"],
+                        "exam_type": "special_discriminator",
+                        "information_gain_hint": 0.90,
+                    },
+                    {
+                        "exam": cta,
+                        "target_candidates": [pavm],
+                        "target_findings": ["pulmonary_vascular_malformation_confirmed"],
+                        "target_gap": "G-PAVF-01",
+                        "target_gaps": ["G-PAVF-01"],
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": 1,
+                        "closure_priority": 100,
+                        "diagnostic_coverage": 0.6,
+                        "gap_diagnostic_coverage": 1.0,
+                        "information_gain_hint": 0.99,
+                    },
+                    {
+                        "exam": bubble_echo,
+                        "target_candidates": [pavm],
+                        "target_findings": ["bubble_echo_right_to_left_shunt"],
+                        "target_gap": "G-PAVF-01",
+                        "target_gaps": ["G-PAVF-01"],
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": 2,
+                        "closure_priority": 96,
+                        "diagnostic_coverage": 0.55,
+                        "gap_diagnostic_coverage": 0.96,
+                        "information_gain_hint": 0.98,
+                    },
+                    {
+                        "exam": enhanced_ct,
+                        "target_candidates": [pavm],
+                        "target_findings": ["enhanced_ct_vascular_malformation"],
+                        "target_gap": "G-PAVF-01",
+                        "target_gaps": ["G-PAVF-01"],
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": 3,
+                        "closure_priority": 92,
+                        "diagnostic_coverage": 0.6,
+                        "gap_diagnostic_coverage": 0.92,
+                        "information_gain_hint": 0.97,
+                    },
+                ],
+            },
+        )
+
+        self.assertTrue(result["differential_driven"])
+        pavm_details = [
+            detail
+            for detail in result["exam_authorization_details"]
+            if detail.get("exam_source") == "deferred_gap_closure_exam"
+        ]
+        self.assertTrue(pavm_details)
+        self.assertEqual(pavm_details[0]["priority_bucket"], "high_value_deferred_gap_closure")
+        self.assertEqual(pavm_details[0]["requested_exam"], cta)
+        self.assertIn("G-PAVF-01", pavm_details[0]["target_gaps"])
+        first_pavm_index = min(
+            result["items"].index(detail["exam"])
+            for detail in pavm_details
+            if detail["exam"] in result["items"]
+        )
+        first_anca_index = result["items"].index(anca) if anca in result["items"] else 99
+        self.assertLess(first_pavm_index, first_anca_index)
+        self.assertNotIn(cbc, result["items"][:2])
+        self.assertNotIn(crp, result["items"][:2])
+
     def test_tb_mpa_lung_cancer_special_exams_beat_generic_inflammation(self):
         result = self.strategy.recommend(
             collected_info={"symptoms": ["咳嗽", "咯血", "夜汗", "尿色深"]},

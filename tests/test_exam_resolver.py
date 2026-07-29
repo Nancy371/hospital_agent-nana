@@ -2,6 +2,7 @@ import unittest
 
 from agent.exam_resolver import (
     ALIAS,
+    EQUIVALENT,
     PARTIAL_SUBSTITUTE,
     UNRESOLVED,
     ExamResolver,
@@ -39,6 +40,31 @@ class ExamResolverTests(unittest.TestCase):
         self.assertEqual(result.resolution_type, PARTIAL_SUBSTITUTE)
         self.assertEqual(result.resolved_exam, "胸部CT扫描（Chest CT）")
         self.assertLess(result.diagnostic_coverage, 1.0)
+
+    def test_pulmonary_vascular_special_requests_use_equivalent_catalog_exam(self):
+        resolver = ExamResolver(
+            catalog_names=[
+                "\u80ba\u8840\u7ba1CTA",
+                "\u8d85\u58f0\u5fc3\u52a8\u56fe\u53f3\u5fc3\u58f0\u5b66\u9020\u5f71",
+                "\u80f8\u90e8\u589e\u5f3aCT",
+                "\u80f8\u90e8CT\u626b\u63cf\uff08Chest CT\uff09",
+            ]
+        )
+
+        cta = resolver.resolve("\u80ba\u52a8\u8109CTA")
+        bubble_echo = resolver.resolve("\u53f3\u5fc3\u58f0\u5b66\u9020\u5f71")
+        enhanced_ct = resolver.resolve("\u589e\u5f3a\u80f8\u90e8CT")
+
+        self.assertEqual(cta.resolution_type, EQUIVALENT)
+        self.assertEqual(cta.resolved_exam, "\u80ba\u8840\u7ba1CTA")
+        self.assertEqual(bubble_echo.resolution_type, EQUIVALENT)
+        self.assertEqual(
+            bubble_echo.resolved_exam,
+            "\u8d85\u58f0\u5fc3\u52a8\u56fe\u53f3\u5fc3\u58f0\u5b66\u9020\u5f71",
+        )
+        self.assertEqual(enhanced_ct.resolution_type, EQUIVALENT)
+        self.assertEqual(enhanced_ct.resolved_exam, "\u80f8\u90e8\u589e\u5f3aCT")
+        self.assertEqual(cta.diagnostic_coverage, 1.0)
 
     def test_unresolved_exam_stays_unresolved(self):
         resolver = ExamResolver(catalog_names=["血常规"])

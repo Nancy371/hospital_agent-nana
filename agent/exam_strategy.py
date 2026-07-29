@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from .exam_resolver import ExamResolver
+from .exam_resolver import ALIAS, EQUIVALENT, EXACT, PARTIAL_SUBSTITUTE, ExamResolver
 from .knowledge import KnowledgeBase
 
 _GENERIC_INFLAMMATION_EXAM_MARKERS = (
@@ -36,6 +36,14 @@ _SPECIAL_DISCRIMINATOR_EXAM_MARKERS = (
     "裂隙灯",
     "痰培养",
 )
+
+_FULL_EXAM_RESOLUTION_TYPES = {EXACT, ALIAS, EQUIVALENT}
+_USABLE_EXAM_RESOLUTION_TYPES = {
+    EXACT,
+    ALIAS,
+    EQUIVALENT,
+    PARTIAL_SUBSTITUTE,
+}
 
 
 _PEDIATRIC_CARDIAC_SCREEN_EXAMS = [
@@ -605,31 +613,55 @@ class ExamStrategyAgent:
             return {}
         task_by_exam = self._normalized_exam_task_map(exam_tasks)
         resolution_by_exam = {
-            item.resolved_exam: item.to_dict()
-            for item in list(exam_resolutions) + list(entity_exam_resolutions)
-            if item.resolved_exam
+            exam: dict(task.get("exam_resolution") or {})
+            for exam, task in task_by_exam.items()
+            if isinstance(task.get("exam_resolution"), dict)
         }
+        for item in list(exam_resolutions) + list(entity_exam_resolutions):
+            if item.resolved_exam and item.resolved_exam not in resolution_by_exam:
+                resolution_by_exam[item.resolved_exam] = item.to_dict()
         ranked, information_gain = self._rank_by_information_gain(
             candidate_diseases=differential_candidates or candidate_diseases or [],
             symptoms=(collected_info or {}).get("symptoms", []),
             proposed_items=list(dict.fromkeys(normalized + proposed_items)),
             exam_tasks=exam_tasks,
         )
-        priority_task_items = [
+        task_items_by_priority = sorted(
+            task_by_exam.items(),
+            key=lambda item: self._exam_task_priority_key(item[1]),
+            reverse=True,
+        )
+        urgent_task_items = [
             exam
-            for exam, task in task_by_exam.items()
-            if str(task.get("exam_source") or "") in {
-                "conflict_adjudication_exam",
-                "deferred_gap_closure_exam",
-                "evidence_claim_followup_exam",
-                "pattern_anchor_workup_exam",
-            }
-            and bool(
-                task.get("priority_override")
-                or str(task.get("exam_source") or "")
-                in {"conflict_adjudication_exam", "deferred_gap_closure_exam"}
-            )
+            for exam, task in task_items_by_priority
+            if bool(task.get("urgent_safety"))
         ]
+        deferred_gap_task_items = [
+            exam
+            for exam, task in task_items_by_priority
+            if str(task.get("exam_source") or "") == "deferred_gap_closure_exam"
+            and bool(task.get("priority_override"))
+        ]
+        followup_task_items = [
+            exam
+            for exam, task in task_items_by_priority
+            if str(task.get("exam_source") or "")
+            in {"evidence_claim_followup_exam", "pattern_anchor_workup_exam"}
+        ]
+        conflict_task_items = [
+            exam
+            for exam, task in task_items_by_priority
+            if str(task.get("exam_source") or "") == "conflict_adjudication_exam"
+            and not bool(task.get("urgent_safety"))
+        ]
+        priority_task_items = list(
+            dict.fromkeys(
+                urgent_task_items
+                + deferred_gap_task_items
+                + followup_task_items
+                + conflict_task_items
+            )
+        )
         high_value_proposed = [
             item
             for item in proposed_items
@@ -707,6 +739,36 @@ class ExamStrategyAgent:
                 "target_gaps": list(task_by_exam.get(item, {}).get("target_gaps") or []),
                 "priority_override": bool(task_by_exam.get(item, {}).get("priority_override")),
                 "override_reason": str(task_by_exam.get(item, {}).get("override_reason") or ""),
+                "priority_bucket": str(
+                    task_by_exam.get(item, {}).get("priority_bucket")
+                    or self._exam_task_priority_bucket(task_by_exam.get(item, {}))
+                ),
+                "closure_rank": task_by_exam.get(item, {}).get("closure_rank"),
+                "closure_priority": task_by_exam.get(item, {}).get("closure_priority"),
+                "requested_exam": str(
+                    task_by_exam.get(item, {}).get("requested_exam")
+                    or resolution_by_exam.get(item, {}).get("requested_exam")
+                    or item
+                ),
+                "resolved_exam": str(
+                    task_by_exam.get(item, {}).get("resolved_exam")
+                    or resolution_by_exam.get(item, {}).get("resolved_exam")
+                    or item
+                ),
+                "resolution_type": str(
+                    task_by_exam.get(item, {}).get("resolution_type")
+                    or resolution_by_exam.get(item, {}).get("resolution_type")
+                    or ""
+                ),
+                "diagnostic_coverage": float(
+                    task_by_exam.get(item, {}).get("diagnostic_coverage")
+                    or resolution_by_exam.get(item, {}).get("diagnostic_coverage")
+                    or 0.0
+                ),
+                "gap_diagnostic_coverage": float(
+                    task_by_exam.get(item, {}).get("gap_diagnostic_coverage")
+                    or 0.0
+                ),
             }
             for item in items
         ]
@@ -805,29 +867,126 @@ class ExamStrategyAgent:
         for task in exam_tasks or []:
             if not isinstance(task, dict):
                 continue
-            normalized, _ = self.knowledge.normalize_examinations(
-                [str(task.get("exam") or "")]
+            requested_exam = str(task.get("exam") or "").strip()
+            if not requested_exam:
+                continue
+            target_candidates = [
+                str(item or "").strip()
+                for item in task.get("target_candidates", []) or []
+                if str(item or "").strip()
+            ]
+            resolution = self.exam_resolver.resolve(
+                requested_exam,
+                candidate=target_candidates[0] if target_candidates else None,
             )
+            task_resolution = dict(task.get("exam_resolution") or {})
+            if (
+                task_resolution.get("resolved_exam")
+                and str(task_resolution.get("resolution_type") or "")
+                in _USABLE_EXAM_RESOLUTION_TYPES
+            ):
+                resolution_payload = task_resolution
+            else:
+                resolution_payload = resolution.to_dict()
+            normalized: List[str] = []
+            if resolution.resolved_exam and resolution.resolution_type in _USABLE_EXAM_RESOLUTION_TYPES:
+                normalized, _ = self.knowledge.normalize_examinations(
+                    [resolution.resolved_exam]
+                )
+                if not normalized:
+                    normalized = [resolution.resolved_exam]
             if not normalized:
-                resolution = self.exam_resolver.resolve(str(task.get("exam") or ""))
-                if resolution.resolved_exam:
-                    normalized, _ = self.knowledge.normalize_examinations(
-                        [resolution.resolved_exam]
-                    )
-                    if not normalized and resolution.resolution_type in {
-                        "exact",
-                        "alias",
-                        "equivalent",
-                        "partial_substitute",
-                    }:
-                        normalized = [resolution.resolved_exam]
+                normalized, _ = self.knowledge.normalize_examinations([requested_exam])
             if not normalized:
                 continue
             current = dict(task)
             for exam in normalized:
                 current_for_exam = dict(current)
                 current_for_exam["exam"] = exam
-                result[exam] = current_for_exam
+                current_for_exam["requested_exam"] = str(
+                    resolution_payload.get("requested_exam") or requested_exam
+                )
+                current_for_exam["resolved_exam"] = exam
+                current_for_exam["resolution_type"] = str(
+                    resolution_payload.get("resolution_type")
+                    or resolution.resolution_type
+                    or ""
+                )
+                current_for_exam["diagnostic_coverage"] = float(
+                    current_for_exam.get("diagnostic_coverage")
+                    or resolution_payload.get("diagnostic_coverage")
+                    or 0.0
+                )
+                current_for_exam["exam_resolution"] = {
+                    **resolution_payload,
+                    "resolved_exam": exam,
+                    "resolution_type": current_for_exam["resolution_type"],
+                    "diagnostic_coverage": current_for_exam["diagnostic_coverage"],
+                }
+                existing = result.get(exam)
+                if existing is None:
+                    result[exam] = current_for_exam
+                else:
+                    result[exam] = self._merge_normalized_exam_tasks(
+                        existing,
+                        current_for_exam,
+                    )
+        return result
+
+    def _merge_normalized_exam_tasks(
+        self,
+        existing: Dict[str, Any],
+        incoming: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        keep_incoming = self._exam_task_priority_key(incoming) > self._exam_task_priority_key(existing)
+        result = dict(incoming if keep_incoming else existing)
+        for key in ("target_candidates", "target_findings", "target_gaps", "target_claims", "source"):
+            values: List[Any] = []
+            for item in list(existing.get(key) or []) + list(incoming.get(key) or []):
+                if item not in values:
+                    values.append(item)
+            if values:
+                result[key] = values
+        result["information_gain_hint"] = max(
+            float(existing.get("information_gain_hint") or 0.0),
+            float(incoming.get("information_gain_hint") or 0.0),
+        )
+        result["closure_priority"] = max(
+            int(existing.get("closure_priority") or 0),
+            int(incoming.get("closure_priority") or 0),
+        )
+        result["closure_rank"] = min(
+            int(existing.get("closure_rank") or 9999),
+            int(incoming.get("closure_rank") or 9999),
+        )
+        if (
+            keep_incoming
+            and incoming.get("exam_source") == "deferred_gap_closure_exam"
+            and incoming.get("priority_override")
+        ):
+            for key in (
+                "exam_source",
+                "exam_type",
+                "expected_effect",
+                "priority_override",
+                "priority_bucket",
+                "override_reason",
+                "target_gap",
+                "evidence_gap",
+                "expected_transition",
+                "requested_exam",
+                "resolved_exam",
+                "resolution_type",
+                "diagnostic_coverage",
+                "gap_diagnostic_coverage",
+                "exam_resolution",
+            ):
+                if incoming.get(key) not in (None, "", [], {}):
+                    result[key] = (
+                        dict(incoming.get(key))
+                        if isinstance(incoming.get(key), dict)
+                        else incoming.get(key)
+                    )
         return result
 
     def _strict_authorized_exam_plan(
@@ -871,6 +1030,51 @@ class ExamStrategyAgent:
             "strong_items": strong_items,
             "max_items": max_items,
         }
+
+    @staticmethod
+    def _exam_task_priority_bucket(task: Dict[str, Any]) -> str:
+        source = str((task or {}).get("exam_source") or "")
+        if bool((task or {}).get("urgent_safety")):
+            return "urgent_safety"
+        if source == "deferred_gap_closure_exam" and bool(
+            (task or {}).get("priority_override")
+        ):
+            return "high_value_deferred_gap_closure"
+        if source in {
+            "evidence_claim_followup_exam",
+            "pattern_anchor_workup_exam",
+        }:
+            return "targeted_evidence_followup"
+        if source == "conflict_adjudication_exam":
+            return "conflict_adjudication"
+        exam_type = str((task or {}).get("exam_type") or "")
+        if exam_type == "generic_inflammation":
+            return "generic_lab_context"
+        return "general_discrimination"
+
+    @classmethod
+    def _exam_task_priority_key(cls, task: Dict[str, Any]) -> tuple:
+        bucket_name = cls._exam_task_priority_bucket(task)
+        bucket = {
+            "urgent_safety": 6,
+            "high_value_deferred_gap_closure": 5,
+            "targeted_evidence_followup": 4,
+            "conflict_adjudication": 3,
+            "general_discrimination": 2,
+            "generic_lab_context": 1,
+        }.get(bucket_name, 0)
+        closure_priority = int((task or {}).get("closure_priority") or 0)
+        closure_rank = int((task or {}).get("closure_rank") or 9999)
+        gap_coverage = float((task or {}).get("gap_diagnostic_coverage") or 0.0)
+        diagnostic_coverage = float((task or {}).get("diagnostic_coverage") or 0.0)
+        return (
+            bucket,
+            closure_priority,
+            gap_coverage,
+            diagnostic_coverage,
+            -closure_rank,
+            float((task or {}).get("information_gain_hint") or 0.0),
+        )
 
     def _strict_primary_diagnosis(
         self,
@@ -1211,6 +1415,7 @@ class ExamStrategyAgent:
         relevance: Dict[str, float] = {}
         task_type: Dict[str, str] = {}
         task_findings: Dict[str, set] = {}
+        task_priority: Dict[str, tuple] = {}
         task_by_exam = self._normalized_exam_task_map(exam_tasks or [])
         for exam, task in task_by_exam.items():
             targets = [
@@ -1233,6 +1438,10 @@ class ExamStrategyAgent:
                 relevance[exam] = relevance.get(exam, 0.0) + 1.25
             if str(task.get("exam_source") or "") == "deferred_gap_closure_exam":
                 relevance[exam] = relevance.get(exam, 0.0) + 1.0
+            task_priority[exam] = max(
+                task_priority.get(exam, (0, 0, 0.0, 0.0, -9999, 0.0)),
+                self._exam_task_priority_key(task),
+            )
         for rank, disease in enumerate(candidates):
             profile = self.knowledge.get_disease_profile(disease) or {}
             raw_items: List[str] = []
@@ -1287,9 +1496,9 @@ class ExamStrategyAgent:
                 + 0.10 * relevance_score
             )
             if task_by_exam.get(exam, {}).get("priority_override"):
-                score += 0.35
+                score += 0.60
             if str(task_by_exam.get(exam, {}).get("exam_source") or "") == "deferred_gap_closure_exam":
-                score += 0.25
+                score += 0.75
             if exam_type == "generic_inflammation" and coverage < 2:
                 score *= 0.45
             scores[exam] = round(score, 4)
@@ -1297,6 +1506,7 @@ class ExamStrategyAgent:
         ranked = sorted(
             scores,
             key=lambda item: (
+                task_priority.get(item, (0, 0, 0.0, 0.0, -9999, 0.0)),
                 scores[item],
                 self._exam_type_score(task_type.get(item) or self._exam_type_for_name(item)),
                 len(exam_support.get(item, set())),
@@ -1326,8 +1536,8 @@ class ExamStrategyAgent:
     @staticmethod
     def _exam_type_score(exam_type: str) -> float:
         return {
-            "conflict_adjudication": 1.2,
-            "deferred_gap_closure": 1.12,
+            "deferred_gap_closure": 1.25,
+            "conflict_adjudication": 1.08,
             "evidence_claim_verification": 1.05,
             "pattern_anchor_workup": 1.02,
             "special_discriminator": 1.0,
