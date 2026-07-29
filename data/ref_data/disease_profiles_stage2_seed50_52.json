@@ -59,6 +59,47 @@
         [{"finding": "pericarditic_chest_pain"}, {"finding": "pericardial_effusion"}, {"finding": "diagnosis:结核性心包炎"}],
         [{"finding": "tuberculosis_exposure"}, {"finding": "pericardial_thickening"}, {"finding": "diagnosis:肺结核"}]
       ],
+      "diagnostic_patterns": [
+        {
+          "pattern_id": "tuberculous_pericarditis_confirmed_pattern",
+          "pattern_type": "anchor_pattern",
+          "logic": "all_of",
+          "required": [
+            {
+              "any_of": [
+                "pericardial_effusion",
+                "pericardial_thickening",
+                "pericarditic_chest_pain"
+              ]
+            },
+            {
+              "any_of": [
+                "tuberculosis_exposure",
+                "tb_exposure",
+                "tuberculosis_pattern",
+                "tb_naat_positive",
+                "afb_positive",
+                "xpert_mtb_positive",
+                "diagnosis:肺结核"
+              ]
+            }
+          ],
+          "requires_objective_source": true,
+          "effect": {"eligibility": "PrimaryEligible"}
+        },
+        {
+          "pattern_id": "tuberculous_pericarditis_no_pericardial_anchor_pattern",
+          "pattern_type": "negative_pattern",
+          "logic": "any_of",
+          "required": [
+            "normal_pericardium",
+            "tb_microbiology_negative",
+            "tb_naat_negative",
+            "afb_negative"
+          ],
+          "effect": {"eligibility": "DifferentialOnly", "reason": "missing_or_negative_specific_anchor"}
+        }
+      ],
       "strong_verification_exams": ["体格检查", "心电图（ECG）", "超声心动图", "胸部CT扫描（Chest CT）", "红细胞沉降率（ESR）"],
       "required_exams": ["体格检查", "超声心动图", "胸部CT扫描（Chest CT）"],
       "common_confusions": ["肺结核", "支气管肺炎", "肺隐球菌病", "肺炎", "心律失常"],

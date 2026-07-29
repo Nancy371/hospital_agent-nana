@@ -29,6 +29,7 @@ AV_BLOCK_2 = "\u4e8c\u5ea6\u623f\u5ba4\u4f20\u5bfc\u963b\u6ede"
 ARRHYTHMIA = "\u5fc3\u5f8b\u5931\u5e38"
 LOW_MAGNESIUM = "\u4f4e\u9541\u8840\u75c7"
 RICKETS = "\u7ef4\u751f\u7d20D\u7f3a\u4e4f\u6027\u4f5d\u507b\u75c5"
+PAVM = "肺动静脉瘘"
 
 
 def load_config():
@@ -408,6 +409,70 @@ class DiagnosisJudgeTests(unittest.TestCase):
         self.assertIn(URACHAL_CYST, payload["differential_candidates"])
         self.assertEqual(payload["differential_pool_source"].get(URACHAL_CYST), "top20_priority_tail")
         self.assertIn(URACHAL_CYST, payload["required_gap_state_by_candidate"])
+
+    def test_pattern_deferred_tail_candidate_forces_workup_pool(self):
+        head = [
+            candidate(
+                f"generic_{i}",
+                0.78 - i * 0.01,
+                required=True,
+                specificity=0.55,
+                coverage=0.42,
+                residual=0.44,
+                matched=[f"symptom:generic{i}"],
+            )
+            for i in range(7)
+        ]
+        for item in head:
+            item.eligibility_status = "PrimaryEligible"
+            item.eligibility_reason = "AnchorsSatisfied"
+
+        pavm = candidate(
+            PAVM,
+            0.20,
+            required=False,
+            diagnosis_type="structural",
+            specificity=0.92,
+            coverage=0.34,
+            residual=0.48,
+            core_coverage=0.32,
+            matched=["hemoptysis", "right_to_left_shunt"],
+            gaps=[
+                "pulmonary_avm_confirmed_vascular_pattern:pulmonary_cta_positive|enhanced_ct_vascular_malformation|bubble_echo_right_to_left_shunt"
+            ],
+            core_score=0.58,
+            diagnostic_score=0.35,
+        )
+        pavm.eligibility_status = "Deferred"
+        pavm.eligibility_reason = "NeedsAnchor"
+        pavm.evidence_pattern_matches = [
+            {
+                "pattern_id": "pulmonary_avm_initial_shunt_pattern",
+                "pattern_type": "anchor_pattern",
+                "matched": True,
+                "matched_required_groups": [
+                    {"matched_findings": ["hemoptysis"]},
+                    {"matched_findings": ["right_to_left_shunt"]},
+                ],
+                "missing_required_groups": [],
+                "effect": {"eligibility": "Deferred", "reason": "NeedsAnchor"},
+            }
+        ]
+
+        decision = self.run_candidates(head + [pavm])
+        payload = decision.judge_decision
+
+        self.assertIn(PAVM, payload["differential_candidates"])
+        self.assertEqual(payload["differential_pool_source"].get(PAVM), "pattern_deferred_workup")
+        self.assertIn(PAVM, payload["evidence_gap_targets"])
+        tasks = payload["discriminating_exam_tasks"]
+        self.assertTrue(
+            any(
+                PAVM in task.get("target_candidates", [])
+                and task.get("exam") in {"肺动脉CTA", "胸部增强CT", "超声心动图右心声学造影"}
+                for task in tasks
+            )
+        )
 
     def test_hard_contradiction_still_blocks_gap_authorization(self):
         ohss = candidate(

@@ -8839,22 +8839,63 @@
         "diagnostic_patterns": [
           {
             "pattern_id": "acute_bacterial_prostatitis_confirmed_pattern",
-            "role": "positive_pattern",
-            "description": "Localizing prostate/urinary evidence plus bacterial confirmation is required before final submission."
+            "pattern_type": "anchor_pattern",
+            "logic": "all_of",
+            "required": [
+              {
+                "any_of": [
+                  "prostate_tenderness",
+                  "perineal_pain"
+                ]
+              },
+              {
+                "any_of": [
+                  "dysuria",
+                  "urinary_frequency",
+                  "urinary_urgency"
+                ]
+              },
+              {
+                "any_of": [
+                  "urine_culture_positive",
+                  "bacteriuria",
+                  "nitrite_positive",
+                  "leukocyte_esterase_positive"
+                ]
+              }
+            ],
+            "requires_objective_source": true,
+            "effect": {
+              "eligibility": "PrimaryEligible"
+            }
           },
           {
             "pattern_id": "acute_bacterial_prostatitis_negative_urine_pattern",
-            "role": "negative_pattern",
-            "support_findings": [
-              "pyuria"
+            "pattern_type": "negative_pattern",
+            "logic": "all_of",
+            "required": [
+              "pyuria",
+              {
+                "min_count": 2,
+                "of": [
+                  "urine_culture_no_growth",
+                  "leukocyte_esterase_negative",
+                  "nitrite_negative",
+                  "urine_wbc_normal"
+                ]
+              }
             ],
-            "blockers": [
-              "urine_culture_no_growth",
-              "leukocyte_esterase_negative",
-              "nitrite_negative",
-              "urine_wbc_normal"
+            "not_any_of": [
+              "prostate_tenderness",
+              "perineal_pain",
+              "dysuria",
+              "urinary_frequency",
+              "urinary_urgency"
             ],
-            "action": "downgrade_to_differential_only"
+            "effect": {
+              "eligibility": "DifferentialOnly",
+              "reason": "negative_urine_pattern"
+            }
           }
         ]
       },
@@ -10153,6 +10194,22 @@
             "weight": 0.75
           },
           {
+            "finding": "pulmonary_cta_positive",
+            "weight": 0.82
+          },
+          {
+            "finding": "enhanced_ct_vascular_malformation",
+            "weight": 0.78
+          },
+          {
+            "finding": "bubble_echo_right_to_left_shunt",
+            "weight": 0.76
+          },
+          {
+            "finding": "pulmonary_avm_mechanism",
+            "weight": 0.62
+          },
+          {
             "finding": "pulmonary_nodule",
             "weight": 0.18
           },
@@ -10161,7 +10218,66 @@
             "weight": 0.22
           }
         ],
-        "contradictions": []
+        "contradictions": [],
+        "diagnostic_patterns": [
+          {
+            "pattern_id": "pulmonary_avm_initial_shunt_pattern",
+            "pattern_type": "anchor_pattern",
+            "logic": "all_of",
+            "required": [
+              {
+                "any_of": [
+                  "hemoptysis",
+                  "hypoxemia",
+                  "cyanosis"
+                ]
+              },
+              {
+                "any_of": [
+                  "right_to_left_shunt",
+                  "pulmonary_vascular_shunt",
+                  "pulmonary_avm_mechanism"
+                ]
+              }
+            ],
+            "effect": {
+              "eligibility": "Deferred",
+              "reason": "NeedsAnchor"
+            }
+          },
+          {
+            "pattern_id": "pulmonary_avm_confirmed_vascular_pattern",
+            "pattern_type": "anchor_pattern",
+            "logic": "all_of",
+            "required": [
+              {
+                "any_of": [
+                  "hemoptysis",
+                  "hypoxemia",
+                  "cyanosis"
+                ]
+              },
+              {
+                "any_of": [
+                  "right_to_left_shunt",
+                  "pulmonary_vascular_shunt",
+                  "pulmonary_avm_mechanism"
+                ]
+              },
+              {
+                "any_of": [
+                  "pulmonary_cta_positive",
+                  "enhanced_ct_vascular_malformation",
+                  "bubble_echo_right_to_left_shunt"
+                ]
+              }
+            ],
+            "requires_objective_source": true,
+            "effect": {
+              "eligibility": "PrimaryEligible"
+            }
+          }
+        ]
       },
       "metadata": {
         "sources": [

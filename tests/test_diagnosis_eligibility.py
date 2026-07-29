@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from agent.clinical_evidence import EvidenceBundle, Observation
 from agent.diagnosis_eligibility import (
     ANCHORS_SATISFIED,
     DEFERRED,
@@ -11,6 +12,7 @@ from agent.diagnosis_eligibility import (
     PRIMARY_ELIGIBLE,
     DiagnosisEligibilityGate,
 )
+from agent.diagnosis_engine import DiagnosticKnowledgeBase
 
 
 def candidate(**overrides):
@@ -43,6 +45,7 @@ def candidate(**overrides):
 class DiagnosisEligibilityGateTests(unittest.TestCase):
     def setUp(self):
         self.gate = DiagnosisEligibilityGate()
+        self.knowledge_gate = DiagnosisEligibilityGate(DiagnosticKnowledgeBase("data/ref_data"))
 
     def test_missing_vitamin_d_anchor_defers_rickets_for_workup(self):
         rickets = candidate(
@@ -147,10 +150,16 @@ class DiagnosisEligibilityGateTests(unittest.TestCase):
             diagnostic_evidence_score=0.0,
         )
 
-        result = self.gate.evaluate(prostatitis)
+        result = self.knowledge_gate.evaluate(prostatitis)
 
         self.assertEqual(result.status, DEFERRED)
         self.assertEqual(result.reason, NEEDS_ANCHOR)
+        self.assertTrue(
+            any(
+                item.startswith("acute_bacterial_prostatitis_confirmed_pattern:")
+                for item in result.missing_required_anchors
+            )
+        )
 
     def test_pyuria_alone_is_not_prostatitis_anchor(self):
         prostatitis = candidate(
@@ -165,13 +174,15 @@ class DiagnosisEligibilityGateTests(unittest.TestCase):
             core_explanatory_coverage=0.36,
         )
 
-        result = self.gate.evaluate(prostatitis)
+        result = self.knowledge_gate.evaluate(prostatitis)
 
         self.assertEqual(result.status, DEFERRED)
         self.assertEqual(result.reason, NEEDS_ANCHOR)
-        self.assertIn(
-            "acute_bacterial_prostatitis_requires_urinary_or_prostate_anchor",
-            result.missing_required_anchors,
+        self.assertTrue(
+            any(
+                item.startswith("acute_bacterial_prostatitis_confirmed_pattern:")
+                for item in result.missing_required_anchors
+            )
         )
 
     def test_negative_urine_pattern_downgrades_pyuria_support(self):
@@ -192,12 +203,12 @@ class DiagnosisEligibilityGateTests(unittest.TestCase):
             core_explanatory_coverage=0.36,
         )
 
-        result = self.gate.evaluate(prostatitis)
+        result = self.knowledge_gate.evaluate(prostatitis)
 
         self.assertEqual(result.status, DIFFERENTIAL_ONLY)
         self.assertEqual(result.reason, PATTERN_CONTRADICTED)
         self.assertIn("urine_culture_no_growth", result.blockers)
-        self.assertEqual(result.evidence_pattern_matches[0]["role"], "negative_pattern")
+        self.assertEqual(result.evidence_pattern_matches[0]["pattern_type"], "negative_pattern")
 
     def test_confirmed_bacterial_prostatitis_pattern_is_primary_eligible(self):
         prostatitis = candidate(
@@ -217,10 +228,108 @@ class DiagnosisEligibilityGateTests(unittest.TestCase):
             diagnostic_evidence_score=0.55,
         )
 
-        result = self.gate.evaluate(prostatitis)
+        result = self.knowledge_gate.evaluate(prostatitis)
 
         self.assertEqual(result.status, PRIMARY_ELIGIBLE)
         self.assertEqual(result.reason, ANCHORS_SATISFIED)
+        self.assertEqual(
+            result.evidence_pattern_matches[0]["pattern_id"],
+            "acute_bacterial_prostatitis_confirmed_pattern",
+        )
+
+    def test_reasoning_only_cannot_satisfy_objective_pavm_confirmed_pattern(self):
+        pavm = candidate(
+            diagnosis="肺动静脉瘘",
+            diagnosis_type="structural",
+            required_met=True,
+            matched_evidence=[
+                "hemoptysis",
+                "right_to_left_shunt",
+                "enhanced_ct_vascular_malformation",
+            ],
+            core_matched_evidence=["hemoptysis", "right_to_left_shunt"],
+            diagnostic_matched_evidence=["enhanced_ct_vascular_malformation"],
+            required_gaps=[],
+            source_prior=0.75,
+            coverage_score=0.7,
+        )
+        evidence = EvidenceBundle(
+            [
+                Observation("hemoptysis", "reasoning_inference", confidence=0.7),
+                Observation("right_to_left_shunt", "reasoning_inference", confidence=0.7),
+                Observation("enhanced_ct_vascular_malformation", "reasoning_inference", confidence=0.7),
+            ]
+        )
+
+        result = self.knowledge_gate.evaluate(pavm, evidence=evidence)
+
+        self.assertEqual(result.status, DEFERRED)
+        self.assertEqual(result.reason, NEEDS_ANCHOR)
+        confirmed = [
+            item for item in result.evidence_pattern_matches
+            if item["pattern_id"] == "pulmonary_avm_confirmed_vascular_pattern"
+        ]
+        self.assertEqual(len(confirmed), 1)
+        self.assertFalse(confirmed[0]["matched"])
+        self.assertFalse(confirmed[0]["objective_source_satisfied"])
+
+    def test_pavm_initial_deferred_then_confirmed_with_objective_ct_anchor(self):
+        initial = candidate(
+            diagnosis="肺动静脉瘘",
+            diagnosis_type="structural",
+            required_met=True,
+            matched_evidence=["hemoptysis", "right_to_left_shunt"],
+            core_matched_evidence=["hemoptysis", "right_to_left_shunt"],
+            required_gaps=[],
+            source_prior=0.75,
+            coverage_score=0.7,
+        )
+
+        initial_result = self.knowledge_gate.evaluate(initial)
+
+        self.assertEqual(initial_result.status, DEFERRED)
+        self.assertTrue(
+            any(
+                item["pattern_id"] == "pulmonary_avm_initial_shunt_pattern"
+                for item in initial_result.evidence_pattern_matches
+            )
+        )
+
+        confirmed = candidate(
+            diagnosis="肺动静脉瘘",
+            diagnosis_type="structural",
+            required_met=True,
+            matched_evidence=[
+                "hemoptysis",
+                "right_to_left_shunt",
+                "enhanced_ct_vascular_malformation",
+            ],
+            core_matched_evidence=["hemoptysis", "right_to_left_shunt"],
+            diagnostic_matched_evidence=["enhanced_ct_vascular_malformation"],
+            required_gaps=[],
+            source_prior=0.75,
+            coverage_score=0.8,
+            diagnostic_evidence_score=0.68,
+            core_evidence_score=0.62,
+        )
+        evidence = EvidenceBundle(
+            [
+                Observation("hemoptysis", "问诊", confidence=0.86),
+                Observation("right_to_left_shunt", "超声心动图右心声学造影", confidence=0.92),
+                Observation("enhanced_ct_vascular_malformation", "胸部增强CT", confidence=0.96),
+            ]
+        )
+
+        confirmed_result = self.knowledge_gate.evaluate(confirmed, evidence=evidence)
+
+        self.assertEqual(confirmed_result.status, PRIMARY_ELIGIBLE)
+        self.assertEqual(confirmed_result.reason, ANCHORS_SATISFIED)
+        self.assertTrue(
+            any(
+                item["pattern_id"] == "pulmonary_avm_confirmed_vascular_pattern"
+                for item in confirmed_result.evidence_pattern_matches
+            )
+        )
 
     def test_pulmonary_cryptococcosis_without_fungal_anchor_is_deferred(self):
         crypto = candidate(

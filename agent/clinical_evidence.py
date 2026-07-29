@@ -417,6 +417,50 @@ _FINDING_METADATA: Dict[str, Dict[str, Any]] = {
         "generic_parents": ("cough", "fever"),
     },
     "hemoptysis": {"evidence_level": "specific", "information_value": 0.84},
+    "hypoxemia": {"evidence_level": "specific", "information_value": 0.86},
+    "cyanosis": {"evidence_level": "specific", "information_value": 0.84},
+    "right_to_left_shunt": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.96,
+        "clinical_pattern": "pulmonary_vascular_shunt",
+        "mechanism_ids": ("pulmonary_vascular_shunt",),
+    },
+    "pulmonary_vascular_shunt": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.94,
+        "clinical_pattern": "pulmonary_vascular_shunt",
+        "mechanism_ids": ("pulmonary_vascular_shunt",),
+    },
+    "pulmonary_avm_mechanism": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.93,
+        "clinical_pattern": "pulmonary_vascular_shunt",
+        "mechanism_ids": ("pulmonary_vascular_shunt",),
+    },
+    "pulmonary_avm_imaging": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.96,
+        "clinical_pattern": "pulmonary_vascular_shunt",
+        "mechanism_ids": ("pulmonary_vascular_shunt",),
+    },
+    "pulmonary_cta_positive": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.98,
+        "clinical_pattern": "pulmonary_vascular_shunt",
+        "mechanism_ids": ("pulmonary_vascular_shunt",),
+    },
+    "enhanced_ct_vascular_malformation": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.97,
+        "clinical_pattern": "pulmonary_vascular_shunt",
+        "mechanism_ids": ("pulmonary_vascular_shunt",),
+    },
+    "bubble_echo_right_to_left_shunt": {
+        "evidence_level": "diagnostic_pattern",
+        "information_value": 0.97,
+        "clinical_pattern": "pulmonary_vascular_shunt",
+        "mechanism_ids": ("pulmonary_vascular_shunt",),
+    },
     "night_sweats": {"evidence_level": "specific", "information_value": 0.84},
     "tuberculosis_pattern": {
         "evidence_level": "diagnostic_pattern",
@@ -559,6 +603,12 @@ _PHRASE_FINDINGS: Dict[str, Tuple[str, ...]] = {
     "congenital_heart_defect": ("先天性心脏病", "先心病", "先天性心脏缺陷", "先天性缺损"),
     "ventricular_septal_defect": ("室间隔缺损", "大型室间隔缺损", "VSD"),
     "right_to_left_shunt": ("右向左分流", "右至左分流"),
+    "pulmonary_vascular_shunt": ("肺血管分流", "肺内右向左分流"),
+    "pulmonary_avm_mechanism": ("肺动静脉瘘", "肺动静脉畸形", "PAVM", "Pulmonary AVM"),
+    "pulmonary_avm_imaging": ("肺动静脉瘘", "肺动静脉畸形", "肺血管畸形"),
+    "pulmonary_cta_positive": ("肺动脉CTA阳性", "CTA提示肺动静脉瘘", "CTA见肺动静脉畸形"),
+    "enhanced_ct_vascular_malformation": ("增强CT提示肺动静脉瘘", "胸部增强CT见肺血管畸形", "强化血管团"),
+    "bubble_echo_right_to_left_shunt": ("右心声学造影阳性", "声学造影提示右向左分流", "bubble study positive"),
     "pulmonary_hypertension": ("肺动脉高压", "肺动脉压升高"),
     "right_ventricular_hypertrophy": ("右心室肥厚", "右室肥厚"),
     "atrial_septal_defect": ("房间隔缺损", "继发孔型房缺", "ASD"),
@@ -1559,6 +1609,24 @@ class ClinicalEvidenceNormalizer:
                 for token in ("大肠埃希菌", "大肠杆菌", "肠球菌", "葡萄球菌", "克雷伯菌", "变形杆菌")
             ):
                 findings.append(("urine_culture_positive", 0.94))
+        if any(token in context for token in ("肺动脉cta", "cta")) and assertive_term(
+            ("肺动静脉瘘", "肺动静脉畸形", "肺血管畸形", "肺血管分流", "右向左分流")
+        ):
+            findings.append(("pulmonary_cta_positive", 0.97))
+            findings.append(("pulmonary_avm_imaging", 0.95))
+            findings.append(("pulmonary_avm_mechanism", 0.9))
+        if any(token in context for token in ("增强ct", "胸部增强ct", "cect")) and assertive_term(
+            ("肺动静脉瘘", "肺动静脉畸形", "肺血管畸形", "强化血管团", "异常血管团")
+        ):
+            findings.append(("enhanced_ct_vascular_malformation", 0.96))
+            findings.append(("pulmonary_avm_imaging", 0.94))
+            findings.append(("pulmonary_avm_mechanism", 0.9))
+        if any(token in context for token in ("右心声学造影", "声学造影", "bubble")) and assertive_term(
+            ("右向左分流", "右至左分流", "阳性", "微泡", "延迟显影")
+        ):
+            findings.append(("bubble_echo_right_to_left_shunt", 0.96))
+            findings.append(("right_to_left_shunt", 0.92))
+            findings.append(("pulmonary_vascular_shunt", 0.88))
         if "ugt1a1" in context and assertive_term(("突变", "变异", "致病", "阳性", "检出")):
             findings.append(("ugt1a1_positive", 0.98))
             findings.append(("genetic_suspicion", 0.92))

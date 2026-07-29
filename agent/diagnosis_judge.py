@@ -334,6 +334,7 @@ class JudgeCandidateReview:
     eligibility_status: str = ""
     eligibility_reason: str = ""
     missing_required_anchors: List[str] = field(default_factory=list)
+    evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1262,6 +1263,8 @@ class DiagnosisJudge:
             ranked,
             conflict_affected_diagnoses,
         )
+        pattern_force_names = self._forced_pool_names_for_pattern_deferred(ranked)
+        force_names = list(dict.fromkeys(list(force_names) + pattern_force_names))
         candidate_pool_for_workup = [
             item
             for item in ranked
@@ -1274,8 +1277,13 @@ class DiagnosisJudge:
             force_names,
         )
         raw_pool_source = self._differential_pool_source(raw_differential_pool)
+        for name in pattern_force_names:
+            raw_pool_source[name] = "pattern_deferred_workup"
         for name in force_names:
-            raw_pool_source.setdefault(name, "forced_conflict_or_top_candidate")
+            raw_pool_source.setdefault(
+                name,
+                "forced_conflict_or_top_candidate",
+            )
         pool_filter = self.pool_filter.filter(
             raw_differential_pool,
             raw_pool_source,
@@ -1291,11 +1299,12 @@ class DiagnosisJudge:
         base_discriminating_exam_tasks = self._discriminating_exam_tasks(
             differential_pool, pairwise, discriminating_findings
         )
+        pattern_exam_tasks = self._pattern_anchor_workup_exam_tasks(differential_pool)
         conflict_exam_tasks = self._conflict_adjudication_exam_tasks(
             differential_pool
         )
         discriminating_exam_tasks = self._merge_discriminating_exam_tasks(
-            conflict_exam_tasks,
+            list(pattern_exam_tasks) + list(conflict_exam_tasks),
             base_discriminating_exam_tasks,
         )
         discriminating_exams = [
@@ -1414,7 +1423,10 @@ class DiagnosisJudge:
             item.diagnosis
             for item in differential_pool
             if item.diagnosis != primary.diagnosis
-            and self._high_value_unresolved_contender(primary, item)
+            and (
+                self._high_value_unresolved_contender(primary, item)
+                or self._pattern_deferred_workup_candidate(item)
+            )
         ][: self.gap_target_limit]
         decision.explanatory_coverage = self._coverage(primary)
         decision.core_explanatory_coverage = self._core_coverage(primary)
@@ -1486,6 +1498,16 @@ class DiagnosisJudge:
                         ),
                         "residual_evidence_score": round(self._residual(item), 4),
                         "residual_core_evidence_count": self._residual_core_count(item),
+                        "eligibility_status": self._eligibility_status(item),
+                        "eligibility_reason": str(
+                            getattr(item, "eligibility_reason", "") or ""
+                        ),
+                        "missing_required_anchors": list(
+                            getattr(item, "missing_required_anchors", []) or []
+                        )[:6],
+                        "evidence_pattern_matches": list(
+                            getattr(item, "evidence_pattern_matches", []) or []
+                        )[:4],
                     }
                     for item in differential_pool
                 ],
@@ -1640,6 +1662,106 @@ class DiagnosisJudge:
             if high_value and self._judge_score(item) >= conflict_score - 0.26:
                 add(name)
         return names[:8]
+
+    def _forced_pool_names_for_pattern_deferred(
+        self,
+        ranked: Sequence[Any],
+    ) -> List[str]:
+        candidates = [
+            item
+            for item in ranked or []
+            if self._pattern_deferred_workup_candidate(item)
+        ]
+        names: List[str] = []
+        limit = max(
+            4,
+            int(getattr(self, "filtered_pool_max_size", 0) or 0),
+            int(getattr(self, "differential_top_k", 0) or 0),
+        )
+        for item in sorted(
+            candidates,
+            key=self._pattern_deferred_workup_sort_key,
+            reverse=True,
+        ):
+            name = str(getattr(item, "diagnosis", "") or "")
+            if name and name not in names:
+                names.append(name)
+            if len(names) >= limit:
+                break
+        return names
+
+    def _pattern_deferred_workup_candidate(self, candidate: Any) -> bool:
+        if not candidate or getattr(candidate, "hard_contradiction", False):
+            return False
+        if self._eligibility_status(candidate) != DEFERRED:
+            return False
+        pattern_matches = [
+            item
+            for item in getattr(candidate, "evidence_pattern_matches", []) or []
+            if isinstance(item, dict)
+        ]
+        if not self._pattern_deferred_workup_progress(pattern_matches):
+            return False
+        if not self._candidate_discriminating_exams(candidate):
+            return False
+        if not (
+            getattr(candidate, "required_gaps", None)
+            or pattern_matches
+        ):
+            return False
+        if self._priority(candidate) or self._systemic_primary(candidate):
+            return True
+        if self._core_or_diagnostic_signal(candidate):
+            return True
+        if float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0) >= 0.35:
+            return True
+        return bool(getattr(candidate, "matched_evidence", None))
+
+    @staticmethod
+    def _pattern_deferred_workup_progress(
+        pattern_matches: Sequence[Dict[str, Any]],
+    ) -> bool:
+        for item in pattern_matches or []:
+            if not isinstance(item, dict):
+                continue
+            effect_status = str((item.get("effect") or {}).get("eligibility") or "")
+            matched_required = list(item.get("matched_required_groups") or [])
+            missing_required = list(item.get("missing_required_groups") or [])
+            if effect_status == DEFERRED and (
+                bool(item.get("matched")) or bool(matched_required)
+            ):
+                return True
+            if (
+                effect_status == PRIMARY_ELIGIBLE
+                and not bool(item.get("matched"))
+                and matched_required
+                and missing_required
+            ):
+                return True
+        return False
+
+    def _pattern_deferred_workup_sort_key(self, candidate: Any) -> tuple:
+        best_progress = 0.0
+        has_deferred_match = 0
+        for item in getattr(candidate, "evidence_pattern_matches", []) or []:
+            if not isinstance(item, dict):
+                continue
+            matched_count = len(list(item.get("matched_required_groups") or []))
+            missing_count = len(list(item.get("missing_required_groups") or []))
+            total = max(1, matched_count + missing_count)
+            best_progress = max(best_progress, matched_count / total)
+            if (
+                str((item.get("effect") or {}).get("eligibility") or "") == DEFERRED
+                and bool(item.get("matched"))
+            ):
+                has_deferred_match = 1
+        return (
+            has_deferred_match,
+            best_progress,
+            1 if self._core_or_diagnostic_signal(candidate) else 0,
+            float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0),
+            self._judge_score(candidate),
+        )
 
     @staticmethod
     def _extend_forced_pool(
@@ -2097,6 +2219,58 @@ class DiagnosisJudge:
                 )
         return tasks
 
+    def _pattern_anchor_workup_exam_tasks(
+        self,
+        pool: Sequence[Any],
+    ) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        pool_size = max(1, len([item for item in pool or [] if item]))
+        for candidate in sorted(
+            [item for item in pool or [] if self._pattern_deferred_workup_candidate(item)],
+            key=self._pattern_deferred_workup_sort_key,
+            reverse=True,
+        ):
+            diagnosis = str(getattr(candidate, "diagnosis", "") or "")
+            if not diagnosis:
+                continue
+            target_findings = list(
+                dict.fromkeys(
+                    list(getattr(candidate, "required_gaps", []) or [])
+                    + [
+                        finding
+                        for pattern in getattr(candidate, "evidence_pattern_matches", []) or []
+                        if isinstance(pattern, dict)
+                        for group in pattern.get("missing_required_groups", []) or []
+                        if isinstance(group, dict)
+                        for finding in group.get("missing_findings", []) or []
+                    ]
+                )
+            )[:12]
+            for exam in self._candidate_discriminating_exams(candidate)[:4]:
+                text = str(exam or "").strip()
+                if not text:
+                    continue
+                key = (diagnosis, text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                tasks.append(
+                    {
+                        "exam": text,
+                        "target_candidates": [diagnosis],
+                        "target_findings": target_findings,
+                        "exam_type": "pattern_anchor_workup",
+                        "expected_effect": "close_missing_diagnostic_pattern_anchor",
+                        "source": ["diagnostic_pattern_workup"],
+                        "pool_candidate_count": pool_size,
+                        "target_candidate_count": 1,
+                        "information_gain_hint": 0.99,
+                        "exam_source": "pattern_anchor_workup_exam",
+                    }
+                )
+        return tasks
+
     def _merge_discriminating_exam_tasks(
         self,
         conflict_tasks: Sequence[Dict[str, Any]],
@@ -2150,6 +2324,13 @@ class DiagnosisJudge:
                 current["expected_effect"] = (
                     "resolve_reasoning_structured_polarity_conflict"
                 )
+            elif (
+                task.get("exam_source") == "pattern_anchor_workup_exam"
+                and current.get("exam_source") != "conflict_adjudication_exam"
+            ):
+                current["exam_source"] = "pattern_anchor_workup_exam"
+                current["exam_type"] = "pattern_anchor_workup"
+                current["expected_effect"] = "close_missing_diagnostic_pattern_anchor"
 
         for task in conflict_tasks or []:
             add(task)
@@ -2506,6 +2687,17 @@ class DiagnosisJudge:
                 continue
             if not getattr(candidate, "required_gaps", None):
                 continue
+            if self._deferred_explains_better_than_primary(primary, candidate):
+                targets.append(candidate.diagnosis)
+        for candidate in ranked:
+            if len(targets) >= self.gap_target_limit:
+                break
+            if candidate.diagnosis in final_set or candidate.diagnosis in targets:
+                continue
+            if self._eligibility_status(candidate) != DEFERRED:
+                continue
+            if not getattr(candidate, "required_gaps", None):
+                continue
             if (
                 self._same_family(primary, candidate)
                 or self._causally_related(primary, candidate)
@@ -2521,7 +2713,43 @@ class DiagnosisJudge:
                 continue
             if self._same_family(primary, candidate) or self._causally_related(primary, candidate):
                 targets.append(candidate.diagnosis)
+        pattern_targets: List[str] = []
+        for candidate in sorted(
+            ranked,
+            key=self._pattern_deferred_workup_sort_key,
+            reverse=True,
+        ):
+            if candidate.diagnosis in final_set or candidate.diagnosis in targets:
+                continue
+            if self._pattern_deferred_workup_candidate(candidate):
+                pattern_targets.append(candidate.diagnosis)
+        for name in pattern_targets:
+            if len(targets) < self.gap_target_limit or not any(
+                target in pattern_targets for target in targets
+            ):
+                targets.append(name)
+            if len(targets) >= self.gap_target_limit and any(
+                target in pattern_targets for target in targets
+            ):
+                break
         return targets
+
+    def _deferred_explains_better_than_primary(self, primary: Any, candidate: Any) -> bool:
+        if not primary or not candidate:
+            return False
+        if getattr(candidate, "hard_contradiction", False):
+            return False
+        if not self._has_signal(candidate):
+            return False
+        if self._coverage(candidate) >= self._coverage(primary) + 0.08:
+            return True
+        if self._residual(candidate) <= self._residual(primary) - 0.10:
+            return True
+        if self._core_coverage(candidate) >= self._core_coverage(primary) + 0.10:
+            return True
+        if self._residual_core_count(candidate) < self._residual_core_count(primary):
+            return True
+        return False
 
     def _deferred_evidence_gap_targets(
         self,
@@ -2551,6 +2779,39 @@ class DiagnosisJudge:
                 continue
             if candidate.diagnosis == getattr(primary, "diagnosis", ""):
                 targets.append(candidate.diagnosis)
+                break
+        for candidate in ordered_pool:
+            if len(targets) >= self.gap_target_limit:
+                break
+            if not candidate or candidate.diagnosis in targets:
+                continue
+            if self._eligibility_status(candidate) != DEFERRED:
+                continue
+            if not getattr(candidate, "required_gaps", None):
+                continue
+            if (
+                self._deferred_explains_better_than_primary(primary, candidate)
+                or self._high_value_unresolved_contender(primary, candidate)
+            ):
+                targets.append(candidate.diagnosis)
+        pattern_targets: List[str] = []
+        for candidate in sorted(
+            ordered_pool,
+            key=self._pattern_deferred_workup_sort_key,
+            reverse=True,
+        ):
+            if not candidate or candidate.diagnosis in targets:
+                continue
+            if self._pattern_deferred_workup_candidate(candidate):
+                pattern_targets.append(candidate.diagnosis)
+        for name in pattern_targets:
+            if len(targets) < self.gap_target_limit or not any(
+                target in pattern_targets for target in targets
+            ):
+                targets.append(name)
+            if len(targets) >= self.gap_target_limit and any(
+                target in pattern_targets for target in targets
+            ):
                 break
         for candidate in ordered_pool:
             if len(targets) >= self.gap_target_limit:
@@ -2933,6 +3194,9 @@ class DiagnosisJudge:
                     missing_required_anchors=list(
                         getattr(candidate, "missing_required_anchors", []) or []
                     )[:6],
+                    evidence_pattern_matches=list(
+                        getattr(candidate, "evidence_pattern_matches", []) or []
+                    )[:4],
                 )
             )
         return reviews

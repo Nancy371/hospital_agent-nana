@@ -6,6 +6,8 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
+from .diagnostic_patterns import DiagnosticPatternEvaluator
+
 
 PRIMARY_ELIGIBLE = "PrimaryEligible"
 DEFERRED = "Deferred"
@@ -21,47 +23,6 @@ INSUFFICIENT_EXPLANATION = "InsufficientExplanation"
 ANCHORS_SATISFIED = "AnchorsSatisfied"
 PATTERN_CONTRADICTED = "PatternContradicted"
 
-
-_ACUTE_PROSTATITIS_ANCHORS = {
-    "diagnosis:急性细菌性前列腺炎",
-    "prostate_tenderness",
-    "perineal_pain",
-    "pelvic_pain",
-    "dysuria",
-    "urinary_frequency",
-    "urinary_urgency",
-    "bacteriuria",
-    "urine_culture_positive",
-    "leukocyte_esterase_positive",
-    "nitrite_positive",
-}
-
-_ACUTE_PROSTATITIS_LOCALIZING_ANCHORS = {
-    "prostate_tenderness",
-    "perineal_pain",
-    "pelvic_pain",
-    "dysuria",
-    "urinary_frequency",
-    "urinary_urgency",
-}
-
-_ACUTE_PROSTATITIS_BACTERIAL_ANCHORS = {
-    "bacteriuria",
-    "urine_culture_positive",
-    "leukocyte_esterase_positive",
-    "nitrite_positive",
-}
-
-_ACUTE_PROSTATITIS_INFLAMMATION_SUPPORT = {
-    "pyuria",
-}
-
-_ACUTE_PROSTATITIS_BACTERIAL_BLOCKERS = {
-    "urine_culture_no_growth",
-    "leukocyte_esterase_negative",
-    "nitrite_negative",
-    "urine_wbc_normal",
-}
 
 _PULMONARY_CRYPTOCOCCOSIS_ANCHORS = {
     "diagnosis:肺隐球菌病",
@@ -356,6 +317,7 @@ class DiagnosisEligibilityGate:
     def __init__(self, knowledge: Optional[Any] = None):
         self.knowledge = knowledge
         self.specificity_calculator = EvidenceSpecificityCalculator(knowledge)
+        self.pattern_evaluator = DiagnosticPatternEvaluator(knowledge)
 
     def evaluate_all(
         self,
@@ -363,12 +325,12 @@ class DiagnosisEligibilityGate:
         evidence: Any = None,
     ) -> Dict[str, Any]:
         self.specificity_calculator.apply(candidates, evidence)
-        results = [self.evaluate(candidate) for candidate in candidates or [] if candidate]
+        results = [self.evaluate(candidate, evidence=evidence) for candidate in candidates or [] if candidate]
         for candidate, result in zip([item for item in candidates or [] if item], results):
             self.apply_result(candidate, result)
         return self.summary(results)
 
-    def evaluate(self, candidate: Any) -> EligibilityResult:
+    def evaluate(self, candidate: Any, evidence: Any = None) -> EligibilityResult:
         diagnosis = str(getattr(candidate, "diagnosis", "") or "")
         missing = list(dict.fromkeys(getattr(candidate, "required_gaps", []) or []))
         satisfied = self._satisfied_anchors(candidate)
@@ -381,11 +343,39 @@ class DiagnosisEligibilityGate:
         if getattr(candidate, "unresolved_evidence_conflict", False):
             blockers.append("unresolved_reasoning_structured_evidence_conflict")
             return self._result(candidate, DEFERRED, CONFLICT_NEEDS_ADJUDICATION, missing, satisfied, blockers)
-        blocking_pattern = self._blocking_evidence_pattern(candidate)
-        if blocking_pattern:
-            blockers.extend(blocking_pattern.get("blockers", []))
-            self._append_evidence_pattern(candidate, blocking_pattern)
-            return self._result(candidate, DIFFERENTIAL_ONLY, PATTERN_CONTRADICTED, missing, satisfied, blockers)
+        pattern_summary = self.pattern_evaluator.evaluate(candidate, evidence=evidence)
+        if pattern_summary.get("has_patterns"):
+            pattern_audit = list(pattern_summary.get("matches", []) or [])
+            pattern_audit.extend(pattern_summary.get("missing_primary_patterns", []) or [])
+            self._append_evidence_patterns(candidate, pattern_audit)
+            blockers.extend(pattern_summary.get("blockers", []) or [])
+            missing_from_patterns = self._pattern_missing_anchors(pattern_summary)
+            if pattern_summary.get("excluded_matches"):
+                return self._result(
+                    candidate,
+                    EXCLUDED,
+                    PATTERN_CONTRADICTED,
+                    missing,
+                    satisfied,
+                    blockers or pattern_summary.get("negative_hits", []),
+                )
+            if pattern_summary.get("primary_eligible_matches"):
+                missing = []
+                return self._result(candidate, PRIMARY_ELIGIBLE, ANCHORS_SATISFIED, missing, satisfied, blockers)
+            if pattern_summary.get("differential_matches"):
+                return self._result(
+                    candidate,
+                    DIFFERENTIAL_ONLY,
+                    PATTERN_CONTRADICTED,
+                    list(dict.fromkeys(list(missing) + missing_from_patterns)),
+                    satisfied,
+                    blockers or pattern_summary.get("negative_hits", []),
+                )
+            if pattern_summary.get("deferred_matches") or pattern_summary.get("required_primary_patterns"):
+                missing = list(dict.fromkeys(list(missing) + missing_from_patterns))
+                if self._deferred_worth_followup(candidate):
+                    return self._result(candidate, DEFERRED, NEEDS_ANCHOR, missing, satisfied, blockers)
+                return self._result(candidate, DIFFERENTIAL_ONLY, WEAK_DIFFERENTIAL_SIGNAL, missing, satisfied, blockers)
         if bool(getattr(candidate, "differential_only", False)):
             reason = str(getattr(candidate, "differential_only_reason", "") or WEAK_DIFFERENTIAL_SIGNAL)
             return self._result(candidate, DIFFERENTIAL_ONLY, reason, missing, satisfied, blockers)
@@ -410,6 +400,12 @@ class DiagnosisEligibilityGate:
         setattr(candidate, "evidence_pattern_matches", list(result.evidence_pattern_matches))
         setattr(candidate, "positive_evidence_score", result.positive_evidence_score)
         setattr(candidate, "evidence_specificity_score", result.evidence_specificity_score)
+        if result.status == PRIMARY_ELIGIBLE:
+            setattr(candidate, "required_met", True)
+            setattr(candidate, "required_gaps", [])
+        elif result.status in {DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED} and result.missing_required_anchors:
+            setattr(candidate, "required_met", False)
+            setattr(candidate, "required_gaps", list(result.missing_required_anchors))
 
     @staticmethod
     def summary(results: Sequence[EligibilityResult]) -> Dict[str, Any]:
@@ -484,7 +480,8 @@ class DiagnosisEligibilityGate:
     def _diagnosis_anchor_sanity_gap(self, candidate: Any) -> str:
         diagnosis = str(getattr(candidate, "diagnosis", "") or "")
         entry = self._entry(candidate)
-        category = str(entry.get("category") or getattr(candidate, "category", "") or "")
+        if entry.get("diagnostic_patterns"):
+            return ""
         if diagnosis == "肺隐球菌病":
             matched = {str(item) for item in getattr(candidate, "matched_evidence", []) or []}
             if matched & _PULMONARY_CRYPTOCOCCOSIS_ANCHORS:
@@ -495,59 +492,48 @@ class DiagnosisEligibilityGate:
             if matched & _MYCOPLASMA_PNEUMONIA_ANCHORS:
                 return ""
             return "mycoplasma_pneumonia_requires_pathogen_or_interstitial_anchor"
-        if diagnosis != "急性细菌性前列腺炎" and category != "acute_bacterial_prostate":
-            return ""
-        matched = {str(item) for item in getattr(candidate, "matched_evidence", []) or []}
-        if matched & _ACUTE_PROSTATITIS_ANCHORS:
-            return ""
-        return "acute_bacterial_prostatitis_requires_urinary_or_prostate_anchor"
-
-    def _blocking_evidence_pattern(self, candidate: Any) -> Dict[str, Any]:
-        diagnosis = str(getattr(candidate, "diagnosis", "") or "")
-        entry = self._entry(candidate)
-        category = str(entry.get("category") or getattr(candidate, "category", "") or "")
-        if diagnosis != "急性细菌性前列腺炎" and category != "acute_bacterial_prostate":
-            return {}
-        matched = {str(item) for item in getattr(candidate, "matched_evidence", []) or []}
-        contradicted = {
-            str(item)
-            for item in (
-                list(getattr(candidate, "soft_contradicted_evidence", []) or [])
-                + list(getattr(candidate, "hard_contradicted_evidence", []) or [])
-                + list(getattr(candidate, "contradicted_evidence", []) or [])
-            )
-        }
-        bacterial_positive = sorted(matched & _ACUTE_PROSTATITIS_BACTERIAL_ANCHORS)
-        if bacterial_positive:
-            return {}
-        bacterial_blockers = sorted((matched | contradicted) & _ACUTE_PROSTATITIS_BACTERIAL_BLOCKERS)
-        if not bacterial_blockers:
-            return {}
-        localizing = sorted(matched & _ACUTE_PROSTATITIS_LOCALIZING_ANCHORS)
-        inflammation_only = sorted(matched & _ACUTE_PROSTATITIS_INFLAMMATION_SUPPORT)
-        multiple_negative_markers = len(bacterial_blockers) >= 2
-        lacks_localizing_anchor = not bool(localizing)
-        if not inflammation_only and not (multiple_negative_markers and lacks_localizing_anchor):
-            return {}
-        if not multiple_negative_markers and not lacks_localizing_anchor:
-            return {}
-        return {
-            "pattern": "acute_bacterial_prostatitis_negative_urine_pattern",
-            "role": "negative_pattern",
-            "matched": sorted(set(inflammation_only + localizing)),
-            "blockers": bacterial_blockers,
-            "action": "downgrade_to_differential_only",
-            "reason": (
-                "pyuria is urinary inflammation support, not a bacterial "
-                "prostatitis anchor when bacterial urine markers are negative"
-            ),
-        }
+        return ""
 
     @staticmethod
-    def _append_evidence_pattern(candidate: Any, pattern: Dict[str, Any]) -> None:
+    def _append_evidence_patterns(candidate: Any, patterns: Sequence[Dict[str, Any]]) -> None:
+        if not patterns:
+            return
         existing = list(getattr(candidate, "evidence_pattern_matches", []) or [])
-        existing.append(dict(pattern))
+        seen = {
+            str(item.get("pattern_id") or item.get("pattern") or "")
+            for item in existing
+            if isinstance(item, dict)
+        }
+        for pattern in patterns:
+            if not isinstance(pattern, dict):
+                continue
+            pattern_id = str(pattern.get("pattern_id") or pattern.get("pattern") or "")
+            if pattern_id and pattern_id in seen:
+                continue
+            existing.append(dict(pattern))
+            if pattern_id:
+                seen.add(pattern_id)
         setattr(candidate, "evidence_pattern_matches", existing)
+
+    @staticmethod
+    def _pattern_missing_anchors(pattern_summary: Dict[str, Any]) -> List[str]:
+        missing: List[str] = []
+        source_patterns = list(pattern_summary.get("missing_primary_patterns", []) or [])
+        source_patterns.extend(pattern_summary.get("deferred_matches", []) or [])
+        for pattern in source_patterns:
+            if not isinstance(pattern, dict):
+                continue
+            pattern_id = str(pattern.get("pattern_id") or "")
+            for group in pattern.get("missing_required_groups", []) or []:
+                if not isinstance(group, dict):
+                    continue
+                condition = group.get("condition")
+                label = _render_pattern_condition(condition)
+                if pattern_id and label:
+                    missing.append(f"{pattern_id}:{label}")
+                elif label:
+                    missing.append(label)
+        return list(dict.fromkeys(item for item in missing if item))
 
     @staticmethod
     def _insufficient_explanation(candidate: Any) -> bool:
@@ -568,6 +554,41 @@ class DiagnosisEligibilityGate:
             return dict(self.knowledge.get(str(getattr(candidate, "diagnosis", "") or "")) or {})
         except Exception:
             return {}
+
+
+def _render_pattern_condition(condition: Any) -> str:
+    if isinstance(condition, str):
+        return condition
+    if isinstance(condition, dict):
+        if "finding" in condition:
+            return str(condition.get("finding") or "")
+        if "any_of" in condition:
+            return "|".join(
+                item
+                for item in (_render_pattern_condition(value) for value in condition.get("any_of") or [])
+                if item
+            )
+        if "all_of" in condition:
+            return "+".join(
+                item
+                for item in (_render_pattern_condition(value) for value in condition.get("all_of") or [])
+                if item
+            )
+        if "min_count" in condition:
+            nested = "|".join(
+                item
+                for item in (_render_pattern_condition(value) for value in condition.get("of") or [])
+                if item
+            )
+            return f"min_count_{condition.get('min_count')}:{nested}" if nested else ""
+        if "not_any_of" in condition:
+            nested = "|".join(
+                item
+                for item in (_render_pattern_condition(value) for value in condition.get("not_any_of") or [])
+                if item
+            )
+            return f"not_any_of:{nested}" if nested else ""
+    return str(condition or "")
 
 
 def eligibility_status(candidate: Any) -> str:

@@ -509,6 +509,11 @@ class DiagnosticKnowledgeBase:
                 entry[key] = _dedupe_objects(
                     list(entry.get(key, []) or []) + list(profile.get(key, []) or [])
                 )
+            if profile.get("diagnostic_patterns"):
+                entry["diagnostic_patterns"] = _dedupe_objects(
+                    list(entry.get("diagnostic_patterns", []) or [])
+                    + list(profile.get("diagnostic_patterns", []) or [])
+                )
             entry["generalization_suppressions"] = list(
                 dict.fromkeys(
                     list(entry.get("generalization_suppressions", []) or [])
@@ -556,6 +561,7 @@ class DiagnosticKnowledgeBase:
                         "caused_by",
                         "suppress_diagnoses",
                         "generalization_suppressions",
+                        "diagnostic_patterns",
                     }:
                         merged[key] = _dedupe_objects(
                             list(merged.get(key, [])) + list(value or [])
@@ -611,6 +617,7 @@ class DiagnosticKnowledgeBase:
             "related_complications": [],
             "category": "",
             "generalization_suppressions": [],
+            "diagnostic_patterns": [],
             "sources": [],
             "source_version": "",
             "department": "",
@@ -736,6 +743,11 @@ class DiagnosticKnowledgeBase:
                 entry["contradictions"] = _dedupe_objects(
                     list(entry.get("contradictions", []) or [])
                     + list(evidence_profile.get("contradictions") or [])
+                )
+            if evidence_profile.get("diagnostic_patterns"):
+                entry["diagnostic_patterns"] = _dedupe_objects(
+                    list(entry.get("diagnostic_patterns", []) or [])
+                    + list(evidence_profile.get("diagnostic_patterns") or [])
                 )
             self.entity_id_by_name[name] = entity.entity_id
             self.aliases[name] = name

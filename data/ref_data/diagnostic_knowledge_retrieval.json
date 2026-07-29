@@ -201,15 +201,26 @@
       "diagnostic_patterns": [
         {
           "pattern_id": "acute_bacterial_prostatitis_confirmed_pattern",
-          "role": "positive_pattern",
-          "description": "Localizing prostate/urinary evidence plus bacterial confirmation is required before final submission."
+          "pattern_type": "anchor_pattern",
+          "logic": "all_of",
+          "required": [
+            {"any_of": ["prostate_tenderness", "perineal_pain"]},
+            {"any_of": ["dysuria", "urinary_frequency", "urinary_urgency"]},
+            {"any_of": ["urine_culture_positive", "bacteriuria", "nitrite_positive", "leukocyte_esterase_positive"]}
+          ],
+          "requires_objective_source": true,
+          "effect": {"eligibility": "PrimaryEligible"}
         },
         {
           "pattern_id": "acute_bacterial_prostatitis_negative_urine_pattern",
-          "role": "negative_pattern",
-          "support_findings": ["pyuria"],
-          "blockers": ["urine_culture_no_growth", "leukocyte_esterase_negative", "nitrite_negative", "urine_wbc_normal"],
-          "action": "downgrade_to_differential_only"
+          "pattern_type": "negative_pattern",
+          "logic": "all_of",
+          "required": [
+            "pyuria",
+            {"min_count": 2, "of": ["urine_culture_no_growth", "leukocyte_esterase_negative", "nitrite_negative", "urine_wbc_normal"]}
+          ],
+          "not_any_of": ["prostate_tenderness", "perineal_pain", "dysuria", "urinary_frequency", "urinary_urgency"],
+          "effect": {"eligibility": "DifferentialOnly", "reason": "negative_urine_pattern"}
         }
       ],
       "generalization_suppressions": ["前列腺增生", "泌尿系感染", "尿道综合征"],
