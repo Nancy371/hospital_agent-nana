@@ -98,6 +98,10 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "exam_information_gain": metric("exam_information_gain"),
         "deferred_gap_closure_rate": metric("deferred_gap_closure_rate"),
         "deferred_exam_coverage": metric("deferred_exam_coverage"),
+        "gap_value_exam_selection_rate": metric("gap_value_exam_selection_rate"),
+        "reserved_highest_gap_survival_rate": metric(
+            "reserved_highest_gap_survival_rate"
+        ),
         "exam_priority_alignment": metric("exam_priority_alignment"),
         "wrong_primary_exam_drift": metric("wrong_primary_exam_drift"),
         "deferred_gap_count": metric("deferred_gap_count"),

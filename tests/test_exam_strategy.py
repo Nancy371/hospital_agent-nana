@@ -339,6 +339,116 @@ class ExamInformationGainTests(unittest.TestCase):
 
         self.assertEqual(result["items"], [cta])
 
+    def test_gap_value_beats_higher_candidate_score_for_next_exam(self):
+        strategy = ExamStrategyAgent(
+            KnowledgeBase("data/ref_data"),
+            max_new_items=1,
+            discriminating_exam_max_items=1,
+        )
+        low_magnesium = "\u4f4e\u9541\u8840\u75c7"
+        rickets = "\u7ef4\u751f\u7d20D\u7f3a\u4e4f\u6027\u4f5d\u507b\u75c5"
+        vitamin_d = "\u7ef4\u751f\u7d20D\u68c0\u6d4b"
+
+        result = strategy.recommend(
+            collected_info={"symptoms": ["\u817f\u75db", "\u8ddb\u884c", "\u4f4e\u9499"]},
+            candidate_diseases=[low_magnesium, rickets],
+            proposed_items=["\u9541\u8d1f\u8377\u8bd5\u9a8c", "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09"],
+            existing_results={},
+            judge_decision={
+                "primary_status": "deferred",
+                "needs_discriminating_exams": True,
+                "differential_candidates": [low_magnesium, rickets],
+                "active_evidence_gaps": [
+                    {
+                        "gap_id": "G-LOW-MAG-LOW-VALUE",
+                        "candidate": low_magnesium,
+                        "entity_id": "D100009",
+                        "target_evidence": "magnesium_recheck",
+                        "gap_type": "confirmation_gap",
+                        "gap_value": 0.2,
+                        "candidate_score_at_decision": 0.89,
+                        "expected_transition": {
+                            "positive": "PrimaryEligible",
+                            "negative": "DifferentialOnly",
+                        },
+                        "closure_exams": ["\u9541\u8d1f\u8377\u8bd5\u9a8c"],
+                    },
+                    {
+                        "gap_id": "G-RICKETS-HIGH-VALUE",
+                        "candidate": rickets,
+                        "entity_id": "D100010",
+                        "target_evidence": "vitamin_d_low|bone_deformity",
+                        "gap_type": "confirmation_gap",
+                        "gap_value": 0.95,
+                        "candidate_score_at_decision": 0.73,
+                        "expected_transition": {
+                            "positive": "PrimaryEligible",
+                            "negative": "DifferentialOnly",
+                        },
+                        "closure_exams": [
+                            vitamin_d,
+                            "\u7532\u72b6\u65c1\u817a\u6fc0\u7d20\u68c0\u6d4b\uff08PTH\uff09",
+                            "X\u7ebf\u68c0\u67e5",
+                        ],
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(result["items"], [vitamin_d])
+        detail = result["exam_authorization_details"][0]
+        self.assertEqual(detail["target_gap"], "G-RICKETS-HIGH-VALUE")
+        self.assertEqual(detail["source_gap_value"], 0.95)
+        self.assertEqual(detail["candidate_score_at_decision"], 0.73)
+        self.assertTrue(detail["score_gap_decoupled"])
+
+    def test_candidate_score_change_does_not_change_gap_value_order(self):
+        strategy = ExamStrategyAgent(
+            KnowledgeBase("data/ref_data"),
+            max_new_items=1,
+            discriminating_exam_max_items=1,
+        )
+        first = {
+            "gap_id": "G-A",
+            "candidate": "\u4f4e\u9541\u8840\u75c7",
+            "entity_id": "D100009",
+            "target_evidence": "magnesium_recheck",
+            "gap_type": "confirmation_gap",
+            "gap_value": 0.62,
+            "candidate_score_at_decision": 0.99,
+            "expected_transition": {"positive": "PrimaryEligible"},
+            "closure_exams": ["\u9541\u8d1f\u8377\u8bd5\u9a8c"],
+        }
+        second = {
+            "gap_id": "G-B",
+            "candidate": "\u7ef4\u751f\u7d20D\u7f3a\u4e4f\u6027\u4f5d\u507b\u75c5",
+            "entity_id": "D100010",
+            "target_evidence": "vitamin_d_low",
+            "gap_type": "confirmation_gap",
+            "gap_value": 0.91,
+            "candidate_score_at_decision": 0.41,
+            "expected_transition": {"positive": "PrimaryEligible"},
+            "closure_exams": ["\u7ef4\u751f\u7d20D\u68c0\u6d4b"],
+        }
+
+        def run(gaps):
+            return strategy.recommend(
+                collected_info={"symptoms": ["\u817f\u75db"]},
+                candidate_diseases=[],
+                proposed_items=[],
+                existing_results={},
+                judge_decision={
+                    "primary_status": "deferred",
+                    "needs_discriminating_exams": True,
+                    "active_evidence_gaps": gaps,
+                },
+            )["items"]
+
+        self.assertEqual(run([first, second]), run([
+            {**first, "candidate_score_at_decision": 0.10},
+            {**second, "candidate_score_at_decision": 0.99},
+        ]))
+
     def test_leukemia_deferred_gap_closure_beats_urinary_and_generic_exams(self):
         strategy = ExamStrategyAgent(
             KnowledgeBase("data/ref_data"),

@@ -339,6 +339,32 @@ _FALLBACK_DISEASE_METADATA = {
 
 
 @dataclass
+class EvidenceGapValue:
+    gap_id: str
+    entity_id: str
+    candidate: str
+    target_evidence: str
+    gap_type: str
+    gap_value: float
+    gap_value_components: Dict[str, float] = field(default_factory=dict)
+    expected_transition: Dict[str, Any] = field(default_factory=dict)
+    closure_exams: List[str] = field(default_factory=list)
+    hard_contradiction: bool = False
+    already_attempted_exams: List[str] = field(default_factory=list)
+    candidate_score_at_decision: float = 0.0
+    score_gap_decoupled: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = dict(self.metadata or {})
+        data = asdict(self)
+        metadata = data.pop("metadata", {})
+        payload.update(metadata)
+        payload.update(data)
+        return payload
+
+
+@dataclass
 class JudgeCandidateReview:
     diagnosis: str
     role: str
@@ -374,6 +400,9 @@ class JudgeCandidateReview:
     exam_followup_authorized: bool = False
     submission_authorized: bool = False
     evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    gap_values: List[Dict[str, Any]] = field(default_factory=list)
+    max_gap_value: float = 0.0
+    actionable_gap_count: int = 0
     deferred_priority: float = 0.0
     deferred_priority_components: Dict[str, float] = field(default_factory=dict)
     exam_priority_override: bool = False
@@ -428,6 +457,7 @@ class JudgeDecision:
     discriminating_exam_tasks: List[Dict[str, Any]] = field(default_factory=list)
     required_gap_by_candidate: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
     high_value_gap_candidates: List[str] = field(default_factory=list)
+    active_evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
     deferred_evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
     exam_priority_overrides: List[Dict[str, Any]] = field(default_factory=list)
     deferred_gap_closure_tasks: List[Dict[str, Any]] = field(default_factory=list)
@@ -2589,6 +2619,9 @@ class DiagnosisJudge:
                 continue
             if self._eligibility_status(candidate) != DEFERRED:
                 setattr(candidate, "evidence_gaps", [])
+                setattr(candidate, "gap_values", [])
+                setattr(candidate, "max_gap_value", 0.0)
+                setattr(candidate, "actionable_gap_count", 0)
                 setattr(candidate, "deferred_priority", 0.0)
                 setattr(candidate, "deferred_priority_components", {})
                 setattr(candidate, "exam_priority_override", False)
@@ -2596,20 +2629,25 @@ class DiagnosisJudge:
                 setattr(candidate, "deferred_priority_status", "")
                 continue
             gaps = self._candidate_evidence_gaps(candidate)
-            components = self._deferred_priority_components(candidate, gaps)
-            priority = round(
-                components["clinical_value"]
-                + components["evidence_support"]
-                + components["expected_information_gain"]
-                + components["eligibility_change_potential"]
-                + components["missed_diagnosis_risk"]
-                - components["exam_cost"]
-                - components["exam_risk"]
-                - components["redundancy"],
-                4,
+            valued_gaps = [self._with_gap_value(candidate, gap) for gap in gaps]
+            actionable_gaps = [
+                gap for gap in valued_gaps if self._actionable_gap_value(candidate, gap)
+            ]
+            max_gap_value = max(
+                [float(gap.get("gap_value") or 0.0) for gap in actionable_gaps],
+                default=0.0,
             )
-            override = self._deferred_gap_priority_override(candidate, gaps, components)
+            components = self._candidate_gap_value_components(actionable_gaps)
+            priority = max_gap_value
+            override = self._deferred_gap_priority_override(
+                candidate,
+                actionable_gaps,
+                components,
+            )
             setattr(candidate, "evidence_gaps", gaps)
+            setattr(candidate, "gap_values", valued_gaps)
+            setattr(candidate, "max_gap_value", max_gap_value)
+            setattr(candidate, "actionable_gap_count", len(actionable_gaps))
             setattr(candidate, "deferred_priority", priority)
             setattr(candidate, "deferred_priority_components", components)
             setattr(candidate, "exam_priority_override", override)
@@ -2738,6 +2776,181 @@ class DiagnosisJudge:
         safe_target = "".join(ch if ch.isalnum() else "_" for ch in target)[:32]
         return f"G-{safe_name}-{safe_type}-{index}-{safe_target}"
 
+    def _with_gap_value(self, candidate: Any, gap: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(gap or {})
+        closure_exams = [
+            str(exam or "").strip()
+            for exam in result.get("closure_exams", []) or []
+            if str(exam or "").strip()
+        ]
+        components = self._gap_value_components(candidate, result, closure_exams)
+        gap_value = round(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    components["clinical_impact"]
+                    + components["decision_change_potential"]
+                    + components["evidence_specificity"]
+                    + components["uncertainty_reduction"]
+                    + components["closure_exam_quality"]
+                    + components["missed_diagnosis_risk"]
+                    - components["redundancy"]
+                    - components["exam_cost"]
+                    - components["exam_risk"],
+                ),
+            ),
+            4,
+        )
+        return EvidenceGapValue(
+            gap_id=str(result.get("gap_id") or ""),
+            entity_id=str(result.get("entity_id") or getattr(candidate, "entity_id", "") or ""),
+            candidate=str(result.get("candidate") or self._name(candidate)),
+            target_evidence=str(result.get("target_evidence") or ""),
+            gap_type=str(result.get("gap_type") or ""),
+            gap_value=gap_value,
+            gap_value_components=components,
+            expected_transition=dict(result.get("expected_transition") or {}),
+            closure_exams=closure_exams,
+            hard_contradiction=bool(
+                result.get("hard_contradiction")
+                or getattr(candidate, "hard_contradiction", False)
+            ),
+            already_attempted_exams=list(result.get("already_attempted_exams") or []),
+            candidate_score_at_decision=float(getattr(candidate, "score", 0.0) or 0.0),
+            score_gap_decoupled=True,
+            metadata=result,
+        ).to_dict()
+
+    def _gap_value_components(
+        self,
+        candidate: Any,
+        gap: Dict[str, Any],
+        closure_exams: Sequence[str],
+    ) -> Dict[str, float]:
+        best_closure = self._best_gap_closure_quality(candidate, gap, closure_exams)
+        return {
+            "clinical_impact": self._gap_clinical_impact(candidate, gap),
+            "decision_change_potential": self._gap_decision_change_potential(candidate, gap),
+            "evidence_specificity": self._gap_evidence_specificity(candidate, gap),
+            "uncertainty_reduction": self._gap_uncertainty_reduction(candidate, gap),
+            "closure_exam_quality": best_closure,
+            "missed_diagnosis_risk": self._gap_missed_diagnosis_risk(candidate, gap),
+            "redundancy": self._gap_redundancy(candidate, gap, closure_exams),
+            "exam_cost": min(0.05, 0.14 * self._exam_cost(closure_exams)),
+            "exam_risk": min(0.05, 0.18 * self._exam_risk(closure_exams)),
+        }
+
+    def _candidate_gap_value_components(
+        self,
+        gaps: Sequence[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        if not gaps:
+            return {}
+        best = max(gaps, key=lambda item: float(item.get("gap_value") or 0.0))
+        return dict(best.get("gap_value_components") or {})
+
+    def _actionable_gap_value(self, candidate: Any, gap: Dict[str, Any]) -> bool:
+        if not gap or getattr(candidate, "hard_contradiction", False):
+            return False
+        if not gap.get("closure_exams"):
+            return False
+        if float(gap.get("gap_value") or 0.0) <= 0.0:
+            return False
+        transition = gap.get("expected_transition") or {}
+        return bool(transition.get("positive") or transition.get("negative"))
+
+    def _best_gap_closure_quality(
+        self,
+        candidate: Any,
+        gap: Dict[str, Any],
+        closure_exams: Sequence[str],
+    ) -> float:
+        values: List[float] = []
+        for exam in closure_exams or []:
+            resolution = self._gap_closure_exam_resolution(exam, candidate)
+            coverage = self._gap_specific_exam_coverage(candidate, gap, exam, resolution)
+            resolution_type = str(resolution.get("resolution_type") or "")
+            resolution_bonus = (
+                0.03
+                if resolution_type in _FULL_CLOSURE_RESOLUTION_TYPES
+                else 0.015
+                if resolution_type == PARTIAL_SUBSTITUTE
+                else 0.0
+            )
+            values.append(min(0.18, 0.15 * float(coverage or 0.0) + resolution_bonus))
+        return round(max(values, default=0.0), 4)
+
+    def _gap_clinical_impact(self, candidate: Any, gap: Dict[str, Any]) -> float:
+        if self._critical_risk_candidate(candidate):
+            return 0.16
+        if self._priority(candidate):
+            return 0.12
+        if str((gap or {}).get("importance") or "").lower() == "critical":
+            return 0.10
+        return 0.06
+
+    @staticmethod
+    def _gap_decision_change_potential(candidate: Any, gap: Dict[str, Any]) -> float:
+        transition = gap.get("expected_transition") or {}
+        positive = str(transition.get("positive") or "").lower()
+        negative = str(transition.get("negative") or "").lower()
+        if "primary" in positive and (
+            "differential" in negative or "excluded" in negative or "reject" in negative
+        ):
+            return 0.22
+        if "primary" in positive:
+            return 0.18
+        if "differential" in negative or "excluded" in negative:
+            return 0.14
+        return 0.08
+
+    def _gap_evidence_specificity(self, candidate: Any, gap: Dict[str, Any]) -> float:
+        target = str((gap or {}).get("target_evidence") or "").lower()
+        if any(
+            token in target
+            for token in (
+                "cta",
+                "vascular",
+                "shunt",
+                "blast",
+                "bone_marrow",
+                "vitamin_d_low",
+                "bone_deformity",
+                "culture_positive",
+                "anca_positive",
+            )
+        ):
+            return 0.15
+        if str((gap or {}).get("gap_type") or "") in {
+            "confirmation_gap",
+            "derived_pattern_gap",
+        }:
+            return 0.12
+        return 0.07
+
+    @staticmethod
+    def _gap_uncertainty_reduction(candidate: Any, gap: Dict[str, Any]) -> float:
+        gap_type = str((gap or {}).get("gap_type") or "")
+        if gap_type in {"confirmation_gap", "derived_pattern_gap"}:
+            return 0.15
+        if gap_type == "observed_evidence_gap":
+            return 0.13
+        return 0.08
+
+    def _gap_missed_diagnosis_risk(self, candidate: Any, gap: Dict[str, Any]) -> float:
+        if self._critical_risk_candidate(candidate):
+            return 0.13
+        if self._priority(candidate):
+            return 0.09
+        return 0.04
+
+    @staticmethod
+    def _gap_redundancy(candidate: Any, gap: Dict[str, Any], closure_exams: Sequence[str]) -> float:
+        attempts = len(gap.get("already_attempted_exams") or [])
+        duplicate_exam_penalty = max(0, len(list(closure_exams or [])) - len(set(closure_exams or [])))
+        return round(min(0.08, 0.025 * attempts + 0.02 * duplicate_exam_penalty), 4)
+
     def _deferred_priority_components(
         self,
         candidate: Any,
@@ -2777,7 +2990,7 @@ class DiagnosisJudge:
             return False
         if not gaps or not any(gap.get("closure_exams") for gap in gaps):
             return False
-        support_score = components.get("evidence_support", 0.0)
+        support_score = self._verified_support_score(candidate)
         if support_score <= 0.0:
             return False
         if self._critical_risk_candidate(candidate):
@@ -2787,10 +3000,7 @@ class DiagnosisJudge:
             return False
         if not self._deferred_high_value_candidate(candidate):
             return False
-        return (
-            components.get("expected_information_gain", 0.0) > 0.0
-            and components.get("eligibility_change_potential", 0.0) > 0.0
-        )
+        return max(float(gap.get("gap_value") or 0.0) for gap in gaps) >= 0.58
 
     def _deferred_high_value_candidate(self, candidate: Any) -> bool:
         if self._explicit_deferred_high_value(candidate):
@@ -3019,9 +3229,9 @@ class DiagnosisJudge:
         candidates = sorted(
             [item for item in pool or [] if self._exam_priority_override_candidate(item)],
             key=lambda item: (
-                float(getattr(item, "deferred_priority", 0.0) or 0.0),
+                float(getattr(item, "max_gap_value", 0.0) or 0.0),
+                int(getattr(item, "actionable_gap_count", 0) or 0),
                 self._verified_support_score(item),
-                self._judge_score(item),
             ),
             reverse=True,
         )
@@ -3029,11 +3239,19 @@ class DiagnosisJudge:
             diagnosis = self._name(candidate)
             candidate_task_count = 0
             candidate_task_limit = min(3, max(1, self.discriminating_exam_max_items))
-            for gap in getattr(candidate, "evidence_gaps", []) or []:
+            candidate_gaps = sorted(
+                [
+                    gap
+                    for gap in getattr(candidate, "gap_values", []) or []
+                    if isinstance(gap, dict)
+                    and self._actionable_gap_value(candidate, gap)
+                ],
+                key=lambda gap: float(gap.get("gap_value") or 0.0),
+                reverse=True,
+            )
+            for gap_value_rank, gap in enumerate(candidate_gaps, start=1):
                 if candidate_task_count >= candidate_task_limit:
                     break
-                if not isinstance(gap, dict):
-                    continue
                 gap_id = str(gap.get("gap_id") or "").strip()
                 target = str(gap.get("target_evidence") or "").strip()
                 closure_exam_items = [
@@ -3094,13 +3312,22 @@ class DiagnosisJudge:
                             "target_candidate_count": 1,
                             "information_gain_hint": min(
                                 1.0,
-                                max(0.82, float(getattr(candidate, "deferred_priority", 0.0) or 0.0) / 4.0),
+                                max(0.50, float(gap.get("gap_value") or 0.0)),
                             ),
                             "exam_source": "deferred_gap_closure_exam",
                             "priority_override": True,
                             "priority_bucket": "high_value_deferred_gap_closure",
                             "closure_rank": closure_rank,
                             "closure_priority": closure_priority,
+                            "gap_value_rank": gap_value_rank,
+                            "source_gap_value": float(gap.get("gap_value") or 0.0),
+                            "gap_value_components": dict(
+                                gap.get("gap_value_components") or {}
+                            ),
+                            "candidate_score_at_decision": float(
+                                getattr(candidate, "score", 0.0) or 0.0
+                            ),
+                            "score_gap_decoupled": True,
                             "original_closure_exam_index": original_index,
                             "requested_exam": str(
                                 resolution.get("requested_exam") or exam
@@ -3109,6 +3336,15 @@ class DiagnosisJudge:
                             "resolution_type": resolution_type,
                             "diagnostic_coverage": diagnostic_coverage,
                             "gap_diagnostic_coverage": gap_coverage,
+                            "exam_gap_closure_value": round(
+                                min(
+                                    1.0,
+                                    0.62 * float(gap.get("gap_value") or 0.0)
+                                    + 0.28 * float(gap_coverage or 0.0)
+                                    + 0.10 * min(1.0, closure_priority / 100.0),
+                                ),
+                                4,
+                            ),
                             "exam_resolution": dict(resolution),
                             "override_reason": str(
                                 getattr(candidate, "exam_priority_override_reason", "") or ""
@@ -3286,6 +3522,12 @@ class DiagnosisJudge:
         pool: Sequence[Any],
         tasks: Sequence[Dict[str, Any]],
     ) -> None:
+        active_gaps = [
+            dict(gap)
+            for candidate in pool or []
+            for gap in getattr(candidate, "gap_values", []) or []
+            if isinstance(gap, dict)
+        ]
         gaps = [
             dict(gap)
             for candidate in pool or []
@@ -3310,6 +3552,11 @@ class DiagnosisJudge:
                     "deferred_priority_components": dict(
                         getattr(candidate, "deferred_priority_components", {}) or {}
                     ),
+                    "max_gap_value": float(getattr(candidate, "max_gap_value", 0.0) or 0.0),
+                    "actionable_gap_count": int(
+                        getattr(candidate, "actionable_gap_count", 0) or 0
+                    ),
+                    "gap_values": list(getattr(candidate, "gap_values", []) or []),
                     "evidence_gaps": list(
                         getattr(candidate, "evidence_gaps", []) or []
                     ),
@@ -3339,6 +3586,14 @@ class DiagnosisJudge:
             for gap_id in task.get("target_gaps", []) or []
             if str(gap_id or "")
         }
+        ranked_active_gaps = sorted(
+            active_gaps,
+            key=lambda item: float(item.get("gap_value") or 0.0),
+            reverse=True,
+        )
+        for index, gap in enumerate(ranked_active_gaps, start=1):
+            gap["gap_value_rank"] = index
+        decision.active_evidence_gaps = ranked_active_gaps
         decision.deferred_evidence_gaps = gaps
         decision.exam_priority_overrides = overrides
         decision.deferred_gap_closure_tasks = closure_tasks
@@ -3502,8 +3757,14 @@ class DiagnosisJudge:
             bucket = DiagnosisJudge._exam_type_priority(exam_type)
         closure_priority = int((task or {}).get("closure_priority") or 0)
         closure_rank = int((task or {}).get("closure_rank") or 9999)
+        source_gap_value = float((task or {}).get("source_gap_value") or 0.0)
+        exam_gap_closure_value = float(
+            (task or {}).get("exam_gap_closure_value") or 0.0
+        )
         return (
             bucket,
+            source_gap_value,
+            exam_gap_closure_value,
             closure_priority,
             -closure_rank,
             float((task or {}).get("information_gain_hint") or 0.0),
@@ -4483,6 +4744,13 @@ class DiagnosisJudge:
                         and self._eligibility_status(candidate) == PRIMARY_ELIGIBLE
                     ),
                     evidence_gaps=list(getattr(candidate, "evidence_gaps", []) or [])[:4],
+                    gap_values=list(getattr(candidate, "gap_values", []) or [])[:4],
+                    max_gap_value=float(
+                        getattr(candidate, "max_gap_value", 0.0) or 0.0
+                    ),
+                    actionable_gap_count=int(
+                        getattr(candidate, "actionable_gap_count", 0) or 0
+                    ),
                     deferred_priority=float(
                         getattr(candidate, "deferred_priority", 0.0) or 0.0
                     ),

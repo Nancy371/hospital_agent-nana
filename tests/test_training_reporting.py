@@ -49,6 +49,8 @@ class TrainingReportingTests(unittest.TestCase):
                     "residual_core_evidence_count": 1,
                     "discriminating_exam_recall": 0.5,
                     "exam_information_gain": 0.45,
+                    "gap_value_exam_selection_rate": 0.9,
+                    "reserved_highest_gap_survival_rate": 1.0,
                     "special_discriminator_rate": 0.75,
                     "multi_candidate_exam_rate": 0.8,
                     "generic_exam_suppression_count": 3,
@@ -121,6 +123,8 @@ class TrainingReportingTests(unittest.TestCase):
         self.assertEqual(summary["residual_core_evidence_count"], 1.0)
         self.assertEqual(summary["discriminating_exam_recall"], 0.5)
         self.assertEqual(summary["exam_information_gain"], 0.45)
+        self.assertEqual(summary["gap_value_exam_selection_rate"], 0.9)
+        self.assertEqual(summary["reserved_highest_gap_survival_rate"], 1.0)
         self.assertEqual(summary["special_discriminator_rate"], 0.75)
         self.assertEqual(summary["multi_candidate_exam_rate"], 0.8)
         self.assertEqual(summary["generic_exam_suppression_count"], 3.0)

@@ -778,6 +778,23 @@ class ExamStrategyAgent:
                     task_by_exam.get(item, {}).get("gap_diagnostic_coverage")
                     or 0.0
                 ),
+                "source_gap_value": float(
+                    task_by_exam.get(item, {}).get("source_gap_value") or 0.0
+                ),
+                "gap_value_rank": task_by_exam.get(item, {}).get("gap_value_rank"),
+                "gap_value_components": dict(
+                    task_by_exam.get(item, {}).get("gap_value_components") or {}
+                ),
+                "exam_gap_closure_value": float(
+                    task_by_exam.get(item, {}).get("exam_gap_closure_value") or 0.0
+                ),
+                "candidate_score_at_decision": float(
+                    task_by_exam.get(item, {}).get("candidate_score_at_decision")
+                    or 0.0
+                ),
+                "score_gap_decoupled": bool(
+                    task_by_exam.get(item, {}).get("score_gap_decoupled")
+                ),
                 "source_decision_version": payload.get("decision_version")
                 or payload.get("case_version")
                 or 0,
@@ -823,6 +840,7 @@ class ExamStrategyAgent:
             for item in payload.get(key, []) or []:
                 if isinstance(item, dict) and str(item.get("exam") or "").strip():
                     tasks.append(dict(item))
+        tasks.extend(self._exam_tasks_from_active_gaps(payload))
         tasks.extend(self._exam_tasks_from_priority_overrides(payload))
 
         result: List[Dict[str, Any]] = []
@@ -839,6 +857,88 @@ class ExamStrategyAgent:
             seen.add(key)
             result.append(task)
         return result
+
+    def _exam_tasks_from_active_gaps(
+        self,
+        payload: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        active_gaps = [
+            gap
+            for gap in payload.get("active_evidence_gaps", []) or []
+            if isinstance(gap, dict)
+            and float(gap.get("gap_value") or 0.0) > 0.0
+            and gap.get("closure_exams")
+        ]
+        active_gaps.sort(
+            key=lambda gap: float(gap.get("gap_value") or 0.0),
+            reverse=True,
+        )
+        for fallback_gap_rank, gap in enumerate(active_gaps, start=1):
+            gap_rank = int(gap.get("gap_value_rank") or fallback_gap_rank)
+            candidate = str(gap.get("candidate") or "").strip()
+            entity_id = str(gap.get("entity_id") or "").strip()
+            target_candidates = [item for item in (candidate, entity_id) if item]
+            gap_id = str(gap.get("gap_id") or "").strip()
+            target = str(gap.get("target_evidence") or "").strip()
+            gap_value = float(gap.get("gap_value") or 0.0)
+            if gap_value < 0.58:
+                continue
+            for exam_rank, exam in enumerate(gap.get("closure_exams", []) or [], start=1):
+                exam_text = str(exam or "").strip()
+                if not exam_text:
+                    continue
+                resolution = self.exam_resolver.resolve(
+                    exam_text,
+                    candidate=candidate or entity_id or None,
+                )
+                coverage = float(resolution.diagnostic_coverage or 0.0)
+                closure_priority = max(0, 101 - exam_rank)
+                tasks.append(
+                    {
+                        "exam": exam_text,
+                        "target_candidates": target_candidates,
+                        "target_findings": [target] if target else [],
+                        "target_gap": gap_id,
+                        "target_gaps": [gap_id] if gap_id else [],
+                        "target_claims": [target] if target else [],
+                        "evidence_gap": dict(gap),
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "expected_effect": "close_highest_value_evidence_gap",
+                        "expected_transition": dict(gap.get("expected_transition") or {}),
+                        "source": ["active_evidence_gap"],
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": exam_rank,
+                        "closure_priority": closure_priority,
+                        "information_gain_hint": gap_value,
+                        "source_gap_value": gap_value,
+                        "gap_value_rank": gap_rank,
+                        "gap_value_components": dict(gap.get("gap_value_components") or {}),
+                        "candidate_score_at_decision": float(
+                            gap.get("candidate_score_at_decision") or 0.0
+                        ),
+                        "score_gap_decoupled": True,
+                        "requested_exam": exam_text,
+                        "resolved_exam": resolution.resolved_exam or exam_text,
+                        "resolution_type": resolution.resolution_type,
+                        "diagnostic_coverage": coverage,
+                        "gap_diagnostic_coverage": coverage,
+                        "exam_gap_closure_value": round(
+                            min(
+                                1.0,
+                                0.62 * gap_value
+                                + 0.28 * coverage
+                                + 0.10 * min(1.0, closure_priority / 100.0),
+                            ),
+                            4,
+                        ),
+                        "exam_resolution": resolution.to_dict(),
+                        "override_reason": "highest-value evidence gap closure",
+                    }
+                )
+        return tasks
 
     def _exam_tasks_from_priority_overrides(
         self,
@@ -883,8 +983,24 @@ class ExamStrategyAgent:
                             "closure_rank": rank,
                             "closure_priority": max(0, 101 - rank),
                             "information_gain_hint": float(
-                                override.get("deferred_priority") or 0.9
+                                gap.get("gap_value")
+                                or override.get("max_gap_value")
+                                or override.get("deferred_priority")
+                                or 0.9
                             ),
+                            "source_gap_value": float(
+                                gap.get("gap_value")
+                                or override.get("max_gap_value")
+                                or 0.0
+                            ),
+                            "gap_value_rank": int(gap.get("gap_value_rank") or rank),
+                            "gap_value_components": dict(
+                                gap.get("gap_value_components") or {}
+                            ),
+                            "candidate_score_at_decision": float(
+                                gap.get("candidate_score_at_decision") or 0.0
+                            ),
+                            "score_gap_decoupled": True,
                             "requested_exam": exam_text,
                             "resolved_exam": resolution.resolved_exam or exam_text,
                             "resolution_type": resolution.resolution_type,
@@ -893,6 +1009,20 @@ class ExamStrategyAgent:
                             ),
                             "gap_diagnostic_coverage": float(
                                 resolution.diagnostic_coverage or 0.0
+                            ),
+                            "exam_gap_closure_value": round(
+                                min(
+                                    1.0,
+                                    0.62
+                                    * float(
+                                        gap.get("gap_value")
+                                        or override.get("max_gap_value")
+                                        or 0.0
+                                    )
+                                    + 0.28 * float(resolution.diagnostic_coverage or 0.0)
+                                    + 0.10 * max(0.0, (101 - rank) / 100.0),
+                                ),
+                                4,
                             ),
                             "exam_resolution": resolution.to_dict(),
                             "override_reason": str(
@@ -1029,6 +1159,7 @@ class ExamStrategyAgent:
                 "evidence_gap_targets",
                 "discriminating_exams",
                 "discriminating_exam_tasks",
+                "active_evidence_gaps",
                 "deferred_gap_closure_tasks",
                 "exam_priority_overrides",
                 "discriminating_findings",
@@ -1174,6 +1305,26 @@ class ExamStrategyAgent:
             int(existing.get("closure_rank") or 9999),
             int(incoming.get("closure_rank") or 9999),
         )
+        result["source_gap_value"] = max(
+            float(existing.get("source_gap_value") or 0.0),
+            float(incoming.get("source_gap_value") or 0.0),
+        )
+        result["exam_gap_closure_value"] = max(
+            float(existing.get("exam_gap_closure_value") or 0.0),
+            float(incoming.get("exam_gap_closure_value") or 0.0),
+        )
+        result["score_gap_decoupled"] = bool(
+            existing.get("score_gap_decoupled") or incoming.get("score_gap_decoupled")
+        )
+        if incoming.get("gap_value_components") and (
+            float(incoming.get("source_gap_value") or 0.0)
+            >= float(existing.get("source_gap_value") or 0.0)
+        ):
+            result["gap_value_components"] = dict(incoming.get("gap_value_components") or {})
+            result["gap_value_rank"] = incoming.get("gap_value_rank")
+            result["candidate_score_at_decision"] = incoming.get(
+                "candidate_score_at_decision"
+            )
         if (
             keep_incoming
             and incoming.get("exam_source") == "deferred_gap_closure_exam"
@@ -1194,6 +1345,12 @@ class ExamStrategyAgent:
                 "resolution_type",
                 "diagnostic_coverage",
                 "gap_diagnostic_coverage",
+                "source_gap_value",
+                "gap_value_rank",
+                "gap_value_components",
+                "exam_gap_closure_value",
+                "candidate_score_at_decision",
+                "score_gap_decoupled",
                 "exam_resolution",
             ):
                 if incoming.get(key) not in (None, "", [], {}):
@@ -1280,6 +1437,10 @@ class ExamStrategyAgent:
         }.get(bucket_name, 0)
         closure_priority = int((task or {}).get("closure_priority") or 0)
         closure_rank = int((task or {}).get("closure_rank") or 9999)
+        source_gap_value = float((task or {}).get("source_gap_value") or 0.0)
+        exam_gap_closure_value = float(
+            (task or {}).get("exam_gap_closure_value") or 0.0
+        )
         gap_coverage = float((task or {}).get("gap_diagnostic_coverage") or 0.0)
         diagnostic_coverage = float((task or {}).get("diagnostic_coverage") or 0.0)
         specialty_followup_priority = (
@@ -1289,6 +1450,8 @@ class ExamStrategyAgent:
         )
         return (
             bucket,
+            source_gap_value,
+            exam_gap_closure_value,
             closure_priority,
             gap_coverage,
             diagnostic_coverage,

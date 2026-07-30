@@ -235,6 +235,9 @@ class CandidateScore:
     submission_authorized: bool = False
     eligibility_substatus: str = ""
     evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    gap_values: List[Dict[str, Any]] = field(default_factory=list)
+    max_gap_value: float = 0.0
+    actionable_gap_count: int = 0
     deferred_priority: float = 0.0
     deferred_priority_components: Dict[str, float] = field(default_factory=dict)
     exam_priority_override: bool = False

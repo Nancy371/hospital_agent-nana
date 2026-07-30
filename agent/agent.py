@@ -2031,6 +2031,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             for item in judge_payload.get("deferred_gap_closure_tasks", []) or []
             if isinstance(item, dict)
         ]
+        active_evidence_gaps = [
+            item
+            for item in judge_payload.get("active_evidence_gaps", []) or []
+            if isinstance(item, dict)
+        ]
         deferred_gap_target_ids = {
             str(gap.get("gap_id") or "")
             for item in exam_priority_overrides
@@ -2226,9 +2231,31 @@ class MyDoctorAgent(BaseDoctorAgent):
             if str(detail.get("exam_source") or "") == "deferred_gap_closure_exam"
             or bool(detail.get("priority_override"))
         ]
+        gap_value_ordered_details = [
+            detail
+            for detail in ordered_authorization_details
+            if bool(detail.get("score_gap_decoupled"))
+            or float(detail.get("source_gap_value") or 0.0) > 0.0
+        ]
         ordered_deferred_gap_ids = {
             str(gap_id or "")
             for detail in deferred_ordered_details
+            for gap_id in detail.get("target_gaps", []) or []
+            if str(gap_id or "")
+        }
+        top_gap_value = max(
+            [float(gap.get("gap_value") or 0.0) for gap in active_evidence_gaps],
+            default=0.0,
+        )
+        top_gap_ids = {
+            str(gap.get("gap_id") or "")
+            for gap in active_evidence_gaps
+            if str(gap.get("gap_id") or "")
+            and float(gap.get("gap_value") or 0.0) >= max(0.0, top_gap_value - 1e-9)
+        }
+        top_gap_ordered_ids = {
+            str(gap_id or "")
+            for detail in gap_value_ordered_details
             for gap_id in detail.get("target_gaps", []) or []
             if str(gap_id or "")
         }
@@ -2236,6 +2263,16 @@ class MyDoctorAgent(BaseDoctorAgent):
             len(deferred_gap_target_ids & ordered_deferred_gap_ids)
             / max(1, len(deferred_gap_target_ids))
             if deferred_gap_target_ids
+            else None
+        )
+        gap_value_exam_selection_rate = (
+            len(gap_value_ordered_details) / max(1, len(ordered_exam_names))
+            if ordered_exam_names and active_evidence_gaps
+            else None
+        )
+        reserved_highest_gap_survival_rate = (
+            len(top_gap_ids & top_gap_ordered_ids) / max(1, len(top_gap_ids))
+            if top_gap_ids
             else None
         )
         exam_priority_alignment = (
@@ -2561,6 +2598,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "exam_information_gain": exam_information_gain,
                 "deferred_gap_closure_rate": deferred_exam_coverage,
                 "deferred_exam_coverage": deferred_exam_coverage,
+                "gap_value_exam_selection_rate": gap_value_exam_selection_rate,
+                "reserved_highest_gap_survival_rate": reserved_highest_gap_survival_rate,
                 "exam_priority_alignment": exam_priority_alignment,
                 "wrong_primary_exam_drift": wrong_primary_exam_drift,
                 "deferred_gap_count": len(deferred_evidence_gaps),
@@ -2753,7 +2792,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "deferred_evidence_gaps": deferred_evidence_gaps,
                 "exam_priority_overrides": exam_priority_overrides,
                 "deferred_gap_closure_tasks": deferred_gap_closure_tasks,
+                "active_evidence_gaps": active_evidence_gaps,
                 "deferred_exam_coverage": deferred_exam_coverage,
+                "gap_value_exam_selection_rate": gap_value_exam_selection_rate,
+                "reserved_highest_gap_survival_rate": reserved_highest_gap_survival_rate,
                 "exam_priority_alignment": exam_priority_alignment,
                 "wrong_primary_exam_drift": wrong_primary_exam_drift,
                 "deferred_substatus_distribution": dict(
@@ -4134,8 +4176,27 @@ class MyDoctorAgent(BaseDoctorAgent):
             return []
         judge_payload = getattr(decision, "judge_decision", None) or {}
         needs_discriminating = bool(judge_payload.get("needs_discriminating_exams"))
-        targets = self._evidence_gap_target_diagnoses(decision)
-        if self._strict_primary_exam_stop_active(decision) and not needs_discriminating and not targets:
+        explicit_gap_targets = [
+            str(item).strip()
+            for item in (judge_payload.get("evidence_gap_targets") or [])
+            if str(item).strip()
+        ]
+        safe_gap_targets = self._evidence_gap_target_diagnoses(decision)
+        strict_stop = self._strict_primary_exam_stop_active(decision)
+        if strict_stop and not needs_discriminating:
+            safe_set = {
+                self.knowledge.normalize_diagnosis(str(item)) or str(item)
+                for item in safe_gap_targets
+                if str(item).strip()
+            }
+            targets = [
+                item
+                for item in dict.fromkeys(explicit_gap_targets)
+                if (self.knowledge.normalize_diagnosis(str(item)) or str(item)) in safe_set
+            ] or safe_gap_targets
+        else:
+            targets = list(dict.fromkeys(explicit_gap_targets)) or safe_gap_targets
+        if strict_stop and not needs_discriminating and not targets:
             return []
         if not targets and not needs_discriminating:
             return []
@@ -4171,6 +4232,40 @@ class MyDoctorAgent(BaseDoctorAgent):
                     + targets
                 )
             )
+            if targets:
+                target_set = {
+                    self.knowledge.normalize_diagnosis(str(item)) or str(item)
+                    for item in targets
+                    if str(item).strip()
+                }
+
+                def gap_targets_candidate(item: Dict[str, Any]) -> bool:
+                    candidate = str(item.get("candidate") or "").strip()
+                    normalized = self.knowledge.normalize_diagnosis(candidate) or candidate
+                    if normalized in target_set:
+                        return True
+                    return any(
+                        (self.knowledge.normalize_diagnosis(str(name)) or str(name))
+                        in target_set
+                        for name in item.get("target_candidates", []) or []
+                        if str(name).strip()
+                    )
+
+                strategy_judge_payload["active_evidence_gaps"] = [
+                    item
+                    for item in strategy_judge_payload.get("active_evidence_gaps", []) or []
+                    if isinstance(item, dict) and gap_targets_candidate(item)
+                ]
+                strategy_judge_payload["deferred_gap_closure_tasks"] = [
+                    item
+                    for item in strategy_judge_payload.get("deferred_gap_closure_tasks", []) or []
+                    if isinstance(item, dict) and gap_targets_candidate(item)
+                ]
+                strategy_judge_payload["exam_priority_overrides"] = [
+                    item
+                    for item in strategy_judge_payload.get("exam_priority_overrides", []) or []
+                    if isinstance(item, dict) and gap_targets_candidate(item)
+                ]
         else:
             proposed = list(dict.fromkeys(target_proposed + judge_proposed))
             # When a concrete evidence-gap target already exposes discriminating exams,

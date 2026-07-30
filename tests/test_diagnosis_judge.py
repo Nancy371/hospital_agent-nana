@@ -780,6 +780,96 @@ class DiagnosisJudgeTests(unittest.TestCase):
         self.assertEqual(decision.required_gap_authorized_diagnoses, [])
         self.assertFalse(payload["root_cause_arbitration"]["applied"])
 
+    def test_gap_value_is_emitted_separately_from_candidate_score(self):
+        low_magnesium = candidate(
+            LOW_MAGNESIUM,
+            0.89,
+            required=True,
+            diagnosis_type="metabolic",
+            specificity=0.90,
+            coverage=0.78,
+            residual=0.12,
+            core_coverage=0.78,
+            residual_core=0,
+            matched=["magnesium_load_retention_high", "magnesium_depletion"],
+            core_score=0.68,
+            diagnostic_score=0.86,
+        )
+        rickets = candidate(
+            RICKETS,
+            0.73,
+            required=False,
+            diagnosis_type="metabolic",
+            specificity=0.92,
+            coverage=0.52,
+            residual=0.48,
+            core_coverage=0.42,
+            residual_core=3,
+            matched=[
+                "symptom:leg_pain",
+                "symptom:waddling_gait",
+                "alp_elevated",
+                "hypocalcemia",
+            ],
+            gaps=["vitamin_d_low|bone_deformity"],
+            diagnostic_score=1.0,
+        )
+        rickets.required_gap_state = "actionable_gap"
+        rickets.component_scores["required_gap_state"] = "actionable_gap"
+        rickets.candidate_value = "high"
+
+        decision = self.run_candidates([low_magnesium, rickets])
+        payload = decision.judge_decision
+        rickets_gaps = [
+            gap
+            for gap in payload["active_evidence_gaps"]
+            if gap.get("candidate") == RICKETS
+        ]
+
+        self.assertTrue(rickets_gaps)
+        best_gap = rickets_gaps[0]
+        self.assertGreater(best_gap["gap_value"], 0.0)
+        self.assertEqual(best_gap["candidate_score_at_decision"], 0.73)
+        self.assertLess(best_gap["candidate_score_at_decision"], low_magnesium.score)
+        self.assertTrue(best_gap["score_gap_decoupled"])
+        self.assertIn("gap_value_components", best_gap)
+
+        reviews = {
+            item["diagnosis"]: item
+            for item in payload["reviews"]
+            if isinstance(item, dict)
+        }
+        self.assertEqual(reviews[RICKETS]["max_gap_value"], best_gap["gap_value"])
+        self.assertEqual(reviews[RICKETS]["deferred_priority"], best_gap["gap_value"])
+        self.assertGreater(reviews[RICKETS]["actionable_gap_count"], 0)
+
+        rickets_tasks = [
+            item
+            for item in payload["discriminating_exam_tasks"]
+            if RICKETS in item.get("target_candidates", [])
+            and item.get("exam_source") == "deferred_gap_closure_exam"
+        ]
+        self.assertTrue(rickets_tasks)
+        self.assertTrue(
+            any(
+                item.get("exam")
+                in {
+                    "\u7ef4\u751f\u7d20D\u68c0\u6d4b",
+                    "\u7532\u72b6\u65c1\u817a\u6fc0\u7d20\u68c0\u6d4b\uff08PTH\uff09",
+                    "X\u7ebf\u68c0\u67e5",
+                }
+                for item in rickets_tasks
+            )
+        )
+        self.assertTrue(
+            all(
+                item.get("source_gap_value") == best_gap["gap_value"]
+                and item.get("candidate_score_at_decision") == 0.73
+                and item.get("score_gap_decoupled")
+                for item in rickets_tasks
+            )
+        )
+
     def test_root_cause_arbitration_respects_upstream_contradiction(self):
         low_magnesium = candidate(
             LOW_MAGNESIUM,
