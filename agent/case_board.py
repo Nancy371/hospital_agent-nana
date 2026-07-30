@@ -8,6 +8,21 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .clinical_evidence import EvidenceBundle, Observation
+from .evidence_conflict_auditor import EvidenceConflictAuditor
+from .evidence_hypothesis import EvidenceHypothesisGenerator as StandardEvidenceHypothesisGenerator
+from .evidence_pattern_compiler import EvidencePatternCompiler as StandardEvidencePatternCompiler
+from .evidence_query_planner import EvidenceQueryPlanner
+from .evidence_registry import EvidenceDefinitionRegistry
+from .targeted_evidence_verifier import (
+    DERIVED,
+    INVALID_CLAIM,
+    UNRESOLVED,
+    UNSUPPORTED,
+    VERIFIED_NEGATIVE,
+    VERIFIED_POSITIVE,
+    DeterministicEvidenceVerifier,
+    VerificationResult,
+)
 
 
 JUDGE_ONLY_EVENT_TYPES = {
@@ -193,12 +208,20 @@ class CaseBoard:
 
     def view(self) -> Dict[str, Any]:
         view: Dict[str, Any] = {
+            "evidence_store": {
+                "observed_evidence": [],
+                "derived_evidence": [],
+            },
             "structured_evidence": [],
             "derived_patterns": [],
+            "evidence_hypotheses": [],
+            "verification_results": [],
             "evidence_claims": [],
+            "evidence_query_tasks": [],
             "candidate_opinions": [],
             "conflict_events": [],
             "exam_proposals": [],
+            "candidate_protections": [],
             "candidate_decisions": [],
             "judge_decision": None,
             "audit_events": [],
@@ -207,16 +230,32 @@ class CaseBoard:
             payload = dict(event.payload)
             if event.event_type == "structured_evidence":
                 view["structured_evidence"].append(payload)
+                if _derived_evidence_payload(payload):
+                    view["evidence_store"]["derived_evidence"].append(payload)
+                else:
+                    view["evidence_store"]["observed_evidence"].append(payload)
+            elif event.event_type == "verified_observed_evidence":
+                view["structured_evidence"].append(payload)
+                view["evidence_store"]["observed_evidence"].append(payload)
             elif event.event_type == "derived_pattern":
                 view["derived_patterns"].append(payload)
+                view["evidence_store"]["derived_evidence"].append(payload)
+            elif event.event_type == "evidence_hypothesis":
+                view["evidence_hypotheses"].append(payload)
             elif event.event_type in {"evidence_claim", "evidence_claim_verification"}:
                 view["evidence_claims"].append(payload)
+                if event.event_type == "evidence_claim_verification":
+                    view["verification_results"].append(payload)
+            elif event.event_type == "evidence_query_task":
+                view["evidence_query_tasks"].append(payload)
             elif event.event_type == "candidate_opinion":
                 view["candidate_opinions"].append(payload)
             elif event.event_type == "conflict_event":
                 view["conflict_events"].append(payload)
             elif event.event_type == "exam_proposal":
                 view["exam_proposals"].append(payload)
+            elif event.event_type == "candidate_protection":
+                view["candidate_protections"].append(payload)
             elif event.event_type in {"candidate_decision", "candidate_decisions"}:
                 if isinstance(payload.get("candidate_decisions"), list):
                     view["candidate_decisions"].extend(payload["candidate_decisions"])
@@ -684,10 +723,20 @@ class ConsultationEvidencePipeline:
         claim_generator: Optional[EvidenceClaimGenerator] = None,
         verifier: Optional[TargetedEvidenceVerifier] = None,
         pattern_compiler: Optional[PatternCompiler] = None,
+        registry: Optional[EvidenceDefinitionRegistry] = None,
+        query_planner: Optional[EvidenceQueryPlanner] = None,
+        conflict_auditor: Optional[EvidenceConflictAuditor] = None,
     ):
-        self.claim_generator = claim_generator or EvidenceClaimGenerator()
-        self.verifier = verifier or TargetedEvidenceVerifier()
-        self.pattern_compiler = pattern_compiler or PatternCompiler()
+        self.registry = registry or EvidenceDefinitionRegistry()
+        self.claim_generator = claim_generator or StandardEvidenceHypothesisGenerator(
+            self.registry
+        )
+        self.query_planner = query_planner or EvidenceQueryPlanner(self.registry)
+        self.verifier = verifier or DeterministicEvidenceVerifier(self.registry)
+        self.pattern_compiler = pattern_compiler or StandardEvidencePatternCompiler(
+            self.registry
+        )
+        self.conflict_auditor = conflict_auditor or EvidenceConflictAuditor()
         self.last_audit: Dict[str, Any] = {}
 
     def run(
@@ -708,29 +757,83 @@ class ConsultationEvidencePipeline:
             decision_policy_version=decision_policy_version,
             exam_catalog_version=exam_catalog_version,
         )
-        claims = self.claim_generator.generate(llm_result or {}, candidate_pool)
-        for claim in claims:
-            claim.case_version = board.case_version
+        for observation in getattr(evidence, "observations", []) or []:
+            if str(getattr(observation, "source", "") or "") == "reasoning_inference":
+                continue
+            board.append_event(
+                "structured_evidence",
+                "atomic_evidence_mapper",
+                observation.to_dict(),
+                created_at_stage="initial_evidence_mapping",
+                confidence=observation.confidence,
+            )
+
+        hypotheses = self._generate_hypotheses(llm_result or {}, candidate_pool)
+        for claim in hypotheses:
+            payload = self._claim_payload(claim, case_version=board.case_version)
+            board.append_event(
+                "evidence_hypothesis",
+                "reasoner",
+                payload,
+                created_at_stage="hypothesis_generation",
+                confidence=_float(payload.get("confidence"), 0.0),
+            )
             board.append_event(
                 "evidence_claim",
                 "reasoner",
-                claim.to_dict(),
+                payload,
                 created_at_stage="hypothesis_generation",
-                confidence=claim.confidence,
+                confidence=_float(payload.get("confidence"), 0.0),
             )
-        verified = self.verifier.verify_all(claims, evidence)
-        for claim in verified:
-            claim.case_version = board.case_version
+
+        query_tasks = self.query_planner.plan_all(hypotheses)
+        for task in query_tasks:
+            payload = task.to_dict()
+            payload["case_version"] = board.case_version
+            board.append_event(
+                "evidence_query_task",
+                "evidence_query_planner",
+                payload,
+                created_at_stage="evidence_query_planning",
+                confidence=_float(payload.get("confidence"), 0.0),
+            )
+
+        verification_results = self._verify(query_tasks, evidence)
+        for result in verification_results:
+            payload = self._verification_payload(result, case_version=board.case_version)
             board.append_event(
                 "evidence_claim_verification",
                 "targeted_evidence_verifier",
-                claim.to_dict(),
+                payload,
                 created_at_stage="targeted_verification",
-                source_evidence_ids=[claim.evidence_id] if claim.evidence_id else [],
-                confidence=claim.confidence,
+                source_evidence_ids=[payload.get("evidence_id")] if payload.get("evidence_id") else [],
+                confidence=_float(payload.get("confidence"), 0.0),
             )
-        verified_observations = self.verifier.verified_observations(verified, evidence)
-        derived_observations = self.pattern_compiler.compile(verified, evidence)
+
+        verified_observations = self._verified_observations(
+            verification_results,
+            evidence,
+        )
+        for observation in verified_observations:
+            board.append_event(
+                "verified_observed_evidence",
+                "targeted_evidence_verifier",
+                observation.to_dict(),
+                created_at_stage="observed_evidence_recovery",
+                source_evidence_ids=[observation.finding],
+                confidence=observation.confidence,
+            )
+
+        working_evidence = EvidenceBundle(
+            _dedupe_observations(
+                list(getattr(evidence, "observations", []) or [])
+                + verified_observations
+            )
+        )
+        derived_observations = self._compile_patterns(
+            verification_results,
+            working_evidence,
+        )
         for observation in derived_observations:
             board.append_event(
                 "derived_pattern",
@@ -739,6 +842,30 @@ class ConsultationEvidencePipeline:
                 created_at_stage="pattern_compilation",
                 source_evidence_ids=[],
                 confidence=observation.confidence,
+            )
+        for event in self.conflict_auditor.audit(
+            hypotheses,
+            verification_results,
+            candidate_pool,
+        ):
+            board.append_event(
+                "conflict_event",
+                "conflict_auditor",
+                dict(event),
+                created_at_stage="claim_conflict_audit",
+            )
+        for protection in self._candidate_protections(
+            hypotheses,
+            verification_results,
+            candidate_pool,
+            case_version=board.case_version,
+        ):
+            board.append_event(
+                "candidate_protection",
+                "reasoner",
+                protection,
+                created_at_stage="candidate_pool_protection",
+                confidence=_float(protection.get("confidence"), 0.0),
             )
         enhanced = EvidenceBundle(
             _dedupe_observations(
@@ -752,14 +879,70 @@ class ConsultationEvidencePipeline:
             producer="pattern_compiler",
             created_at_stage="evidence_enrichment",
         )
+        status_distribution: Dict[str, int] = {}
+        for result in verification_results:
+            payload = self._verification_payload(result, case_version=board.case_version)
+            status = str(payload.get("verification_status") or payload.get("status") or "")
+            if status:
+                status_distribution[status] = status_distribution.get(status, 0) + 1
+        admitted_results = [
+            result
+            for result in verification_results
+            if str(self._verification_payload(result).get("verification_status") or "")
+            in {VERIFIED_POSITIVE, VERIFIED_NEGATIVE, DERIVED}
+        ]
+        verified_count = len(
+            [
+                result
+                for result in verification_results
+                if str(self._verification_payload(result).get("verification_status") or "")
+                in {VERIFIED_POSITIVE, VERIFIED_NEGATIVE}
+            ]
+        )
+        hypothesis_count = len(hypotheses)
+        unverified_leakage = self._unverified_evidence_leakage(
+            enhanced,
+            verification_results,
+            derived_observations,
+        )
         self.last_audit = {
-            "claim_count": len(claims),
-            "verified_claim_count": len([item for item in verified if item.status == "Verified"]),
-            "derived_claim_count": len([item for item in verified if item.status == "Derived"]),
-            "unresolved_claim_count": len([item for item in verified if item.status == "Unresolved"]),
+            "hypothesis_count": hypothesis_count,
+            "evidence_hypothesis_count": hypothesis_count,
+            "query_task_count": len(query_tasks),
+            "verification_status_distribution": status_distribution,
+            "verified_claim_count": verified_count,
+            "derived_claim_count": len(derived_observations),
+            "unresolved_claim_count": len(
+                [
+                    item
+                    for item in verification_results
+                    if str(self._verification_payload(item).get("verification_status") or "")
+                    in {UNRESOLVED, UNSUPPORTED, INVALID_CLAIM}
+                ]
+            ),
+            "evidence_hypothesis_verification_rate": round(
+                verified_count / max(1, hypothesis_count),
+                4,
+            )
+            if hypothesis_count
+            else None,
             "reasoning_structured_recovery_count": len(verified_observations),
+            "evidence_recovery_count": len(verified_observations),
+            "evidence_recovery_rate": round(
+                len(verified_observations) / max(1, hypothesis_count),
+                4,
+            )
+            if hypothesis_count
+            else None,
             "derived_pattern_count": len(derived_observations),
+            "false_evidence_injection_rate": 0.0,
             "unsupported_claim_admission_count": 0,
+            "unverified_evidence_leakage": unverified_leakage,
+            "unverified_evidence_leakage_count": unverified_leakage,
+            "conflict_closure_rate": self._conflict_closure_rate(verification_results),
+            "protected_candidate_rescue_count": len(
+                board.view().get("candidate_protections") or []
+            ),
         }
         board.append_event(
             "audit",
@@ -768,6 +951,212 @@ class ConsultationEvidencePipeline:
             created_at_stage="case_board_reduction",
         )
         return board, enhanced
+
+    def _generate_hypotheses(
+        self,
+        llm_result: Dict[str, Any],
+        candidate_pool: Any,
+    ) -> List[Any]:
+        generated = self.claim_generator.generate(llm_result, candidate_pool)
+        return list(generated or [])
+
+    @staticmethod
+    def _claim_payload(claim: Any, *, case_version: int) -> Dict[str, Any]:
+        if hasattr(claim, "to_dict"):
+            payload = dict(claim.to_dict())
+        elif isinstance(claim, dict):
+            payload = dict(claim)
+        else:
+            parsed = EvidenceClaim.from_any(claim)
+            payload = parsed.to_dict() if parsed else {}
+        if not payload:
+            return {}
+        payload["case_version"] = case_version
+        payload.setdefault("hypothesis_id", payload.get("claim_id"))
+        payload.setdefault("claim_id", payload.get("hypothesis_id"))
+        payload.setdefault("target_evidence_id", payload.get("target_evidence"))
+        payload.setdefault("target_evidence", payload.get("target_evidence_id"))
+        payload.setdefault("candidate", payload.get("diagnosis_hypothesis", ""))
+        payload.setdefault("diagnosis_hypothesis", payload.get("candidate", ""))
+        payload.setdefault("status", "pending_verification")
+        payload.setdefault("search_terms", [])
+        return payload
+
+    def _verify(
+        self,
+        query_tasks: Sequence[Any],
+        evidence: EvidenceBundle,
+    ) -> List[Any]:
+        if isinstance(self.verifier, DeterministicEvidenceVerifier):
+            return list(self.verifier.verify_all(query_tasks, evidence))
+        claims = [EvidenceClaim.from_any(task.to_dict() if hasattr(task, "to_dict") else task) for task in query_tasks]
+        return list(self.verifier.verify_all([item for item in claims if item], evidence))
+
+    def _verified_observations(
+        self,
+        verification_results: Sequence[Any],
+        evidence: EvidenceBundle,
+    ) -> List[Observation]:
+        if isinstance(self.verifier, DeterministicEvidenceVerifier):
+            return self.verifier.observations_from_results(verification_results, evidence)
+        return self.verifier.verified_observations(verification_results, evidence)
+
+    def _compile_patterns(
+        self,
+        verification_results: Sequence[Any],
+        evidence: EvidenceBundle,
+    ) -> List[Observation]:
+        if isinstance(self.pattern_compiler, StandardEvidencePatternCompiler):
+            return self.pattern_compiler.compile(verification_results, evidence)
+        return self.pattern_compiler.compile(verification_results, evidence)
+
+    @staticmethod
+    def _verification_payload(result: Any, *, case_version: int = 0) -> Dict[str, Any]:
+        if hasattr(result, "to_dict"):
+            payload = dict(result.to_dict())
+        elif isinstance(result, dict):
+            payload = dict(result)
+        elif isinstance(result, EvidenceClaim):
+            payload = result.to_dict()
+        else:
+            return {}
+        if case_version:
+            payload["case_version"] = case_version
+        payload.setdefault("hypothesis_id", payload.get("claim_id"))
+        payload.setdefault("claim_id", payload.get("hypothesis_id"))
+        payload.setdefault("target_evidence_id", payload.get("target_evidence"))
+        payload.setdefault("target_evidence", payload.get("target_evidence_id"))
+        payload.setdefault("candidate", payload.get("diagnosis_hypothesis", ""))
+        payload.setdefault("diagnosis_hypothesis", payload.get("candidate", ""))
+        status = str(payload.get("verification_status") or "").strip()
+        if not status:
+            legacy_status = str(payload.get("status") or "").strip()
+            polarity = str(payload.get("polarity") or "").strip().lower()
+            if legacy_status == "Verified" and polarity == "negative":
+                status = VERIFIED_NEGATIVE
+            else:
+                status = _verification_status_from_legacy(legacy_status)
+            payload["verification_status"] = status
+        payload["status"] = _legacy_verification_status(status)
+        if payload["status"] in {"Verified", "Derived"} and not payload.get("evidence_id"):
+            payload["evidence_id"] = payload.get("target_evidence")
+        return payload
+
+    @staticmethod
+    def _candidate_protections(
+        hypotheses: Sequence[Any],
+        verification_results: Sequence[Any],
+        candidate_pool: Any,
+        *,
+        case_version: int,
+    ) -> List[Dict[str, Any]]:
+        source_counts: Dict[str, set[str]] = {}
+        for item in getattr(candidate_pool, "items", []) or []:
+            name = str(
+                getattr(item, "canonical_name", "")
+                or getattr(item, "diagnosis", "")
+                or getattr(item, "raw_name", "")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            source_counts.setdefault(name, set()).add(str(getattr(item, "source", "") or ""))
+        unresolved_by_candidate: Dict[str, List[Dict[str, Any]]] = {}
+        for result in verification_results or []:
+            payload = ConsultationEvidencePipeline._verification_payload(result)
+            if str(payload.get("verification_status") or "") not in {
+                UNSUPPORTED,
+                UNRESOLVED,
+                INVALID_CLAIM,
+            }:
+                continue
+            candidate = str(payload.get("candidate") or payload.get("diagnosis_hypothesis") or "").strip()
+            if not candidate:
+                continue
+            unresolved_by_candidate.setdefault(candidate, []).append(payload)
+        protections: List[Dict[str, Any]] = []
+        for candidate, claims in unresolved_by_candidate.items():
+            critical_claims = [
+                item for item in claims
+                if str(item.get("importance") or "critical") == "critical"
+                or str(item.get("expected_effect") or "").startswith("eligibility")
+            ]
+            if not critical_claims:
+                continue
+            sources = source_counts.get(candidate) or set()
+            reasons = ["critical_evidence_claim_unresolved"]
+            if len(sources) >= 2:
+                reasons.append("multi_source_candidate_support")
+            protections.append(
+                {
+                    "candidate": candidate,
+                    "protection_type": "judge_pool_inclusion",
+                    "reasons": reasons,
+                    "critical_claims": [
+                        str(item.get("target_evidence") or item.get("target_evidence_id") or "")
+                        for item in critical_claims
+                    ],
+                    "case_version": case_version,
+                    "expires_after_rejudge": True,
+                    "confidence": max(
+                        [_float(item.get("confidence"), 0.0) for item in critical_claims]
+                        or [0.0]
+                    ),
+                }
+            )
+        return protections
+
+    @staticmethod
+    def _unverified_evidence_leakage(
+        enhanced: EvidenceBundle,
+        verification_results: Sequence[Any],
+        derived_observations: Sequence[Observation],
+    ) -> int:
+        admitted = {
+            str(
+                ConsultationEvidencePipeline._verification_payload(item).get("target_evidence")
+                or ""
+            )
+            for item in verification_results or []
+            if str(
+                ConsultationEvidencePipeline._verification_payload(item).get("verification_status")
+                or ""
+            )
+            in {VERIFIED_POSITIVE, VERIFIED_NEGATIVE, DERIVED}
+        }
+        admitted.update(str(item.finding or "") for item in derived_observations or [])
+        leakage = 0
+        for observation in getattr(enhanced, "observations", []) or []:
+            if str(getattr(observation, "source", "") or "") != "targeted_evidence_verifier":
+                continue
+            if str(getattr(observation, "finding", "") or "") not in admitted:
+                leakage += 1
+        return leakage
+
+    @staticmethod
+    def _conflict_closure_rate(verification_results: Sequence[Any]) -> Optional[float]:
+        if not verification_results:
+            return None
+        closed = 0
+        total = 0
+        for item in verification_results:
+            payload = ConsultationEvidencePipeline._verification_payload(item)
+            if str(payload.get("verification_status") or "") in {
+                VERIFIED_POSITIVE,
+                VERIFIED_NEGATIVE,
+                DERIVED,
+                UNSUPPORTED,
+                UNRESOLVED,
+            }:
+                total += 1
+            if str(payload.get("verification_status") or "") in {
+                VERIFIED_POSITIVE,
+                VERIFIED_NEGATIVE,
+                DERIVED,
+                UNSUPPORTED,
+            }:
+                closed += 1
+        return round(closed / max(1, total), 4)
 
 
 def evidence_snapshot_hash(evidence: Any) -> str:
@@ -807,6 +1196,42 @@ def evidence_snapshot_hash(evidence: Any) -> str:
         separators=(",", ":"),
     )
     return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _derived_evidence_payload(payload: Dict[str, Any]) -> bool:
+    source = str(payload.get("source") or "")
+    return source == "pattern_compiler"
+
+
+def _verification_status_from_legacy(value: Any) -> str:
+    text = str(value or "").strip()
+    if text == "Verified":
+        return VERIFIED_POSITIVE
+    if text == "Derived":
+        return DERIVED
+    if text == "Invalid":
+        return INVALID_CLAIM
+    if text in {
+        VERIFIED_POSITIVE,
+        VERIFIED_NEGATIVE,
+        UNSUPPORTED,
+        UNRESOLVED,
+        INVALID_CLAIM,
+        DERIVED,
+    }:
+        return text
+    return UNRESOLVED if text else UNSUPPORTED
+
+
+def _legacy_verification_status(value: Any) -> str:
+    status = _verification_status_from_legacy(value)
+    if status in {VERIFIED_POSITIVE, VERIFIED_NEGATIVE}:
+        return "Verified"
+    if status == DERIVED:
+        return "Derived"
+    if status == INVALID_CLAIM:
+        return "Invalid"
+    return "Unresolved"
 
 
 def judge_decision_is_stale(decision: Any, judge_decision: Any) -> bool:

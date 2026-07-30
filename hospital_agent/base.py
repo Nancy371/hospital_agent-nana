@@ -181,6 +181,18 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "policy_rejected_count": metric("policy_rejected_count"),
         "policy_conflict_count": metric("policy_conflict_count"),
         "failure_stage_distribution": merged_distribution("failure_stage_distribution"),
+        "evidence_hypothesis_count": metric("evidence_hypothesis_count"),
+        "evidence_query_task_count": metric("evidence_query_task_count"),
+        "evidence_hypothesis_verification_rate": metric(
+            "evidence_hypothesis_verification_rate"
+        ),
+        "evidence_recovery_count": metric("evidence_recovery_count"),
+        "evidence_recovery_rate": metric("evidence_recovery_rate"),
+        "false_evidence_injection_rate": metric("false_evidence_injection_rate"),
+        "unverified_evidence_leakage": metric("unverified_evidence_leakage"),
+        "conflict_closure_rate": metric("conflict_closure_rate"),
+        "protected_candidate_rescue_count": metric("protected_candidate_rescue_count"),
+        "derived_pattern_count": metric("derived_pattern_count"),
         "generic_only_candidate_count": metric("generic_only_candidate_count"),
         "evidence_information_value_mean": metric("evidence_information_value_mean"),
         "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,

@@ -1856,6 +1856,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             decision.get("required_gap_authorized_diagnoses")
         )
         judge_payload = decision.get("judge_decision") or {}
+        case_board_payload = dict(decision.get("case_board") or {})
+        case_board_audit = {}
+        for item in case_board_payload.get("audit_events", []) or []:
+            if isinstance(item, dict):
+                case_board_audit.update(item)
         eligibility_distribution = dict(
             decision.get("eligibility_distribution")
             or judge_payload.get("eligibility_distribution")
@@ -2535,6 +2540,34 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "failure_stage_distribution": policy_summary.get(
                     "failure_stage_distribution"
                 ),
+                "evidence_hypothesis_count": case_board_audit.get(
+                    "evidence_hypothesis_count"
+                ),
+                "evidence_query_task_count": case_board_audit.get("query_task_count"),
+                "evidence_hypothesis_verification_rate": case_board_audit.get(
+                    "evidence_hypothesis_verification_rate"
+                ),
+                "evidence_recovery_count": case_board_audit.get(
+                    "evidence_recovery_count"
+                ),
+                "evidence_recovery_rate": case_board_audit.get(
+                    "evidence_recovery_rate"
+                ),
+                "false_evidence_injection_rate": case_board_audit.get(
+                    "false_evidence_injection_rate"
+                ),
+                "unverified_evidence_leakage": case_board_audit.get(
+                    "unverified_evidence_leakage"
+                ),
+                "conflict_closure_rate": case_board_audit.get(
+                    "conflict_closure_rate"
+                ),
+                "protected_candidate_rescue_count": case_board_audit.get(
+                    "protected_candidate_rescue_count"
+                ),
+                "derived_pattern_count": case_board_audit.get(
+                    "derived_pattern_count"
+                ),
             },
             "top_candidates": top_twenty,
             "retriever_top1": retriever_top1,
@@ -2566,6 +2599,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "exam_authorization_mode": exam_authorization_mode,
                 "finding_extraction_summary": finding_extraction_summary,
                 "evidence_compiler": evidence_compiler_audit,
+                "case_board_evidence": case_board_audit,
                 "pairwise_comparison_count": len(pairwise_comparisons),
                 "judge_primary_status": str(judge_payload.get("primary_status") or ""),
                 "needs_discriminating_exams": bool(

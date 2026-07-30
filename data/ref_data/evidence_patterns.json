@@ -1,0 +1,115 @@
+{
+  "schema_version": "evidence_patterns.v1",
+  "patterns": [
+    {
+      "pattern_id": "multilineage_cytopenia",
+      "rule_id": "PATTERN-HEM-001",
+      "logic": {
+        "min_count": {
+          "count": 2,
+          "of": [
+            "hemoglobin_low",
+            "platelet_low",
+            "neutrophil_low",
+            "white_blood_cell_abnormal"
+          ]
+        }
+      },
+      "output": {
+        "evidence_id": "multilineage_cytopenia",
+        "evidence_level": "diagnostic_pattern",
+        "polarity": "positive",
+        "confidence": 0.9,
+        "information_value": 0.88
+      }
+    },
+    {
+      "pattern_id": "acute_leukemia_pattern",
+      "rule_id": "PATTERN-LEUKEMIA-001",
+      "logic": {
+        "all_of": [
+          "blast_present",
+          {
+            "any_of": [
+              "multilineage_cytopenia",
+              "extreme_white_blood_cell_abnormality"
+            ]
+          }
+        ]
+      },
+      "output": {
+        "evidence_id": "acute_leukemia_pattern",
+        "evidence_level": "diagnostic_pattern",
+        "polarity": "positive",
+        "confidence": 0.92,
+        "information_value": 0.96
+      }
+    },
+    {
+      "pattern_id": "bacterial_prostatitis_negative_pattern",
+      "rule_id": "PATTERN-URO-NEG-001",
+      "logic": {
+        "all_of": [
+          {
+            "min_count": {
+              "count": 2,
+              "of": [
+                "urine_culture_no_growth",
+                "nitrite_negative",
+                "leukocyte_esterase_negative",
+                "urine_wbc_normal"
+              ]
+            }
+          }
+        ]
+      },
+      "not_any_of": [
+        "prostate_tenderness",
+        "perineal_pain",
+        "dysuria",
+        "urinary_frequency",
+        "urinary_urgency",
+        "urine_culture_positive"
+      ],
+      "output": {
+        "evidence_id": "bacterial_prostatitis_negative_pattern",
+        "evidence_level": "diagnostic_pattern",
+        "polarity": "positive",
+        "confidence": 0.88,
+        "information_value": 0.84
+      }
+    },
+    {
+      "pattern_id": "pulmonary_av_fistula_pattern",
+      "rule_id": "PATTERN-PAVM-001",
+      "logic": {
+        "all_of": [
+          {
+            "any_of": ["hemoptysis", "hypoxemia", "cyanosis"]
+          },
+          {
+            "any_of": [
+              "right_to_left_shunt",
+              "pulmonary_vascular_shunt",
+              "pulmonary_avm_mechanism"
+            ]
+          },
+          {
+            "any_of": [
+              "pulmonary_cta_positive",
+              "enhanced_ct_vascular_malformation",
+              "bubble_echo_right_to_left_shunt"
+            ]
+          }
+        ]
+      },
+      "output": {
+        "evidence_id": "pulmonary_av_fistula_pattern",
+        "evidence_level": "diagnostic_pattern",
+        "polarity": "positive",
+        "confidence": 0.92,
+        "information_value": 0.95
+      }
+    }
+  ]
+}

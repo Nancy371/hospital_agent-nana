@@ -1,0 +1,39 @@
+{
+  "schema_version": "evidence_registry.v1",
+  "evidence": [
+    {
+      "evidence_id": "blast_present",
+      "aliases": ["原始细胞", "母细胞", "blast", "myeloblast", "lymphoblast"],
+      "preferred_sections": ["peripheral_blood_smear", "bone_marrow", "laboratory", "外周血涂片", "骨髓"],
+      "verification_type": "presence_or_percentage",
+      "positive_terms": ["阳性", "提示", "发现", "可见", "存在", "检出", "positive", "+"],
+      "negative_terms": ["阴性", "未见", "未发现", "未检出", "无", "negative"],
+      "ambiguous_terms": ["异常幼稚细胞", "可疑幼稚细胞"],
+      "followup_exam": "外周血涂片",
+      "evidence_level": "diagnostic_pattern",
+      "information_value": 0.96
+    },
+    {
+      "evidence_id": "pulmonary_cta_positive",
+      "aliases": ["肺动脉CTA阳性", "CTA提示肺动静脉瘘", "肺血管畸形", "pulmonary CTA positive"],
+      "preferred_sections": ["CTA", "CT", "imaging"],
+      "verification_type": "imaging_confirmation",
+      "positive_terms": ["阳性", "提示", "发现", "可见", "存在", "检出", "positive"],
+      "negative_terms": ["阴性", "未见", "未发现", "未提示", "未检出", "negative"],
+      "followup_exam": "肺动脉CTA",
+      "evidence_level": "diagnostic_pattern",
+      "information_value": 0.98
+    },
+    {
+      "evidence_id": "bubble_echo_right_to_left_shunt",
+      "aliases": ["右心声学造影阳性", "声学造影右向左分流", "bubble echo right-to-left shunt"],
+      "preferred_sections": ["echocardiography", "超声"],
+      "verification_type": "imaging_confirmation",
+      "positive_terms": ["阳性", "提示", "发现", "可见", "存在", "positive"],
+      "negative_terms": ["阴性", "未见", "未发现", "未提示", "negative"],
+      "followup_exam": "超声心动图右心声学造影",
+      "evidence_level": "diagnostic_pattern",
+      "information_value": 0.97
+    }
+  ]
+}

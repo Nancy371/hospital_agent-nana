@@ -37,9 +37,20 @@ __all__ = [
     "ConsultationEvidencePipeline",
     "EvidenceClaim",
     "EvidenceClaimGenerator",
+    "EvidenceConflictAuditor",
+    "EvidenceDefinition",
+    "EvidenceDefinitionRegistry",
+    "EvidenceHypothesis",
+    "EvidenceHypothesisGenerator",
+    "EvidencePatternCompiler",
+    "EvidencePatternMatch",
+    "EvidenceQueryPlanner",
+    "EvidenceQueryTask",
     "PatternCompiler",
     "StaleJudgeDecisionError",
+    "DeterministicEvidenceVerifier",
     "TargetedEvidenceVerifier",
+    "VerificationResult",
     "evidence_snapshot_hash",
     "ExamResolver",
     "ExamResolution",
@@ -131,6 +142,24 @@ def __getattr__(name: str):
     if name == "DiagnosticPatternEvaluator":
         from .diagnostic_patterns import DiagnosticPatternEvaluator
         return DiagnosticPatternEvaluator
+    if name in ("EvidenceDefinition", "EvidenceDefinitionRegistry"):
+        from . import evidence_registry as _evidence_registry
+        return getattr(_evidence_registry, name)
+    if name in ("EvidenceHypothesis", "EvidenceHypothesisGenerator"):
+        from . import evidence_hypothesis as _evidence_hypothesis
+        return getattr(_evidence_hypothesis, name)
+    if name in ("EvidenceQueryPlanner", "EvidenceQueryTask"):
+        from . import evidence_query_planner as _evidence_query_planner
+        return getattr(_evidence_query_planner, name)
+    if name in ("DeterministicEvidenceVerifier", "VerificationResult"):
+        from . import targeted_evidence_verifier as _targeted_evidence_verifier
+        return getattr(_targeted_evidence_verifier, name)
+    if name in ("EvidencePatternCompiler", "EvidencePatternMatch"):
+        from . import evidence_pattern_compiler as _evidence_pattern_compiler
+        return getattr(_evidence_pattern_compiler, name)
+    if name == "EvidenceConflictAuditor":
+        from .evidence_conflict_auditor import EvidenceConflictAuditor
+        return EvidenceConflictAuditor
     if name in (
         "CaseBoard",
         "CaseBoardEvent",
