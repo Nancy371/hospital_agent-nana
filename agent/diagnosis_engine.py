@@ -817,6 +817,10 @@ class DiagnosticKnowledgeBase:
                 "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09",
                 "\u5916\u5468\u8840\u6d82\u7247",
                 "\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09",
+                "\u6d41\u5f0f\u7ec6\u80de\u672f\u514d\u75ab\u5206\u578b",
+                "\u9aa8\u9ad3\u6d41\u5f0f\u7ec6\u80de\u514d\u75ab\u8868\u578b\u5206\u6790",
+                "\u7ec6\u80de\u9057\u4f20\u5b66\u5206\u6790",
+                "\u767d\u8840\u75c5\u878d\u5408\u57fa\u56e0\u68c0\u6d4b",
                 "\u7ec4\u7ec7\u75c5\u7406\u5b66\u68c0\u67e5",
             ],
             diagnostic_patterns=[

@@ -301,6 +301,17 @@ class ExamStrategyAgent:
                 "primary_diagnosis": differential_plan["primary_diagnosis"],
                 "differential_candidates": differential_plan["differential_candidates"],
                 "discriminating_items": items,
+                "reserved_gap_items": list(
+                    differential_plan.get("reserved_gap_items") or []
+                ),
+                "source_decision_version": differential_plan.get(
+                    "source_decision_version",
+                    0,
+                ),
+                "source_evidence_version": differential_plan.get(
+                    "source_evidence_version",
+                    0,
+                ),
                 "blocked_items": blocked_items,
                 "generic_exam_suppression_count": differential_plan.get(
                     "generic_exam_suppression_count",
@@ -548,11 +559,7 @@ class ExamStrategyAgent:
         payload = self._judge_payload(judge_decision)
         if not payload:
             return {}
-        exam_tasks = [
-            item
-            for item in payload.get("discriminating_exam_tasks", []) or []
-            if isinstance(item, dict) and str(item.get("exam") or "").strip()
-        ]
+        exam_tasks = self._judge_exam_tasks(payload)
         raw_discriminating = [
             str(item).strip()
             for item in (
@@ -575,6 +582,8 @@ class ExamStrategyAgent:
             if str(item).strip()
         ]
         differential_candidates = list(dict.fromkeys(differential_candidates))[:6]
+        task_by_exam = self._normalized_exam_task_map(exam_tasks)
+        task_exam_items = list(task_by_exam)
         exam_resolutions = self.exam_resolver.resolve_many(raw_discriminating)
         resolver_items = [
             item.resolved_exam
@@ -586,6 +595,7 @@ class ExamStrategyAgent:
         normalized, _ = self.knowledge.normalize_examinations(
             resolver_items or raw_discriminating
         )
+        normalized = list(dict.fromkeys(task_exam_items + normalized))
         entity_fallback_pool = self._entity_exam_fallback_pool(
             differential_candidates or candidate_diseases or []
         )
@@ -608,10 +618,9 @@ class ExamStrategyAgent:
         )
         entity_fallback_set = set(entity_fallback_normalized) if use_entity_fallback else set()
         if use_entity_fallback:
-            normalized = entity_fallback_normalized
+            normalized = list(dict.fromkeys(task_exam_items + entity_fallback_normalized))
         if not normalized:
             return {}
-        task_by_exam = self._normalized_exam_task_map(exam_tasks)
         resolution_by_exam = {
             exam: dict(task.get("exam_resolution") or {})
             for exam, task in task_by_exam.items()
@@ -683,13 +692,13 @@ class ExamStrategyAgent:
                     + [item for item in ranked if item in set(normalized)]
                 )
             )
-        items = self.prepare_order_items(
+        items = self._prepare_differential_order_items(
             list(dict.fromkeys(ordered)),
             collected_info=collected_info,
             candidate_diseases=differential_candidates or candidate_diseases,
             existing_results=existing_results,
             max_items=self.discriminating_exam_max_items,
-            add_strong_verification=False,
+            task_by_exam=task_by_exam,
         )
         if not items:
             return {}
@@ -769,8 +778,23 @@ class ExamStrategyAgent:
                     task_by_exam.get(item, {}).get("gap_diagnostic_coverage")
                     or 0.0
                 ),
+                "source_decision_version": payload.get("decision_version")
+                or payload.get("case_version")
+                or 0,
+                "source_evidence_version": payload.get("evidence_version")
+                or payload.get("case_version")
+                or 0,
+                "source_evidence_snapshot_hash": str(
+                    payload.get("evidence_snapshot_hash") or ""
+                ),
             }
             for item in items
+        ]
+        reserved_gap_items = [
+            detail["exam"]
+            for detail in authorization_details
+            if detail.get("exam_source") == "deferred_gap_closure_exam"
+            and detail.get("priority_override")
         ]
         return {
             "items": items,
@@ -779,12 +803,163 @@ class ExamStrategyAgent:
             "primary_diagnosis": str(payload.get("primary") or payload.get("judge_primary") or ""),
             "candidate_exam_pool": normalized,
             "exam_authorization_details": authorization_details,
+            "reserved_gap_items": reserved_gap_items,
+            "source_decision_version": payload.get("decision_version")
+            or payload.get("case_version")
+            or 0,
+            "source_evidence_version": payload.get("evidence_version")
+            or payload.get("case_version")
+            or 0,
             "generic_exam_suppression_count": sum(
                 1
                 for item in normalized + proposed_items
                 if self._generic_inflammation_exam(item) and item not in set(items)
             ),
         }
+
+    def _judge_exam_tasks(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        for key in ("deferred_gap_closure_tasks", "discriminating_exam_tasks"):
+            for item in payload.get(key, []) or []:
+                if isinstance(item, dict) and str(item.get("exam") or "").strip():
+                    tasks.append(dict(item))
+        tasks.extend(self._exam_tasks_from_priority_overrides(payload))
+
+        result: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for task in tasks:
+            exam = str(task.get("exam") or "").strip()
+            if not exam:
+                continue
+            gap = str(task.get("target_gap") or "")
+            source = str(task.get("exam_source") or "")
+            key = (exam, gap, source)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(task)
+        return result
+
+    def _exam_tasks_from_priority_overrides(
+        self,
+        payload: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        for override in payload.get("exam_priority_overrides", []) or []:
+            if not isinstance(override, dict):
+                continue
+            candidate = str(override.get("candidate") or "").strip()
+            entity_id = str(override.get("entity_id") or "").strip()
+            target_candidates = [item for item in (candidate, entity_id) if item]
+            for gap in override.get("evidence_gaps", []) or []:
+                if not isinstance(gap, dict):
+                    continue
+                gap_id = str(gap.get("gap_id") or "").strip()
+                target = str(gap.get("target_evidence") or "").strip()
+                for rank, exam in enumerate(gap.get("closure_exams", []) or [], start=1):
+                    exam_text = str(exam or "").strip()
+                    if not exam_text:
+                        continue
+                    resolution = self.exam_resolver.resolve(
+                        exam_text,
+                        candidate=candidate or entity_id or None,
+                    )
+                    tasks.append(
+                        {
+                            "exam": exam_text,
+                            "target_candidates": target_candidates,
+                            "target_findings": [target] if target else [],
+                            "target_gap": gap_id,
+                            "target_gaps": [gap_id] if gap_id else [],
+                            "target_claims": [target] if target else [],
+                            "evidence_gap": dict(gap),
+                            "exam_type": "deferred_gap_closure",
+                            "exam_source": "deferred_gap_closure_exam",
+                            "expected_effect": "close_high_value_deferred_evidence_gap",
+                            "expected_transition": dict(gap.get("expected_transition") or {}),
+                            "source": ["deferred_gap_closure"],
+                            "priority_override": True,
+                            "priority_bucket": "high_value_deferred_gap_closure",
+                            "closure_rank": rank,
+                            "closure_priority": max(0, 101 - rank),
+                            "information_gain_hint": float(
+                                override.get("deferred_priority") or 0.9
+                            ),
+                            "requested_exam": exam_text,
+                            "resolved_exam": resolution.resolved_exam or exam_text,
+                            "resolution_type": resolution.resolution_type,
+                            "diagnostic_coverage": float(
+                                resolution.diagnostic_coverage or 0.0
+                            ),
+                            "gap_diagnostic_coverage": float(
+                                resolution.diagnostic_coverage or 0.0
+                            ),
+                            "exam_resolution": resolution.to_dict(),
+                            "override_reason": str(
+                                override.get("override_reason")
+                                or "high-value deferred evidence gap"
+                            ),
+                        }
+                    )
+        return tasks
+
+    def _prepare_differential_order_items(
+        self,
+        items: List[str],
+        collected_info: Dict[str, Any],
+        candidate_diseases: Optional[List[Any]],
+        existing_results: Dict[str, Any],
+        max_items: Optional[int],
+        task_by_exam: Dict[str, Dict[str, Any]],
+    ) -> List[str]:
+        existing_valid, _ = self.knowledge.normalize_examinations(
+            list((existing_results or {}).keys())
+        )
+        existing_set = set((existing_results or {}).keys()) | set(existing_valid)
+        prepared: List[str] = []
+
+        for item in items or []:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if text in task_by_exam:
+                candidates = [text]
+            else:
+                normalized, _ = self.knowledge.normalize_examinations([text])
+                candidates = normalized or [text]
+            for exam in candidates:
+                if exam and exam not in existing_set and exam not in prepared:
+                    prepared.append(exam)
+
+        prepared = self._filter_contextual_items(
+            prepared,
+            collected_info=collected_info,
+            candidate_diseases=candidate_diseases,
+        )
+        if max_items is None:
+            return prepared
+        limit = max(0, int(max_items))
+        if len(prepared) <= limit:
+            return prepared
+        urgent = [
+            item
+            for item in prepared
+            if bool(task_by_exam.get(item, {}).get("urgent_safety"))
+        ]
+        reserved = [
+            item
+            for item in prepared
+            if str(task_by_exam.get(item, {}).get("exam_source") or "")
+            == "deferred_gap_closure_exam"
+            and bool(task_by_exam.get(item, {}).get("priority_override"))
+        ]
+        selected: List[str] = []
+        for item in urgent + reserved + prepared:
+            if item not in selected:
+                selected.append(item)
+            if len(selected) >= limit:
+                break
+        return selected
 
     def _entity_exam_fallback_pool(
         self,
@@ -854,6 +1029,8 @@ class ExamStrategyAgent:
                 "evidence_gap_targets",
                 "discriminating_exams",
                 "discriminating_exam_tasks",
+                "deferred_gap_closure_tasks",
+                "exam_priority_overrides",
                 "discriminating_findings",
             )
             if hasattr(judge_decision, key)
@@ -890,11 +1067,14 @@ class ExamStrategyAgent:
                 resolution_payload = resolution.to_dict()
             normalized: List[str] = []
             if resolution.resolved_exam and resolution.resolution_type in _USABLE_EXAM_RESOLUTION_TYPES:
-                normalized, _ = self.knowledge.normalize_examinations(
-                    [resolution.resolved_exam]
-                )
-                if not normalized:
+                if self._preserve_specialty_exam_name(task, resolution.resolved_exam):
                     normalized = [resolution.resolved_exam]
+                else:
+                    normalized, _ = self.knowledge.normalize_examinations(
+                        [resolution.resolved_exam]
+                    )
+                    if not normalized:
+                        normalized = [resolution.resolved_exam]
             if not normalized:
                 normalized, _ = self.knowledge.normalize_examinations([requested_exam])
             if not normalized:
@@ -932,6 +1112,41 @@ class ExamStrategyAgent:
                         current_for_exam,
                     )
         return result
+
+    @staticmethod
+    def _preserve_specialty_exam_name(
+        task: Dict[str, Any],
+        exam: str,
+    ) -> bool:
+        source = str((task or {}).get("exam_source") or "")
+        if source == "deferred_gap_closure_exam":
+            if not bool((task or {}).get("priority_override")):
+                return False
+        elif source not in {
+            "evidence_claim_followup_exam",
+            "pattern_anchor_workup_exam",
+        }:
+            return False
+        text = str(exam or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "cta",
+                "cect",
+                "\u589e\u5f3a",
+                "\u9020\u5f71",
+                "\u52a8\u8109",
+                "\u8840\u7ba1",
+                "\u9aa8\u9ad3",
+                "\u6d41\u5f0f",
+                "\u514d\u75ab\u5206\u578b",
+                "\u878d\u5408\u57fa\u56e0",
+                "\u5206\u5b50\u68c0\u6d4b",
+                "\u7ec6\u80de\u9057\u4f20",
+                "\u67d3\u8272\u4f53\u6838\u578b",
+                "bmab",
+            )
+        )
 
     def _merge_normalized_exam_tasks(
         self,
@@ -1067,14 +1282,52 @@ class ExamStrategyAgent:
         closure_rank = int((task or {}).get("closure_rank") or 9999)
         gap_coverage = float((task or {}).get("gap_diagnostic_coverage") or 0.0)
         diagnostic_coverage = float((task or {}).get("diagnostic_coverage") or 0.0)
+        specialty_followup_priority = (
+            cls._specialty_followup_priority(task)
+            if bucket_name == "targeted_evidence_followup"
+            else 0
+        )
         return (
             bucket,
             closure_priority,
             gap_coverage,
             diagnostic_coverage,
+            specialty_followup_priority,
             -closure_rank,
             float((task or {}).get("information_gain_hint") or 0.0),
         )
+
+    @staticmethod
+    def _specialty_followup_priority(task: Dict[str, Any]) -> int:
+        exam = str((task or {}).get("exam") or "")
+        requested = str((task or {}).get("requested_exam") or "")
+        resolved = str((task or {}).get("resolved_exam") or "")
+        targets = " ".join(str(item or "") for item in (task or {}).get("target_candidates", []) or [])
+        text = f"{exam} {requested} {resolved} {targets}".lower()
+        compact = "".join(text.split())
+        if (
+            "\u9aa8\u9ad3\u7a7f\u523a" in compact
+            or "\u9aa8\u9ad3\u6d3b\u68c0" in compact
+            or "bmab" in compact
+        ):
+            return 100
+        if "\u9aa8\u9ad3\u6d41\u5f0f" in compact or "\u6d41\u5f0f\u7ec6\u80de" in compact or "\u514d\u75ab\u5206\u578b" in compact:
+            return 96
+        if "\u767d\u8840\u75c5\u878d\u5408\u57fa\u56e0" in compact or "\u878d\u5408\u57fa\u56e0" in compact:
+            return 92
+        if "\u7ec6\u80de\u9057\u4f20" in compact or "\u67d3\u8272\u4f53\u6838\u578b" in compact:
+            return 88
+        if "cta" in compact or "\u53f3\u5fc3\u58f0\u5b66\u9020\u5f71" in compact:
+            return 84
+        if "\u589e\u5f3a" in compact or "cect" in compact:
+            return 80
+        if "\u5916\u5468\u8840\u6d82\u7247" in compact:
+            return 72
+        if "\u5168\u8840\u7ec6\u80de\u8ba1\u6570" in compact or "\u8840\u5e38\u89c4" in compact or "cbc" in compact:
+            return 38
+        if "\u8840\u6c89" in compact or "esr" in compact:
+            return 12
+        return 0
 
     def _strict_primary_diagnosis(
         self,

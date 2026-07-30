@@ -474,6 +474,60 @@ class DiagnosisJudgeTests(unittest.TestCase):
             )
         )
 
+    def test_leukemia_confirmatory_gap_prefers_marrow_flow_and_molecular_exams(self):
+        leukemia = candidate(
+            LEUKEMIA,
+            0.42,
+            required=False,
+            diagnosis_type="disease",
+            specificity=0.86,
+            coverage=0.46,
+            residual=0.32,
+            core_coverage=0.44,
+            matched=[
+                "anemia",
+                "platelet_low",
+                "white_blood_cell_abnormal",
+                "bleeding_tendency",
+            ],
+            gaps=["bone_marrow_blast_confirmed"],
+            core_score=0.46,
+            diagnostic_score=0.28,
+        )
+        leukemia.entity_id = "D000025"
+        leukemia.eligibility_status = "Deferred"
+        leukemia.eligibility_reason = "NeedsAnchor"
+        leukemia.eligibility_substatus = "DeferredNeedsConfirmatoryExam"
+        generic = candidate(
+            "generic_primary",
+            0.60,
+            required=True,
+            matched=["symptom:fever"],
+        )
+
+        decision = self.run_candidates([generic, leukemia])
+        payload = decision.judge_decision
+        tasks = [
+            item
+            for item in payload["discriminating_exam_tasks"]
+            if LEUKEMIA in item.get("target_candidates", [])
+        ]
+        exams = [item["exam"] for item in tasks]
+
+        self.assertIn("\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09", exams)
+        self.assertIn("\u6d41\u5f0f\u7ec6\u80de\u672f\u514d\u75ab\u5206\u578b", exams)
+        self.assertLess(
+            exams.index("\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09"),
+            exams.index("\u5916\u5468\u8840\u6d82\u7247") if "\u5916\u5468\u8840\u6d82\u7247" in exams else len(exams),
+        )
+        marrow_task = next(
+            item for item in tasks
+            if item["exam"] == "\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09"
+        )
+        self.assertEqual(marrow_task["exam_source"], "deferred_gap_closure_exam")
+        self.assertEqual(marrow_task["priority_bucket"], "high_value_deferred_gap_closure")
+        self.assertEqual(marrow_task["gap_diagnostic_coverage"], 1.0)
+
     def test_hard_contradiction_still_blocks_gap_authorization(self):
         ohss = candidate(
             OHSS,

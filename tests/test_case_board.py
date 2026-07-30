@@ -312,7 +312,7 @@ class CaseBoardTests(unittest.TestCase):
         ]
         leukemia.diagnostic_matched_evidence = ["acute_leukemia_pattern"]
 
-        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7626")
+        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7618")
         pavm.entity_id = "D100055"
         pavm.eligibility_status = DEFERRED
         pavm.required_gaps = ["pulmonary_cta_positive"]
@@ -336,7 +336,7 @@ class CaseBoardTests(unittest.TestCase):
         coronary.entity_id = "D000011"
         coronary.core_matched_evidence = ["hemoptysis"]
 
-        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7626")
+        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7618")
         pavm.entity_id = "D100055"
         pavm.eligibility_status = DEFERRED
         pavm.required_gaps = ["pulmonary_cta_positive"]
@@ -361,7 +361,7 @@ class CaseBoardTests(unittest.TestCase):
         lung_cancer.core_matched_evidence = ["hemoptysis"]
         lung_cancer.matched_evidence = ["hemoptysis", "pulmonary_nodule"]
 
-        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7626")
+        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7618")
         pavm.entity_id = "D100055"
         pavm.eligibility_status = DEFERRED
         pavm.eligibility_substatus = DEFERRED_NEEDS_CONFIRMATORY_EXAM
@@ -376,21 +376,21 @@ class CaseBoardTests(unittest.TestCase):
         decision = judge.judge([lung_cancer, pavm])
 
         self.assertEqual(decision.primary_status, "deferred")
-        self.assertIn("\u80ba\u52a8\u9759\u8109\u7626", decision.high_value_gap_candidates)
+        self.assertIn("\u80ba\u52a8\u9759\u8109\u7618", decision.high_value_gap_candidates)
         self.assertTrue(decision.exam_priority_overrides)
         self.assertTrue(decision.deferred_evidence_gaps)
         self.assertTrue(
             any(
                 task.get("exam_source") == "deferred_gap_closure_exam"
                 and task.get("priority_override")
-                and "\u80ba\u52a8\u9759\u8109\u7626" in task.get("target_candidates", [])
+                and "\u80ba\u52a8\u9759\u8109\u7618" in task.get("target_candidates", [])
                 for task in decision.discriminating_exam_tasks
             )
         )
 
     def test_pavm_deferred_gap_tasks_prioritize_entity_confirmatory_bundle(self):
         judge = DiagnosisJudge(load_config(), knowledge=KnowledgeBase("data/ref_data"))
-        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7626")
+        pavm = candidate("\u80ba\u52a8\u9759\u8109\u7618")
         pavm.entity_id = "D100055"
         pavm.eligibility_status = DEFERRED
         pavm.eligibility_substatus = DEFERRED_NEEDS_CONFIRMATORY_EXAM
@@ -410,7 +410,7 @@ class CaseBoardTests(unittest.TestCase):
         self.assertEqual(tasks[0]["exam"], "\u80ba\u52a8\u8109CTA")
         self.assertEqual(tasks[0]["priority_bucket"], "high_value_deferred_gap_closure")
         self.assertEqual(tasks[0]["closure_rank"], 1)
-        self.assertEqual(tasks[0]["target_candidates"], ["\u80ba\u52a8\u9759\u8109\u7626"])
+        self.assertEqual(tasks[0]["target_candidates"], ["\u80ba\u52a8\u9759\u8109\u7618"])
         self.assertTrue(
             any("\u58f0\u5b66\u9020\u5f71" in task["exam"] for task in tasks)
         )

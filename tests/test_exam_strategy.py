@@ -120,7 +120,7 @@ class ExamInformationGainTests(unittest.TestCase):
             max_new_items=3,
             discriminating_exam_max_items=3,
         )
-        pavm = "\u80ba\u52a8\u9759\u8109\u7626"
+        pavm = "\u80ba\u52a8\u9759\u8109\u7618"
         mpa = "\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e"
         lung_cancer = "\u80ba\u764c"
         anca = "\u6297\u4e2d\u6027\u7c92\u7ec6\u80de\u80de\u8d28\u6297\u4f53\uff08ANCA\uff09\u8c31"
@@ -235,6 +235,259 @@ class ExamInformationGainTests(unittest.TestCase):
         self.assertLess(first_pavm_index, first_anca_index)
         self.assertNotIn(cbc, result["items"][:2])
         self.assertNotIn(crp, result["items"][:2])
+
+    def test_deferred_gap_closure_tasks_are_consumed_without_discriminating_tasks(self):
+        strategy = ExamStrategyAgent(
+            KnowledgeBase("data/ref_data"),
+            max_new_items=2,
+            discriminating_exam_max_items=2,
+        )
+        pavm = "\u80ba\u52a8\u9759\u8109\u7618"
+        anca = "\u6297\u4e2d\u6027\u7c92\u7ec6\u80de\u80de\u8d28\u6297\u4f53\uff08ANCA\uff09\u8c31"
+        cta = "\u80ba\u52a8\u8109CTA"
+
+        result = strategy.recommend(
+            collected_info={"symptoms": ["\u54af\u8840", "\u4f4e\u6c27"]},
+            candidate_diseases=[pavm, "\u80ba\u764c"],
+            proposed_items=[anca],
+            existing_results={},
+            judge_decision={
+                "primary_status": "deferred",
+                "needs_discriminating_exams": True,
+                "differential_candidates": [pavm, "\u80ba\u764c"],
+                "deferred_gap_closure_tasks": [
+                    {
+                        "exam": cta,
+                        "target_candidates": [pavm],
+                        "target_findings": ["pulmonary_vascular_malformation_confirmed"],
+                        "target_gap": "G-PAVF-01",
+                        "target_gaps": ["G-PAVF-01"],
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": 1,
+                        "closure_priority": 100,
+                        "gap_diagnostic_coverage": 1.0,
+                        "information_gain_hint": 0.99,
+                    }
+                ],
+            },
+        )
+
+        self.assertTrue(result["differential_driven"])
+        self.assertIn(cta, result["items"])
+        self.assertEqual(result["items"][0], cta)
+        self.assertTrue(
+            any(
+                item.get("exam_source") == "deferred_gap_closure_exam"
+                for item in result["exam_authorization_details"]
+            )
+        )
+
+    def test_reserved_deferred_gap_item_survives_max_item_truncation(self):
+        strategy = ExamStrategyAgent(
+            KnowledgeBase("data/ref_data"),
+            max_new_items=1,
+            discriminating_exam_max_items=1,
+        )
+        pavm = "\u80ba\u52a8\u9759\u8109\u7618"
+        cta = "\u80ba\u52a8\u8109CTA"
+        anca = "\u6297\u4e2d\u6027\u7c92\u7ec6\u80de\u80de\u8d28\u6297\u4f53\uff08ANCA\uff09\u8c31"
+        chest_ct = "\u80f8\u90e8CT\u626b\u63cf\uff08Chest CT\uff09"
+
+        result = strategy.recommend(
+            collected_info={"symptoms": ["\u54af\u8840", "\u4f4e\u6c27"]},
+            candidate_diseases=[pavm, "\u80ba\u764c"],
+            proposed_items=[anca, chest_ct],
+            existing_results={},
+            judge_decision={
+                "primary_status": "deferred",
+                "needs_discriminating_exams": True,
+                "differential_candidates": [pavm, "\u80ba\u764c"],
+                "discriminating_exam_tasks": [
+                    {
+                        "exam": anca,
+                        "target_candidates": ["\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e"],
+                        "exam_type": "conflict_adjudication",
+                        "exam_source": "conflict_adjudication_exam",
+                        "information_gain_hint": 0.99,
+                    },
+                    {
+                        "exam": chest_ct,
+                        "target_candidates": [pavm, "\u80ba\u764c"],
+                        "exam_type": "special_discriminator",
+                        "information_gain_hint": 0.95,
+                    },
+                    {
+                        "exam": cta,
+                        "target_candidates": [pavm],
+                        "target_gap": "G-PAVF-01",
+                        "target_gaps": ["G-PAVF-01"],
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": 1,
+                        "closure_priority": 100,
+                        "gap_diagnostic_coverage": 1.0,
+                        "information_gain_hint": 0.9,
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(result["items"], [cta])
+
+    def test_leukemia_deferred_gap_closure_beats_urinary_and_generic_exams(self):
+        strategy = ExamStrategyAgent(
+            KnowledgeBase("data/ref_data"),
+            max_new_items=2,
+            discriminating_exam_max_items=2,
+        )
+        leukemia = "\u767d\u8840\u75c5"
+        marrow = "\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09"
+        flow = "\u6d41\u5f0f\u7ec6\u80de\u672f\u514d\u75ab\u5206\u578b"
+        anca = "\u6297\u4e2d\u6027\u7c92\u7ec6\u80de\u80de\u8d28\u6297\u4f53\uff08ANCA\uff09\u8c31"
+        ua = "\u5c3f\u6db2\u5206\u6790\uff08UA\uff09"
+        dre = "\u76f4\u80a0\u6307\u68c0\uff08DRE\uff09"
+
+        result = strategy.recommend(
+            collected_info={
+                "symptoms": ["\u53d1\u70ed", "\u4e4f\u529b", "\u76ae\u80a4\u7600\u9752"]
+            },
+            candidate_diseases=[leukemia, "\u6025\u6027\u7ec6\u83cc\u6027\u524d\u5217\u817a\u708e"],
+            proposed_items=[anca, ua, dre],
+            existing_results={},
+            judge_decision={
+                "primary_status": "deferred",
+                "needs_discriminating_exams": True,
+                "differential_candidates": [
+                    leukemia,
+                    "\u6025\u6027\u7ec6\u83cc\u6027\u524d\u5217\u817a\u708e",
+                ],
+                "deferred_gap_closure_tasks": [
+                    {
+                        "exam": marrow,
+                        "target_candidates": [leukemia],
+                        "target_findings": ["bone_marrow_blast_confirmed"],
+                        "target_gap": "G-LEUKEMIA-01",
+                        "target_gaps": ["G-LEUKEMIA-01"],
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": 1,
+                        "closure_priority": 100,
+                        "gap_diagnostic_coverage": 1.0,
+                        "information_gain_hint": 0.99,
+                    },
+                    {
+                        "exam": flow,
+                        "target_candidates": [leukemia],
+                        "target_findings": ["leukemia_lineage_identified"],
+                        "target_gap": "G-LEUKEMIA-02",
+                        "target_gaps": ["G-LEUKEMIA-02"],
+                        "exam_type": "deferred_gap_closure",
+                        "exam_source": "deferred_gap_closure_exam",
+                        "priority_override": True,
+                        "priority_bucket": "high_value_deferred_gap_closure",
+                        "closure_rank": 2,
+                        "closure_priority": 96,
+                        "gap_diagnostic_coverage": 0.96,
+                        "information_gain_hint": 0.98,
+                    },
+                    {
+                        "exam": ua,
+                        "target_candidates": ["\u6025\u6027\u7ec6\u83cc\u6027\u524d\u5217\u817a\u708e"],
+                        "exam_type": "special_discriminator",
+                        "information_gain_hint": 0.7,
+                    },
+                    {
+                        "exam": dre,
+                        "target_candidates": ["\u6025\u6027\u7ec6\u83cc\u6027\u524d\u5217\u817a\u708e"],
+                        "exam_type": "special_discriminator",
+                        "information_gain_hint": 0.7,
+                    },
+                    {
+                        "exam": anca,
+                        "target_candidates": ["\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e"],
+                        "exam_type": "conflict_adjudication",
+                        "exam_source": "conflict_adjudication_exam",
+                        "information_gain_hint": 0.9,
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(result["items"][:2], [marrow, flow])
+        self.assertNotIn(ua, result["items"][:2])
+        self.assertNotIn(dre, result["items"][:2])
+        details = result["exam_authorization_details"]
+        marrow_detail = next(item for item in details if item["exam"] == marrow)
+        self.assertEqual(marrow_detail["priority_bucket"], "high_value_deferred_gap_closure")
+        self.assertEqual(marrow_detail["requested_exam"], marrow)
+        self.assertIn("G-LEUKEMIA-01", marrow_detail["target_gaps"])
+
+    def test_leukemia_targeted_followup_prefers_marrow_over_esr_and_cbc(self):
+        strategy = ExamStrategyAgent(
+            KnowledgeBase("data/ref_data"),
+            max_new_items=3,
+            discriminating_exam_max_items=3,
+        )
+        leukemia = "\u767d\u8840\u75c5"
+        marrow = "\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09"
+        esr = "\u7ea2\u7ec6\u80de\u6c89\u964d\u7387\uff08ESR\uff09"
+        cbc = "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09"
+        smear = "\u5916\u5468\u8840\u6d82\u7247"
+
+        result = strategy.recommend(
+            collected_info={
+                "symptoms": ["\u53d1\u70ed", "\u4e4f\u529b", "\u76ae\u80a4\u7600\u9752"]
+            },
+            candidate_diseases=[leukemia],
+            proposed_items=[],
+            existing_results={},
+            judge_decision={
+                "primary_status": "deferred",
+                "needs_discriminating_exams": True,
+                "differential_candidates": [leukemia],
+                "discriminating_exam_tasks": [
+                    {
+                        "exam": esr,
+                        "target_candidates": [leukemia],
+                        "exam_type": "pattern_anchor_workup",
+                        "exam_source": "pattern_anchor_workup_exam",
+                        "information_gain_hint": 0.99,
+                    },
+                    {
+                        "exam": cbc,
+                        "target_candidates": [leukemia],
+                        "exam_type": "pattern_anchor_workup",
+                        "exam_source": "pattern_anchor_workup_exam",
+                        "information_gain_hint": 0.99,
+                    },
+                    {
+                        "exam": smear,
+                        "target_candidates": [leukemia],
+                        "exam_type": "evidence_claim_verification",
+                        "exam_source": "evidence_claim_followup_exam",
+                        "information_gain_hint": 0.99,
+                    },
+                    {
+                        "exam": marrow,
+                        "target_candidates": [leukemia],
+                        "exam_type": "evidence_claim_verification",
+                        "exam_source": "evidence_claim_followup_exam",
+                        "information_gain_hint": 0.99,
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(result["items"][0], marrow)
+        self.assertIn(smear, result["items"][:3])
+        self.assertNotEqual(result["items"][0], esr)
 
     def test_tb_mpa_lung_cancer_special_exams_beat_generic_inflammation(self):
         result = self.strategy.recommend(

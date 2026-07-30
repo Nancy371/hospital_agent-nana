@@ -65,7 +65,13 @@ _PARENT_FALLBACK_NAMES = {"先天性心脏病"}
 _DIFFERENTIAL_EXAM_HINTS = {
     "雅司病": ["体格检查", "梅毒血清学检查", "暗视野显微镜检查", "组织病理学检查"],
     "湿疹": ["体格检查", "血清学抗体检测"],
-    "白血病": ["全血细胞计数（CBC）", "外周血涂片", "组织病理学检查"],
+    "白血病": [
+        "全血细胞计数（CBC）",
+        "外周血涂片",
+        "骨髓穿刺和活检（BMAB）",
+        "流式细胞术免疫分型",
+        "白血病融合基因检测",
+    ],
     "肺结核": ["胸部CT扫描（Chest CT）", "痰培养", "抗酸杆菌染色（AFB）", "核酸扩增检测（NAAT）"],
     "肺炎": ["胸部X线检查（CXR）", "全血细胞计数（CBC）", "C反应蛋白（CRP）", "痰培养"],
     "支气管肺炎": ["胸部X线检查（CXR）", "全血细胞计数（CBC）", "C反应蛋白（CRP）", "痰培养"],
@@ -2811,7 +2817,7 @@ class DiagnosisJudge:
         text = f"{name} {canonical}".lower()
         critical_names = (
             "\u767d\u8840\u75c5",
-            "\u80ba\u52a8\u9759\u8109\u7626",
+            "\u80ba\u52a8\u9759\u8109\u7618",
             "\u663e\u5fae\u955c\u4e0b\u591a\u8840\u7ba1\u708e",
             "\u7ed3\u6838\u6027\u5fc3\u5305\u708e",
         )
@@ -2832,7 +2838,7 @@ class DiagnosisJudge:
             for item in self._specific_support_evidence(candidate)
             if str(item or "").strip()
         }
-        if entity_id == "D100055" or "pavm" in text or "\u80ba\u52a8\u9759\u8109\u7626" in name:
+        if entity_id == "D100055" or "pavm" in text or "\u80ba\u52a8\u9759\u8109\u7618" in name:
             return bool(
                 support
                 & {
@@ -3181,6 +3187,15 @@ class DiagnosisJudge:
                 return 0.45
             if preference >= 20:
                 return 0.25
+        if self._hematologic_malignancy_gap(candidate, gap):
+            if preference >= 90:
+                return round(preference / 100.0, 4)
+            if preference >= 80:
+                return 0.82
+            if preference >= 60:
+                return 0.62
+            if preference >= 35:
+                return 0.35
         return float(resolution.get("diagnostic_coverage") or 0.0)
 
     def _gap_specific_exam_preference(
@@ -3210,6 +3225,24 @@ class DiagnosisJudge:
             if "abg" in compact or "\u8840\u6c14" in compact or "spo2" in compact:
                 return 24
             return 20
+        if self._hematologic_malignancy_gap(candidate, gap):
+            if "\u9aa8\u9ad3\u7a7f\u523a" in compact or "\u9aa8\u9ad3\u6d3b\u68c0" in compact or "bmab" in compact:
+                return 100
+            if "\u9aa8\u9ad3\u6d41\u5f0f" in compact or "\u6d41\u5f0f\u7ec6\u80de" in compact or "\u514d\u75ab\u5206\u578b" in compact:
+                return 96
+            if "\u767d\u8840\u75c5\u878d\u5408\u57fa\u56e0" in compact or "\u878d\u5408\u57fa\u56e0" in compact:
+                return 92
+            if "\u7ec6\u80de\u9057\u4f20" in compact or "\u67d3\u8272\u4f53\u6838\u578b" in compact:
+                return 88
+            if "\u5916\u5468\u8840\u6d82\u7247" in compact:
+                return 72
+            if "\u7ec4\u7ec7\u75c5\u7406" in compact or "\u7a7f\u523a\u6d3b\u68c0" in compact:
+                return 58
+            if "\u5168\u8840\u7ec6\u80de\u8ba1\u6570" in compact or "\u8840\u5e38\u89c4" in compact or "cbc" in compact:
+                return 38
+            if "\u8840\u6c89" in compact or "esr" in compact or "\u809d\u529f\u80fd" in compact or "\u80be\u529f\u80fd" in compact:
+                return 22
+            return 18
         resolution_type = str(resolution.get("resolution_type") or "")
         if resolution_type in _FULL_CLOSURE_RESOLUTION_TYPES:
             return 80
@@ -3227,9 +3260,24 @@ class DiagnosisJudge:
         return bool(
             entity_id == "D100055"
             or "pavm" in text
-            or "\u80ba\u52a8\u9759\u8109\u7626" in text
+            or "\u80ba\u52a8\u9759\u8109\u7618" in text
             or "pulmonary_avm" in text
             or "pulmonary_vascular" in text
+        )
+
+    @staticmethod
+    def _hematologic_malignancy_gap(candidate: Any, gap: Dict[str, Any]) -> bool:
+        entity_id = str(getattr(candidate, "entity_id", "") or "")
+        name = str(getattr(candidate, "diagnosis", "") or "")
+        canonical = str(getattr(candidate, "canonical_name", "") or "")
+        target = str((gap or {}).get("target_evidence") or "")
+        text = f"{entity_id} {name} {canonical} {target}".lower()
+        return bool(
+            entity_id == "D000025"
+            or "leukemia" in text
+            or "blast" in text
+            or "acute_leukemia" in text
+            or "\u767d\u8840\u75c5" in text
         )
 
     def _apply_deferred_gap_decision_audit(

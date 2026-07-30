@@ -302,6 +302,40 @@ class EvidenceGapExamRecommendationTests(unittest.TestCase):
         self.assertIn("尿液分析（UA）", exams)
         self.assertIn("肾功能检查（RFTs）", exams)
 
+    def test_strategy_order_items_preserves_reserved_pavm_closure_exam(self):
+        agent = self.make_agent()
+        cta = "\u80ba\u52a8\u8109CTA"
+        anca = "\u6297\u4e2d\u6027\u7c92\u7ec6\u80de\u80de\u8d28\u6297\u4f53\uff08ANCA\uff09\u8c31"
+        strategy = {
+            "items": [cta, anca],
+            "differential_driven": True,
+            "exam_authorization_details": [
+                {
+                    "exam": cta,
+                    "exam_source": "deferred_gap_closure_exam",
+                    "priority_override": True,
+                    "priority_bucket": "high_value_deferred_gap_closure",
+                    "target_gaps": ["G-PAVF-01"],
+                },
+                {
+                    "exam": anca,
+                    "exam_source": "conflict_adjudication_exam",
+                    "priority_bucket": "conflict_adjudication",
+                },
+            ],
+        }
+
+        items = agent._strategy_order_items(
+            strategy,
+            collected_info={"symptoms": ["\u54af\u8840", "\u4f4e\u6c27"]},
+            candidate_diseases=["\u80ba\u52a8\u9759\u8109\u7618", "\u80ba\u764c"],
+            existing_results={},
+            max_items=1,
+            add_strong_verification=False,
+        )
+
+        self.assertEqual(items, [cta])
+
     def test_strict_primary_av_block_stops_low_magnesium_gap_exams(self):
         agent = self.make_agent()
         av_block = "\u4e8c\u5ea6\u623f\u5ba4\u4f20\u5bfc\u963b\u6ede"

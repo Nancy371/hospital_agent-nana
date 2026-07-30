@@ -41,6 +41,50 @@ class ExamResolverTests(unittest.TestCase):
         self.assertEqual(result.resolved_exam, "胸部CT扫描（Chest CT）")
         self.assertLess(result.diagnostic_coverage, 1.0)
 
+    def test_pavm_candidate_preserves_controlled_cta_request(self):
+        resolver = ExamResolver(
+            catalog_names=["\u80f8\u90e8CT\u626b\u63cf\uff08Chest CT\uff09"]
+        )
+
+        result = resolver.resolve(
+            "\u80ba\u52a8\u8109CTA",
+            candidate="\u80ba\u52a8\u9759\u8109\u7618",
+        )
+
+        self.assertEqual(result.resolution_type, EQUIVALENT)
+        self.assertEqual(result.resolved_exam, "\u80ba\u52a8\u8109CTA")
+        self.assertEqual(result.diagnostic_coverage, 1.0)
+
+    def test_leukemia_candidate_preserves_controlled_marrow_and_flow_requests(self):
+        resolver = ExamResolver(
+            catalog_names=[
+                "\u7ec4\u7ec7\u75c5\u7406\u5b66\u68c0\u67e5",
+                "\u7a7f\u523a\u6d3b\u68c0",
+                "\u57fa\u56e0\u68c0\u6d4b",
+            ]
+        )
+
+        marrow = resolver.resolve(
+            "\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09",
+            candidate="\u767d\u8840\u75c5",
+        )
+        flow = resolver.resolve(
+            "\u6d41\u5f0f\u7ec6\u80de\u672f\u514d\u75ab\u5206\u578b",
+            candidate="\u767d\u8840\u75c5",
+        )
+
+        self.assertEqual(marrow.resolution_type, EQUIVALENT)
+        self.assertEqual(
+            marrow.resolved_exam,
+            "\u9aa8\u9ad3\u7a7f\u523a\u548c\u6d3b\u68c0\uff08BMAB\uff09",
+        )
+        self.assertEqual(flow.resolution_type, EQUIVALENT)
+        self.assertEqual(
+            flow.resolved_exam,
+            "\u6d41\u5f0f\u7ec6\u80de\u672f\u514d\u75ab\u5206\u578b",
+        )
+        self.assertNotEqual(marrow.resolved_exam, "\u7ec4\u7ec7\u75c5\u7406\u5b66\u68c0\u67e5")
+
     def test_pulmonary_vascular_special_requests_use_equivalent_catalog_exam(self):
         resolver = ExamResolver(
             catalog_names=[

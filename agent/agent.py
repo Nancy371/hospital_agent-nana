@@ -1456,10 +1456,21 @@ class MyDoctorAgent(BaseDoctorAgent):
         self,
         collected_info: Dict[str, Any],
         exam_results: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         try:
             evidence = self.clinical_normalizer.normalize(collected_info, exam_results)
-            decision = self.diagnosis_engine.decide({}, [], evidence)
+            llm_result: Dict[str, Any] = {}
+            if isinstance(thinking, dict):
+                candidates = (
+                    thinking.get("differential_diagnosis")
+                    or thinking.get("candidate_diseases")
+                    or thinking.get("diagnosis_candidates")
+                    or []
+                )
+                if isinstance(candidates, list):
+                    llm_result["diagnosis_candidates"] = candidates
+            decision = self.diagnosis_engine.decide(llm_result, [], evidence)
             payload = dict(getattr(decision, "judge_decision", None) or {})
             if payload:
                 payload["stage"] = "pre_exam_judge"
@@ -1467,6 +1478,83 @@ class MyDoctorAgent(BaseDoctorAgent):
         except Exception as exc:
             logger.debug("[Judge] pre-exam judge skipped: %s", exc)
             return {}
+
+    def _strategy_order_items(
+        self,
+        strategy: Dict[str, Any],
+        collected_info: Dict[str, Any],
+        candidate_diseases: Optional[List[Any]],
+        existing_results: Dict[str, Any],
+        max_items: Optional[int],
+        add_strong_verification: bool = False,
+    ) -> List[str]:
+        items = list(strategy.get("items") or [])
+        details = [
+            item
+            for item in strategy.get("exam_authorization_details", []) or []
+            if isinstance(item, dict)
+        ]
+        has_reserved_gap = any(
+            str(item.get("exam_source") or "") == "deferred_gap_closure_exam"
+            and (
+                bool(item.get("priority_override"))
+                or str(item.get("priority_bucket") or "")
+                == "high_value_deferred_gap_closure"
+            )
+            for item in details
+        )
+        if not (strategy.get("differential_driven") or has_reserved_gap):
+            return self.exam_agent.prepare_order_items(
+                items,
+                collected_info=collected_info,
+                candidate_diseases=candidate_diseases,
+                existing_results=existing_results,
+                max_items=max_items,
+                add_strong_verification=add_strong_verification,
+            )
+
+        detail_by_exam = {
+            str(item.get("exam") or "").strip(): item
+            for item in details
+            if str(item.get("exam") or "").strip()
+        }
+        existing_valid, _ = self.knowledge.normalize_examinations(
+            list((existing_results or {}).keys())
+        )
+        existing_set = set((existing_results or {}).keys()) | set(existing_valid)
+        prepared: List[str] = []
+        for item in items:
+            exam = str(item or "").strip()
+            if not exam or exam in existing_set or exam in prepared:
+                continue
+            prepared.append(exam)
+        if max_items is None or len(prepared) <= max_items:
+            return prepared
+        limit = max(0, int(max_items))
+        reserved = [
+            item
+            for item in prepared
+            if str(detail_by_exam.get(item, {}).get("exam_source") or "")
+            == "deferred_gap_closure_exam"
+            and (
+                bool(detail_by_exam.get(item, {}).get("priority_override"))
+                or str(detail_by_exam.get(item, {}).get("priority_bucket") or "")
+                == "high_value_deferred_gap_closure"
+            )
+        ]
+        urgent = [
+            item
+            for item in prepared
+            if str(detail_by_exam.get(item, {}).get("priority_bucket") or "")
+            == "urgent_safety"
+        ]
+        selected: List[str] = []
+        for item in urgent + reserved + prepared:
+            if item not in selected:
+                selected.append(item)
+            if len(selected) >= limit:
+                break
+        return selected
 
     async def _execute_order_examination(
         self,
@@ -1511,7 +1599,11 @@ class MyDoctorAgent(BaseDoctorAgent):
         _cands = None
         if thinking and isinstance(thinking, dict):
             _cands = thinking.get("differential_diagnosis") or thinking.get("candidate_diseases")
-        pre_exam_judge = self._pre_exam_judge_payload(collected_info, exam_results)
+        pre_exam_judge = self._pre_exam_judge_payload(
+            collected_info,
+            exam_results,
+            thinking=thinking if isinstance(thinking, dict) else None,
+        )
         if pre_exam_judge.get("differential_candidates"):
             _cands = [
                 str(item).strip()
@@ -1584,6 +1676,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                         strategy.get("discriminating_items") or []
                     ),
                     "authorized_items": list(strategy.get("items") or []),
+                    "reserved_gap_items": list(strategy.get("reserved_gap_items") or []),
+                    "source_decision_version": strategy.get("source_decision_version", 0),
+                    "source_evidence_version": strategy.get("source_evidence_version", 0),
                     "blocked_items": list(strategy.get("blocked_items") or []),
                     "exam_authorization_details": list(
                         strategy.get("exam_authorization_details") or []
@@ -1593,8 +1688,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                     ),
                 }
             )
-        exam_items = self.exam_agent.prepare_order_items(
-            strategy.get("items", []),
+        exam_items = self._strategy_order_items(
+            strategy,
             collected_info=collected_info,
             candidate_diseases=_cands if isinstance(_cands, list) else None,
             existing_results=exam_results,
@@ -2948,7 +3043,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             _cands2 = None
             if thinking and isinstance(thinking, dict):
                 _cands2 = thinking.get("differential_diagnosis") or thinking.get("candidate_diseases")
-            pre_exam_judge = self._pre_exam_judge_payload(collected_info, exam_results)
+            pre_exam_judge = self._pre_exam_judge_payload(
+                collected_info,
+                exam_results,
+                thinking=thinking if isinstance(thinking, dict) else None,
+            )
             if pre_exam_judge.get("differential_candidates"):
                 _cands2 = [
                     str(item).strip()
@@ -3022,6 +3121,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                             strategy.get("discriminating_items") or []
                         ),
                         "authorized_items": list(strategy.get("items") or []),
+                        "reserved_gap_items": list(strategy.get("reserved_gap_items") or []),
+                        "source_decision_version": strategy.get("source_decision_version", 0),
+                        "source_evidence_version": strategy.get("source_evidence_version", 0),
                         "blocked_items": list(strategy.get("blocked_items") or []),
                         "exam_authorization_details": list(
                             strategy.get("exam_authorization_details") or []
@@ -3031,8 +3133,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                         ),
                     }
                 )
-            exam_items = self.exam_agent.prepare_order_items(
-                strategy.get("items", []),
+            exam_items = self._strategy_order_items(
+                strategy,
                 collected_info=collected_info,
                 candidate_diseases=_cands2 if isinstance(_cands2, list) else None,
                 existing_results=exam_results,
@@ -3248,6 +3350,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 exam_results=exam_results,
                 collected_info=collected_info,
                 candidate_diseases=corrective_candidate_diseases,
+                judge_decision=pre_corrective_judge,
                 add_strong_verification=not bool(
                     pre_corrective_judge.get("needs_discriminating_exams")
                 ),
@@ -4110,14 +4213,26 @@ class MyDoctorAgent(BaseDoctorAgent):
             ordered_items = list(
                 dict.fromkeys(proposed + list(strategy.get("items", []) or []))
             )
-        items = self.exam_agent.prepare_order_items(
-            ordered_items,
-            collected_info=collected_info,
-            candidate_diseases=targets,
-            existing_results=exam_results,
-            max_items=self.diagnosis_critic.max_corrective_exam_items,
-            add_strong_verification=False,
-        )
+        if strategy.get("items"):
+            strategy_for_items = dict(strategy)
+            strategy_for_items["items"] = ordered_items
+            items = self._strategy_order_items(
+                strategy_for_items,
+                collected_info=collected_info,
+                candidate_diseases=targets,
+                existing_results=exam_results,
+                max_items=self.diagnosis_critic.max_corrective_exam_items,
+                add_strong_verification=False,
+            )
+        else:
+            items = self.exam_agent.prepare_order_items(
+                ordered_items,
+                collected_info=collected_info,
+                candidate_diseases=targets,
+                existing_results=exam_results,
+                max_items=self.diagnosis_critic.max_corrective_exam_items,
+                add_strong_verification=False,
+            )
         if (
             strategy.get("strict_diagnosis_driven")
             or strategy.get("differential_driven")
@@ -4138,6 +4253,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                         strategy.get("discriminating_items") or []
                     ),
                     "authorized_items": list(items or []),
+                    "reserved_gap_items": list(strategy.get("reserved_gap_items") or []),
+                    "source_decision_version": strategy.get("source_decision_version", 0),
+                    "source_evidence_version": strategy.get("source_evidence_version", 0),
                     "blocked_items": list(strategy.get("blocked_items") or []),
                     "exam_authorization_details": list(
                         strategy.get("exam_authorization_details") or []
@@ -4644,25 +4762,53 @@ class MyDoctorAgent(BaseDoctorAgent):
         exam_results: Dict[str, Any],
         collected_info: Optional[Dict[str, Any]] = None,
         candidate_diseases: Optional[List[Any]] = None,
+        judge_decision: Optional[Dict[str, Any]] = None,
         add_strong_verification: bool = True,
         force_deferred_anchor_round: bool = False,
     ) -> Dict[str, Any]:
+        has_judge_gap_plan = bool(
+            judge_decision
+            and (
+                (judge_decision.get("deferred_gap_closure_tasks") or [])
+                or (judge_decision.get("exam_priority_overrides") or [])
+            )
+        )
         if (
             not recommended_exams
+            and not has_judge_gap_plan
             or self._remaining_case_seconds() < self.diagnosis_critic.corrective_exam_min_seconds
         ):
             return {}
         planner = self._get_planner()
         if planner.exam_rounds >= self.max_exam_rounds and not force_deferred_anchor_round:
             return {}
-        items = self.exam_agent.prepare_order_items(
-            recommended_exams,
-            collected_info=collected_info or {},
-            candidate_diseases=candidate_diseases,
-            existing_results=exam_results,
-            max_items=self.diagnosis_critic.max_corrective_exam_items,
-            add_strong_verification=add_strong_verification,
-        )
+        strategy: Dict[str, Any] = {}
+        if judge_decision:
+            strategy = self.exam_agent.recommend(
+                collected_info=collected_info or {},
+                candidate_diseases=candidate_diseases,
+                proposed_items=recommended_exams or [],
+                existing_results=exam_results,
+                judge_decision=judge_decision,
+            )
+        if strategy.get("items"):
+            items = self._strategy_order_items(
+                strategy,
+                collected_info=collected_info or {},
+                candidate_diseases=candidate_diseases,
+                existing_results=exam_results,
+                max_items=self.diagnosis_critic.max_corrective_exam_items,
+                add_strong_verification=False,
+            )
+        else:
+            items = self.exam_agent.prepare_order_items(
+                recommended_exams,
+                collected_info=collected_info or {},
+                candidate_diseases=candidate_diseases,
+                existing_results=exam_results,
+                max_items=self.diagnosis_critic.max_corrective_exam_items,
+                add_strong_verification=add_strong_verification,
+            )
         normalized_recommended, _ = self.knowledge.normalize_examinations(
             recommended_exams or []
         )
@@ -4670,18 +4816,25 @@ class MyDoctorAgent(BaseDoctorAgent):
             item for item in normalized_recommended
             if item not in set(items or [])
         ]
-        if blocked_items:
+        if blocked_items or strategy.get("exam_authorization_details"):
             self._last_exam_authorization.append(
                 {
                     "stage": "critic_corrective_exam",
                     "strict_diagnosis_driven": True,
+                    "differential_driven": bool(strategy.get("differential_driven")),
                     "primary_diagnosis": (
                         str(candidate_diseases[0])
                         if candidate_diseases
                         else ""
                     ),
                     "authorized_items": list(items or []),
+                    "reserved_gap_items": list(strategy.get("reserved_gap_items") or []),
+                    "source_decision_version": strategy.get("source_decision_version", 0),
+                    "source_evidence_version": strategy.get("source_evidence_version", 0),
                     "blocked_items": list(dict.fromkeys(blocked_items)),
+                    "exam_authorization_details": list(
+                        strategy.get("exam_authorization_details") or []
+                    ),
                 }
             )
         if not items:
