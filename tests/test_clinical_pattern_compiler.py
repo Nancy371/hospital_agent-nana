@@ -7,6 +7,9 @@ from agent.clinical_pattern_compiler import ClinicalPatternCompiler
 from agent.diagnosis_engine import DiagnosisDecisionEngine
 
 
+REITER = "\u8d56\u7279\u7efc\u5408\u5f81"
+
+
 def load_config():
     with open("config.yaml", "r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
@@ -47,6 +50,9 @@ class ClinicalPatternCompilerTests(unittest.TestCase):
         self.assertGreaterEqual(pattern.confidence, 0.62)
         self.assertIn("postinfectious_immune_inflammation", pattern.mechanism_ids)
         self.assertIn("reactive_arthritis_spectrum", pattern.family_ids)
+        self.assertIn("musculoskeletal", pattern.matched_domains)
+        self.assertIn("genitourinary", pattern.matched_domains)
+        self.assertIn("ocular", pattern.matched_domains)
 
     def test_deep_bleeding_contradiction_prevents_platelet_pattern(self):
         evidence = EvidenceBundle(
@@ -105,6 +111,40 @@ class ClinicalPatternCompilerTests(unittest.TestCase):
                 source.get("source") == "clinical_pattern"
                 and source.get("metadata", {}).get("pattern_id") == "postinfectious_arthritis_uroocular_pattern"
                 for source in reiter.candidate_sources
+            )
+        )
+        self.assertTrue(reiter.bridge_protection_decisions)
+        self.assertTrue(
+            any(
+                item.get("canonical_pattern") == "reactive_arthritis_bridge_pattern"
+                for item in reiter.derived_pattern_assertions
+            )
+        )
+        self.assertNotIn(
+            REITER,
+            [
+                item.get("diagnosis")
+                for item in decision.judge_decision.get("excluded_from_pairwise", [])
+                if item.get("reason") == "cross_system_no_shared_core_evidence"
+            ],
+        )
+        self.assertEqual(
+            decision.judge_decision.get("pool_filter_reasons", {}).get(REITER),
+            "verified_multi_system_syndrome_bridge",
+        )
+        self.assertTrue(
+            any(
+                item.get("candidate") == REITER
+                and item.get("decision")
+                in {
+                    "SelectedPrimary",
+                    "SelectedSecondary",
+                    "DeferredNeedsConfirmatoryEvidence",
+                    "RejectedAfterComparison",
+                }
+                for item in decision.judge_decision.get(
+                    "bridge_candidate_final_dispositions", []
+                )
             )
         )
 

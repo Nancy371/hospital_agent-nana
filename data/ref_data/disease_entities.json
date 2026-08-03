@@ -10694,6 +10694,29 @@
               "reason": "NeedsAnchor"
             }
           }
+        ],
+        "accepted_bridge_patterns": [
+          {
+            "pattern_id": "postinfectious_arthritis_uroocular_pattern",
+            "canonical_pattern": "reactive_arthritis_bridge_pattern",
+            "assertion_type": "multi_system_syndrome_pattern",
+            "binding_type": "syndrome_support",
+            "minimum_strength": "probable",
+            "protection_scope": [
+              "cross_system_no_shared_core_evidence"
+            ],
+            "strong_required_domains": [
+              "musculoskeletal",
+              "genitourinary",
+              "ocular"
+            ],
+            "probable_required_domains": [
+              "musculoskeletal",
+              "genitourinary"
+            ],
+            "strong_min_confidence": 0.62,
+            "probable_min_confidence": 0.62
+          }
         ]
       },
       "metadata": {

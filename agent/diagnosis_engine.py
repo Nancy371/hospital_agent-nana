@@ -15,6 +15,7 @@ from .case_board import (
     judge_decision_is_stale,
 )
 from .clinical_evidence import EvidenceBundle, Observation
+from .clinical_pattern_bridge import BridgePatternValidator
 from .clinical_pattern_compiler import ClinicalPatternCompiler
 from .diagnosis_eligibility import (
     DEFERRED,
@@ -224,6 +225,10 @@ class CandidateScore:
     eligibility_blockers: List[str] = field(default_factory=list)
     evidence_contributions: List[Dict[str, Any]] = field(default_factory=list)
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    clinical_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    derived_pattern_assertions: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_validation_results: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_protection_decisions: List[Dict[str, Any]] = field(default_factory=list)
     positive_evidence_score: float = 0.0
     evidence_specificity_score: float = 0.0
     entity_id: str = ""
@@ -292,6 +297,11 @@ class DiagnosisDecision:
     open_world_candidates: List[Dict[str, Any]] = field(default_factory=list)
     mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
     clinical_patterns: List[Dict[str, Any]] = field(default_factory=list)
+    clinical_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    derived_pattern_assertions: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_validation_results: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_protection_decisions: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_protected_candidates: List[str] = field(default_factory=list)
     retrieval_views: List[Dict[str, Any]] = field(default_factory=list)
     evidence_conflicts: List[Dict[str, Any]] = field(default_factory=list)
     conflict_affected_diagnoses: List[str] = field(default_factory=list)
@@ -340,6 +350,11 @@ class DiagnosisDecision:
             "open_world_candidates": list(self.open_world_candidates),
             "mechanism_hypotheses": list(self.mechanism_hypotheses),
             "clinical_patterns": list(self.clinical_patterns),
+            "clinical_pattern_matches": list(self.clinical_pattern_matches),
+            "derived_pattern_assertions": list(self.derived_pattern_assertions),
+            "bridge_validation_results": list(self.bridge_validation_results),
+            "bridge_protection_decisions": list(self.bridge_protection_decisions),
+            "bridge_protected_candidates": list(self.bridge_protected_candidates),
             "retrieval_views": list(self.retrieval_views),
             "evidence_conflicts": list(self.evidence_conflicts),
             "conflict_affected_diagnoses": list(self.conflict_affected_diagnoses),
@@ -604,6 +619,7 @@ class DiagnosticKnowledgeBase:
                         "suppress_diagnoses",
                         "generalization_suppressions",
                         "diagnostic_patterns",
+                        "accepted_bridge_patterns",
                     }:
                         merged[key] = _dedupe_objects(
                             list(merged.get(key, [])) + list(value or [])
@@ -661,6 +677,7 @@ class DiagnosticKnowledgeBase:
             "category": "",
             "generalization_suppressions": [],
             "diagnostic_patterns": [],
+            "accepted_bridge_patterns": [],
             "sources": [],
             "source_version": "",
             "department": "",
@@ -791,6 +808,11 @@ class DiagnosticKnowledgeBase:
                 entry["diagnostic_patterns"] = _dedupe_objects(
                     list(entry.get("diagnostic_patterns", []) or [])
                     + list(evidence_profile.get("diagnostic_patterns") or [])
+                )
+            if evidence_profile.get("accepted_bridge_patterns"):
+                entry["accepted_bridge_patterns"] = _dedupe_objects(
+                    list(entry.get("accepted_bridge_patterns", []) or [])
+                    + list(evidence_profile.get("accepted_bridge_patterns") or [])
                 )
             self.entity_id_by_name[name] = entity.entity_id
             self.aliases[name] = name
@@ -1125,6 +1147,7 @@ class DiagnosisDecisionEngine:
         self.candidate_generator = CandidateGenerator(self.knowledge, self.resolver)
         self.mechanism_reasoner = MechanismReasoner()
         self.clinical_pattern_compiler = ClinicalPatternCompiler(ref_dir)
+        self.bridge_pattern_validator = BridgePatternValidator()
         self.judge = DiagnosisJudge(config=config, knowledge=self.knowledge)
         self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
         self.conflict_arbiter = EvidenceConflictArbiter(self.knowledge)
@@ -1230,6 +1253,12 @@ class DiagnosisDecisionEngine:
         )
         self._apply_evidence_conflicts(scores, evidence_conflicts)
         eligibility_summary = self.eligibility_gate.evaluate_all(scores, evidence)
+        bridge_summary = self.bridge_pattern_validator.validate_all(
+            scores,
+            clinical_patterns,
+            self.knowledge,
+            case_version=case_board.case_version,
+        )
         scores = self._sort_candidates(scores)
 
         trusted_pool = [
@@ -1297,6 +1326,24 @@ class DiagnosisDecisionEngine:
             open_world_candidates=open_world_candidates,
             mechanism_hypotheses=mechanism_hypotheses,
             clinical_patterns=clinical_patterns,
+            clinical_pattern_matches=self._candidate_bridge_records(
+                scores,
+                "clinical_pattern_matches",
+            ),
+            derived_pattern_assertions=self._candidate_bridge_records(
+                scores,
+                "derived_pattern_assertions",
+            ),
+            bridge_validation_results=list(
+                bridge_summary.get("bridge_validation_results") or []
+            ),
+            bridge_protection_decisions=self._candidate_bridge_records(
+                scores,
+                "bridge_protection_decisions",
+            ),
+            bridge_protected_candidates=list(
+                bridge_summary.get("bridge_protected_candidates") or []
+            ),
             retrieval_views=retrieval_views,
             evidence_conflicts=evidence_conflicts,
             conflict_affected_diagnoses=[
@@ -1575,6 +1622,36 @@ class DiagnosisDecisionEngine:
             or ""
         ).strip()
 
+    @staticmethod
+    def _candidate_bridge_records(
+        candidates: Sequence[CandidateScore],
+        attribute: str,
+    ) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in candidates or []:
+            diagnosis = str(getattr(candidate, "diagnosis", "") or "")
+            entity_id = str(getattr(candidate, "entity_id", "") or "")
+            for item in getattr(candidate, attribute, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                record = dict(item)
+                record.setdefault("candidate", diagnosis)
+                record.setdefault("entity_id", entity_id)
+                marker = "|".join(
+                    [
+                        attribute,
+                        str(record.get("candidate") or ""),
+                        str(record.get("entity_id") or ""),
+                        str(record.get("assertion_id") or record.get("match_id") or record.get("source_assertion_id") or record.get("pattern_id") or record),
+                    ]
+                )
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                records.append(record)
+        return records
+
     def _entity_resolution_audit(
         self,
         candidate_pool: CandidatePool,
@@ -1723,6 +1800,14 @@ class DiagnosisDecisionEngine:
             "exam_catalog_version",
         ):
             setattr(judge_decision, field_name, getattr(decision, field_name, ""))
+        for field_name in (
+            "clinical_pattern_matches",
+            "derived_pattern_assertions",
+            "bridge_validation_results",
+            "bridge_protection_decisions",
+            "bridge_protected_candidates",
+        ):
+            setattr(judge_decision, field_name, list(getattr(decision, field_name, []) or []))
 
     @staticmethod
     def _decision_judge_stale(decision: DiagnosisDecision) -> bool:

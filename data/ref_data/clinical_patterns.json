@@ -7,6 +7,7 @@
       "body_system": "hematology",
       "required_groups": [
         {
+          "domain": "hematology_skin",
           "findings": [
             "petechiae",
             "purpura",
@@ -15,6 +16,7 @@
           "min_match": 1
         },
         {
+          "domain": "hematology_mucosal",
           "findings": [
             "epistaxis",
             "gingival_bleeding",
@@ -30,6 +32,19 @@
         "isolated_thrombocytopenia",
         "coagulation_test_normal"
       ],
+      "finding_domains": {
+        "petechiae": "hematology_skin",
+        "purpura": "hematology_skin",
+        "ecchymosis": "hematology_skin",
+        "epistaxis": "hematology_mucosal",
+        "gingival_bleeding": "hematology_mucosal",
+        "menorrhagia": "hematology_mucosal",
+        "mucosal_bleeding": "hematology_mucosal",
+        "platelet_low": "hematology_lab",
+        "thrombocytopenia": "hematology_lab",
+        "isolated_thrombocytopenia": "hematology_lab",
+        "coagulation_test_normal": "hematology_lab"
+      },
       "contradicting_findings": [
         "hemarthrosis",
         "deep_muscle_hematoma",
@@ -73,6 +88,7 @@
       "body_system": "rheumatology",
       "required_groups": [
         {
+          "domain": "musculoskeletal",
           "findings": [
             "arthritis",
             "arthralgia",
@@ -82,6 +98,7 @@
           "min_match": 1
         },
         {
+          "domain": "genitourinary",
           "findings": [
             "urethritis",
             "dysuria",
@@ -97,6 +114,20 @@
         "recent_genitourinary_infection",
         "recent_gastrointestinal_infection"
       ],
+      "finding_domains": {
+        "arthritis": "musculoskeletal",
+        "arthralgia": "musculoskeletal",
+        "inflammatory_joint_pain": "musculoskeletal",
+        "asymmetric_lower_limb_arthritis": "musculoskeletal",
+        "urethritis": "genitourinary",
+        "dysuria": "genitourinary",
+        "genitourinary_infection": "genitourinary",
+        "conjunctivitis": "ocular",
+        "ocular_redness": "ocular_soft",
+        "uveitis": "ocular",
+        "recent_genitourinary_infection": "trigger_history",
+        "recent_gastrointestinal_infection": "trigger_history"
+      },
       "contradicting_findings": [
         "trauma_history",
         "post_traumatic_joint_pain",

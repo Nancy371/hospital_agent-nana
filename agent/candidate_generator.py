@@ -192,6 +192,7 @@ class CandidateGenerator:
                 metadata = {
                     "pattern_id": pattern.pattern_id,
                     "pattern_type": pattern.pattern_type,
+                    "pattern_version": pattern.pattern_version,
                     "body_system": pattern.body_system,
                     "mechanism_ids": list(pattern.mechanism_ids),
                     "family_ids": list(pattern.family_ids),
@@ -200,6 +201,12 @@ class CandidateGenerator:
                     "pattern_information_value": pattern.information_value,
                     "source_level": pattern.source_level,
                     "verified_pattern": bool(pattern.verified),
+                    "supporting_findings": list(pattern.supporting_findings),
+                    "supporting_observation_ids": list(pattern.supporting_observation_ids),
+                    "matched_domains": list(pattern.matched_domains),
+                    "temporal_consistency": pattern.temporal_consistency,
+                    "polarity_consistency": pattern.polarity_consistency,
+                    "clinical_pattern": pattern.to_dict(),
                 }
                 if resolution.canonical_name:
                     pool.add(

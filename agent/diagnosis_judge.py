@@ -20,6 +20,7 @@ from .diagnosis_eligibility import (
     EXCLUDED,
     PRIMARY_ELIGIBLE,
 )
+from .clinical_pattern_bridge import BRIDGE_REASON, CROSS_SYSTEM_SCOPE, has_active_bridge_protection
 from .exam_resolver import ALIAS, EQUIVALENT, EXACT, PARTIAL_SUBSTITUTE, ExamResolver
 
 
@@ -397,6 +398,10 @@ class JudgeCandidateReview:
     eligibility_substatus: str = ""
     missing_required_anchors: List[str] = field(default_factory=list)
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    clinical_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    derived_pattern_assertions: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_validation_results: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_protection_decisions: List[Dict[str, Any]] = field(default_factory=list)
     exam_followup_authorized: bool = False
     submission_authorized: bool = False
     evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
@@ -489,6 +494,14 @@ class JudgeDecision:
     excluded_candidates: List[str] = field(default_factory=list)
     primary_eligible_candidates: List[str] = field(default_factory=list)
     entity_resolutions: List[Dict[str, Any]] = field(default_factory=list)
+    clinical_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    derived_pattern_assertions: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_validation_results: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_protection_decisions: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_protected_candidates: List[str] = field(default_factory=list)
+    bridge_pairwise_comparisons: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_candidate_final_dispositions: List[Dict[str, Any]] = field(default_factory=list)
+    bridge_generated_gaps: List[Dict[str, Any]] = field(default_factory=list)
     case_version: int = 0
     evidence_snapshot_hash: str = ""
     knowledge_profile_version: str = ""
@@ -560,7 +573,11 @@ class DifferentialPoolFilter:
             name = self._name(candidate)
             if name in force_names and not getattr(candidate, "hard_contradiction", False):
                 retained.append(candidate)
-                result.pool_filter_reasons[name] = "forced_conflict_or_top_candidate"
+                result.pool_filter_reasons[name] = (
+                    BRIDGE_REASON
+                    if self._bridge_protected(candidate)
+                    else "forced_conflict_or_top_candidate"
+                )
                 continue
             reason = self._keep_reason(
                 candidate,
@@ -655,6 +672,8 @@ class DifferentialPoolFilter:
         data = relevance[name]
         if getattr(candidate, "hard_contradiction", False):
             return ""
+        if self._bridge_protected(candidate):
+            return BRIDGE_REASON
         if self._high_explanatory_candidate(candidate, data):
             return "high_explanatory_primary_candidate"
         if self._direct_diagnosis(candidate):
@@ -735,6 +754,8 @@ class DifferentialPoolFilter:
         data = relevance[name]
         if getattr(candidate, "hard_contradiction", False):
             return "negative_feature"
+        if self._bridge_protected(candidate):
+            return BRIDGE_REASON
         if not data["core"] and data["generic"]:
             return "generic_only_evidence"
         if data["cluster"] not in dominant_clusters and dominant_clusters:
@@ -838,11 +859,17 @@ class DifferentialPoolFilter:
             return True, "same_family"
         if self.judge._causally_related(left, right):
             return True, "causal_or_graph_relation"
+        if self._bridge_protected(left) or self._bridge_protected(right):
+            return True, BRIDGE_REASON
         if self.judge._same_body_system(left, right) and (
             left_data["core"] or right_data["core"]
         ):
             return True, "same_body_system_with_core_evidence"
         return False, "cross_system_no_shared_core_evidence"
+
+    @staticmethod
+    def _bridge_protected(candidate: Any) -> bool:
+        return has_active_bridge_protection(candidate, CROSS_SYSTEM_SCOPE)
 
     def _can_form_differential(
         self,
@@ -874,6 +901,7 @@ class DifferentialPoolFilter:
             index = original_index.get(id(item), 999)
             return (
                 1 if self._high_explanatory_candidate(item, data) else 0,
+                1 if self._bridge_protected(item) else 0,
                 1 if index < self.judge.differential_top_k else 0,
                 1 if data["core"] else 0,
                 1 if self._direct_diagnosis(item) else 0,
@@ -1354,12 +1382,14 @@ class DiagnosisJudge:
         pattern_force_names = self._forced_pool_names_for_pattern_deferred(ranked)
         claim_force_names = self._forced_pool_names_for_claims(ranked)
         gap_force_names = self._forced_pool_names_for_deferred_gap_override(ranked)
+        bridge_force_names = self._forced_pool_names_for_bridge_protection(ranked)
         force_names = list(
             dict.fromkeys(
                 list(force_names)
                 + pattern_force_names
                 + claim_force_names
                 + gap_force_names
+                + bridge_force_names
             )
         )
         candidate_pool_for_workup = [
@@ -1380,6 +1410,8 @@ class DiagnosisJudge:
             raw_pool_source[name] = "critical_evidence_claim_followup"
         for name in gap_force_names:
             raw_pool_source[name] = "deferred_gap_priority_override"
+        for name in bridge_force_names:
+            raw_pool_source[name] = "bridge_protection"
         for name in force_names:
             raw_pool_source.setdefault(
                 name,
@@ -1481,6 +1513,13 @@ class DiagnosisJudge:
                 differential_pool,
                 discriminating_exam_tasks,
             )
+            self._apply_bridge_decision_audit(
+                decision,
+                ranked_all,
+                differential_pool,
+                pairwise,
+                discriminating_exam_tasks,
+            )
             decision.required_gap_by_candidate = required_gap_by_candidate
             decision.differential_pool_source = dict(pool_filter.pool_source)
             decision.evidence_conflicts = evidence_conflicts
@@ -1576,6 +1615,13 @@ class DiagnosisJudge:
         self._apply_deferred_gap_decision_audit(
             decision,
             differential_pool,
+            discriminating_exam_tasks,
+        )
+        self._apply_bridge_decision_audit(
+            decision,
+            ranked_all,
+            differential_pool,
+            pairwise,
             discriminating_exam_tasks,
         )
         decision.required_gap_by_candidate = required_gap_by_candidate
@@ -3219,6 +3265,37 @@ class DiagnosisJudge:
             if self._exam_priority_override_candidate(item) and self._name(item)
         ][: self.gap_target_limit]
 
+    def _forced_pool_names_for_bridge_protection(
+        self,
+        candidates: Sequence[Any],
+    ) -> List[str]:
+        protected = [
+            item
+            for item in candidates or []
+            if has_active_bridge_protection(item, CROSS_SYSTEM_SCOPE)
+            and self._name(item)
+            and not getattr(item, "hard_contradiction", False)
+        ]
+        protected.sort(key=self._bridge_protection_sort_key, reverse=True)
+        return [self._name(item) for item in protected[:3]]
+
+    def _bridge_protection_sort_key(self, candidate: Any) -> tuple:
+        strength_rank = 0
+        for item in getattr(candidate, "bridge_protection_decisions", []) or []:
+            if not isinstance(item, dict):
+                continue
+            strength = str(item.get("strength") or "").lower()
+            strength_rank = max(
+                strength_rank,
+                {"weak": 0, "probable": 1, "strong": 2}.get(strength, 0),
+            )
+        return (
+            strength_rank,
+            self._core_coverage(candidate),
+            float(getattr(candidate, "max_gap_value", 0.0) or 0.0),
+            self._judge_score(candidate),
+        )
+
     def _deferred_gap_closure_exam_tasks(
         self,
         pool: Sequence[Any],
@@ -3603,6 +3680,76 @@ class DiagnosisJudge:
         ) if override_gap_ids else 0.0
         decision.exam_priority_alignment = decision.deferred_gap_closure_exam_coverage
         decision.wrong_primary_exam_drift = 0.0
+
+    def _apply_bridge_decision_audit(
+        self,
+        decision: JudgeDecision,
+        ranked_all: Sequence[Any],
+        differential_pool: Sequence[Any],
+        pairwise: Sequence[Dict[str, Any]],
+        discriminating_exam_tasks: Sequence[Dict[str, Any]],
+    ) -> None:
+        protected = [
+            item
+            for item in ranked_all or []
+            if has_active_bridge_protection(item, CROSS_SYSTEM_SCOPE)
+        ]
+        if not protected:
+            return
+        pool_names = {self._name(item) for item in differential_pool or []}
+        final_names = set(getattr(decision, "final_diagnoses", []) or [])
+        gap_targets = set(getattr(decision, "evidence_gap_targets", []) or [])
+        blocked_reasons = {
+            str(item.get("diagnosis") or ""): str(item.get("reason") or "")
+            for item in getattr(decision, "blocked_diagnoses", []) or []
+            if isinstance(item, dict)
+        }
+        decision.bridge_protected_candidates = list(
+            dict.fromkeys(
+                list(getattr(decision, "bridge_protected_candidates", []) or [])
+                + [self._name(item) for item in protected if self._name(item)]
+            )
+        )
+        decision.bridge_pairwise_comparisons = [
+            dict(item)
+            for item in pairwise or []
+            if str(item.get("left") or "") in decision.bridge_protected_candidates
+            or str(item.get("right") or "") in decision.bridge_protected_candidates
+        ]
+        dispositions: List[Dict[str, Any]] = []
+        for candidate in protected:
+            name = self._name(candidate)
+            if not name:
+                continue
+            if name in final_names:
+                disposition = "SelectedPrimary" if name == decision.primary else "SelectedSecondary"
+            elif name in gap_targets or self._eligibility_status(candidate) == DEFERRED:
+                disposition = "DeferredNeedsConfirmatoryEvidence"
+            elif name in pool_names:
+                disposition = "RejectedAfterComparison"
+            else:
+                disposition = "NotInJudgePool"
+            dispositions.append(
+                {
+                    "candidate": name,
+                    "entity_id": str(getattr(candidate, "entity_id", "") or ""),
+                    "entered_by": "bridge_protection",
+                    "eligibility_status": self._eligibility_status(candidate),
+                    "pool_filter_reason": decision.pool_filter_reasons.get(name, ""),
+                    "decision": disposition,
+                    "decision_reason": blocked_reasons.get(name, disposition),
+                    "bridge_protection_decisions": list(
+                        getattr(candidate, "bridge_protection_decisions", []) or []
+                    ),
+                }
+            )
+        decision.bridge_candidate_final_dispositions = dispositions
+        bridge_names = set(decision.bridge_protected_candidates)
+        decision.bridge_generated_gaps = [
+            dict(task)
+            for task in discriminating_exam_tasks or []
+            if bridge_names & set(task.get("target_candidates") or [])
+        ]
 
     def _merge_discriminating_exam_tasks(
         self,
@@ -4737,6 +4884,18 @@ class DiagnosisJudge:
                     )[:6],
                     evidence_pattern_matches=list(
                         getattr(candidate, "evidence_pattern_matches", []) or []
+                    )[:4],
+                    clinical_pattern_matches=list(
+                        getattr(candidate, "clinical_pattern_matches", []) or []
+                    )[:4],
+                    derived_pattern_assertions=list(
+                        getattr(candidate, "derived_pattern_assertions", []) or []
+                    )[:4],
+                    bridge_validation_results=list(
+                        getattr(candidate, "bridge_validation_results", []) or []
+                    )[:4],
+                    bridge_protection_decisions=list(
+                        getattr(candidate, "bridge_protection_decisions", []) or []
                     )[:4],
                     exam_followup_authorized=bool(role == "evidence_gap"),
                     submission_authorized=bool(

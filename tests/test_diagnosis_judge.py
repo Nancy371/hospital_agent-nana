@@ -2,6 +2,7 @@ import unittest
 
 import yaml
 
+from agent.clinical_pattern_bridge import BRIDGE_REASON, CROSS_SYSTEM_SCOPE
 from agent.diagnosis_engine import CandidateScore, DiagnosisDecision, DiagnosisDecisionEngine
 
 
@@ -29,6 +30,7 @@ AV_BLOCK_2 = "\u4e8c\u5ea6\u623f\u5ba4\u4f20\u5bfc\u963b\u6ede"
 ARRHYTHMIA = "\u5fc3\u5f8b\u5931\u5e38"
 LOW_MAGNESIUM = "\u4f4e\u9541\u8840\u75c7"
 RICKETS = "\u7ef4\u751f\u7d20D\u7f3a\u4e4f\u6027\u4f5d\u507b\u75c5"
+REACTIVE_ARTHRITIS = "\u53cd\u5e94\u6027\u5173\u8282\u708e"
 PAVM = "肺动静脉瘘"
 
 
@@ -471,6 +473,93 @@ class DiagnosisJudgeTests(unittest.TestCase):
                 PAVM in task.get("target_candidates", [])
                 and task.get("exam") in {"肺动脉CTA", "胸部增强CT", "超声心动图右心声学造影"}
                 for task in tasks
+            )
+        )
+
+    def test_bridge_protected_candidate_survives_cross_system_pool_filter(self):
+        leukemia = candidate(
+            LEUKEMIA,
+            0.74,
+            required=True,
+            matched=["fever", "anemia", "platelet_low"],
+            coverage=0.50,
+            residual=0.36,
+        )
+        reactive = candidate(
+            REACTIVE_ARTHRITIS,
+            0.31,
+            required=True,
+            diagnosis_type="disease",
+            matched=["arthralgia", "dysuria", "conjunctivitis"],
+            coverage=0.42,
+            residual=0.44,
+        )
+        reactive.bridge_protection_decisions = [
+            {
+                "candidate_id": "D100057",
+                "source_assertion_id": "DPA-test-reactive-arthritis",
+                "protection_scope": [CROSS_SYSTEM_SCOPE],
+                "protection_status": "active",
+                "reason_code": BRIDGE_REASON,
+                "strength": "strong",
+            }
+        ]
+
+        decision = self.run_candidates([leukemia, reactive])
+        payload = decision.judge_decision
+
+        self.assertIn(REACTIVE_ARTHRITIS, payload["differential_candidates"])
+        self.assertEqual(
+            payload["pool_filter_reasons"].get(REACTIVE_ARTHRITIS),
+            BRIDGE_REASON,
+        )
+        self.assertFalse(
+            any(
+                item.get("diagnosis") == REACTIVE_ARTHRITIS
+                and item.get("reason") == "cross_system_no_shared_core_evidence"
+                for item in payload["excluded_from_pairwise"]
+            )
+        )
+        self.assertTrue(
+            any(
+                item.get("allowed")
+                and item.get("reason") == BRIDGE_REASON
+                and REACTIVE_ARTHRITIS in {item.get("left"), item.get("right")}
+                for item in payload["pairwise_allowed_matrix"]
+            )
+        )
+
+    def test_bridge_protection_does_not_override_hard_blocker(self):
+        primary = candidate(LEUKEMIA, 0.72, required=True, matched=["blast_present"])
+        reactive = candidate(
+            REACTIVE_ARTHRITIS,
+            0.44,
+            required=True,
+            matched=["arthralgia", "dysuria", "conjunctivitis"],
+        )
+        reactive.hard_contradiction = True
+        reactive.bridge_protection_decisions = [
+            {
+                "candidate_id": "D100057",
+                "source_assertion_id": "DPA-test-reactive-arthritis",
+                "protection_scope": [CROSS_SYSTEM_SCOPE],
+                "protection_status": "active",
+                "reason_code": BRIDGE_REASON,
+                "strength": "strong",
+            }
+        ]
+
+        filtered = self.engine.judge.pool_filter.filter([primary, reactive])
+
+        self.assertNotIn(
+            REACTIVE_ARTHRITIS,
+            [item.diagnosis for item in filtered.candidates],
+        )
+        self.assertTrue(
+            any(
+                item.get("diagnosis") == REACTIVE_ARTHRITIS
+                and item.get("reason") == "negative_feature"
+                for item in filtered.excluded
             )
         )
 

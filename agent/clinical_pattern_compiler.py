@@ -19,12 +19,16 @@ from .clinical_evidence import EvidenceBundle, Observation
 class ClinicalPattern:
     pattern_id: str
     pattern_type: str
+    pattern_version: str = ""
     supporting_findings: List[str] = field(default_factory=list)
     supporting_observation_ids: List[str] = field(default_factory=list)
     contradicting_findings: List[str] = field(default_factory=list)
     missing_required_groups: List[List[str]] = field(default_factory=list)
+    matched_domains: List[str] = field(default_factory=list)
     body_system: str = ""
     temporal_pattern: str = ""
+    temporal_consistency: str = "unknown"
+    polarity_consistency: str = "consistent"
     confidence: float = 0.0
     information_value: float = 0.0
     mechanism_ids: List[str] = field(default_factory=list)
@@ -43,7 +47,9 @@ class ClinicalPatternCompiler:
     def __init__(self, ref_dir: str = "data/ref_data"):
         self.ref_dir = ref_dir
         self.path = os.path.join(ref_dir, "clinical_patterns.json")
-        self.rules = self._load_rules()
+        payload = self._load_payload()
+        self.version = str(payload.get("version") or "") if isinstance(payload, dict) else ""
+        self.rules = self._load_rules(payload)
 
     def compile(self, evidence: Optional[EvidenceBundle]) -> List[ClinicalPattern]:
         bundle = evidence or EvidenceBundle()
@@ -122,22 +128,35 @@ class ClinicalPatternCompiler:
 
         matched_required = []
         missing_required: List[List[str]] = []
+        matched_domains: List[str] = []
         supporting: List[str] = []
         observation_ids: List[str] = []
+        finding_domains = {
+            str(key): str(value)
+            for key, value in dict(rule.get("finding_domains") or {}).items()
+            if str(key) and str(value)
+        }
         for group in required_groups:
             findings = [str(item) for item in group.get("findings") or [] if str(item)]
             min_match = max(1, int(group.get("min_match", 1) or 1))
             hits = [finding for finding in findings if finding in positives]
             if len(hits) >= min_match:
+                domain = str(group.get("domain") or "").strip()
                 matched_required.append(
                     {
                         "findings": findings,
                         "min_match": min_match,
                         "matched": hits,
+                        "domain": domain,
                     }
                 )
                 supporting.extend(hits)
                 observation_ids.extend(_observation_ids(positives[finding]) for finding in hits)
+                if domain:
+                    matched_domains.append(domain)
+                matched_domains.extend(
+                    finding_domains.get(finding, "") for finding in hits
+                )
             else:
                 missing_required.append(findings)
 
@@ -155,6 +174,7 @@ class ClinicalPatternCompiler:
         optional_hits = [finding for finding in optional if finding in positives]
         supporting.extend(optional_hits)
         observation_ids.extend(_observation_ids(positives[finding]) for finding in optional_hits)
+        matched_domains.extend(finding_domains.get(finding, "") for finding in optional_hits)
 
         required_coverage = len(matched_required) / max(1, len(required_groups))
         optional_support = len(optional_hits) / max(1, len(optional)) if optional else 0.0
@@ -180,12 +200,16 @@ class ClinicalPatternCompiler:
         return ClinicalPattern(
             pattern_id=str(rule.get("pattern_id") or ""),
             pattern_type=str(rule.get("pattern_type") or "clinical_pattern"),
+            pattern_version=self.version,
             supporting_findings=_dedupe(supporting),
             supporting_observation_ids=_dedupe(observation_ids),
             contradicting_findings=_dedupe(contradicting),
             missing_required_groups=[],
+            matched_domains=_dedupe(matched_domains),
             body_system=str(rule.get("body_system") or ""),
             temporal_pattern=str(rule.get("temporal_pattern") or ""),
+            temporal_consistency=str(rule.get("temporal_consistency") or "supported"),
+            polarity_consistency="consistent" if not contradicting else "conflicted",
             confidence=round(confidence, 4),
             information_value=round(max(0.0, min(1.0, specificity)), 4),
             mechanism_ids=_dedupe(rule.get("mechanism_ids") or []),
@@ -201,8 +225,12 @@ class ClinicalPatternCompiler:
             },
         )
 
-    def _load_rules(self) -> List[Dict[str, Any]]:
+    def _load_payload(self) -> Dict[str, Any]:
         payload = _read_json(self.path, {})
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _load_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         rules = payload.get("patterns", []) if isinstance(payload, dict) else []
         return [dict(item) for item in rules if isinstance(item, dict)]
 
