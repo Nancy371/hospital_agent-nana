@@ -22,6 +22,8 @@ __all__ = [
     "EvidenceGraph",
     "EvidenceBundle",
     "Observation",
+    "ClinicalPattern",
+    "ClinicalPatternCompiler",
     "CandidateGenerator",
     "CandidatePool",
     "CandidateSource",
@@ -133,6 +135,9 @@ def __getattr__(name: str):
     if name in ("ClinicalEvidenceNormalizer", "EvidenceAgent", "EvidenceGraph", "EvidenceBundle", "Observation"):
         from . import clinical_evidence as _clinical_evidence
         return getattr(_clinical_evidence, name)
+    if name in ("ClinicalPattern", "ClinicalPatternCompiler"):
+        from . import clinical_pattern_compiler as _clinical_pattern_compiler
+        return getattr(_clinical_pattern_compiler, name)
     if name in ("CandidateGenerator", "CandidatePool", "CandidateSource"):
         from . import candidate_generator as _candidate_generator
         return getattr(_candidate_generator, name)

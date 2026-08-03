@@ -10299,6 +10299,411 @@
           "动脉血气分析"
         ]
       }
+    },
+    {
+      "entity_id": "D100056",
+      "canonical_name": "特发性血小板减少性紫癜",
+      "submission_name": "特发性血小板减少性紫癜",
+      "aliases": [
+        "特发性血小板减少性紫癜",
+        "免疫性血小板减少症",
+        "免疫性血小板减少性紫癜",
+        "ITP",
+        "immune thrombocytopenia",
+        "idiopathic thrombocytopenic purpura",
+        "血小板减少性紫癜"
+      ],
+      "submittable": true,
+      "source_kind": "controlled_extension",
+      "parent_entity_id": "",
+      "parent_name": "",
+      "icd10": "",
+      "department": "血液科",
+      "diagnosis_type": "disease",
+      "body_system": "hematology",
+      "disease_family": "thrombocytopenic_disorders",
+      "family": "thrombocytopenic_disorders",
+      "exam_bundle": [
+        "全血细胞计数（CBC）",
+        "外周血涂片",
+        "凝血功能",
+        "骨髓穿刺和活检（BMAB）",
+        "血小板相关抗体检测",
+        "溶血指标"
+      ],
+      "discriminating_exam_bundle": [
+        "全血细胞计数（CBC）",
+        "外周血涂片",
+        "凝血功能",
+        "骨髓穿刺和活检（BMAB）",
+        "血小板相关抗体检测",
+        "溶血指标"
+      ],
+      "treatment_bundle": [],
+      "evidence_profile": {
+        "required_groups": [
+          [
+            {
+              "finding": "platelet_low"
+            },
+            {
+              "finding": "thrombocytopenia"
+            },
+            {
+              "finding": "isolated_thrombocytopenia"
+            }
+          ],
+          [
+            {
+              "finding": "petechiae"
+            },
+            {
+              "finding": "purpura"
+            },
+            {
+              "finding": "ecchymosis"
+            },
+            {
+              "finding": "epistaxis"
+            },
+            {
+              "finding": "gingival_bleeding"
+            },
+            {
+              "finding": "mucosal_bleeding"
+            }
+          ]
+        ],
+        "supporting_evidence": [
+          {
+            "finding": "mucocutaneous_platelet_bleeding_pattern",
+            "weight": 0.5
+          },
+          {
+            "finding": "petechiae",
+            "weight": 0.34
+          },
+          {
+            "finding": "purpura",
+            "weight": 0.32
+          },
+          {
+            "finding": "ecchymosis",
+            "weight": 0.3
+          },
+          {
+            "finding": "epistaxis",
+            "weight": 0.28
+          },
+          {
+            "finding": "gingival_bleeding",
+            "weight": 0.3
+          },
+          {
+            "finding": "mucosal_bleeding",
+            "weight": 0.28
+          },
+          {
+            "finding": "platelet_low",
+            "weight": 0.82
+          },
+          {
+            "finding": "thrombocytopenia",
+            "weight": 0.72
+          },
+          {
+            "finding": "isolated_thrombocytopenia",
+            "weight": 0.84
+          },
+          {
+            "finding": "coagulation_test_normal",
+            "weight": 0.42
+          }
+        ],
+        "contradictions": [
+          {
+            "finding": "hemarthrosis",
+            "penalty": 0.28
+          },
+          {
+            "finding": "deep_muscle_hematoma",
+            "penalty": 0.28
+          },
+          {
+            "finding": "pt_prolonged",
+            "penalty": 0.24
+          },
+          {
+            "finding": "aptt_prolonged",
+            "penalty": 0.24
+          }
+        ],
+        "diagnostic_patterns": [
+          {
+            "pattern_id": "itp_confirmed_isolated_thrombocytopenic_bleeding_pattern",
+            "pattern_type": "anchor_pattern",
+            "logic": "all_of",
+            "required": [
+              {
+                "any_of": [
+                  "platelet_low",
+                  "thrombocytopenia",
+                  "isolated_thrombocytopenia"
+                ]
+              },
+              {
+                "any_of": [
+                  "petechiae",
+                  "purpura",
+                  "ecchymosis",
+                  "epistaxis",
+                  "gingival_bleeding",
+                  "mucosal_bleeding"
+                ]
+              }
+            ],
+            "requires_objective_source": false,
+            "effect": {
+              "eligibility": "PrimaryEligible"
+            }
+          },
+          {
+            "pattern_id": "itp_bleeding_without_platelet_anchor_pattern",
+            "pattern_type": "anchor_pattern",
+            "logic": "min_count",
+            "min_count": 2,
+            "required": [
+              "petechiae",
+              "purpura",
+              "ecchymosis",
+              "epistaxis",
+              "gingival_bleeding",
+              "mucosal_bleeding"
+            ],
+            "effect": {
+              "eligibility": "Deferred",
+              "reason": "NeedsAnchor"
+            }
+          }
+        ]
+      },
+      "metadata": {
+        "sources": [
+          "clinical_pattern_seed"
+        ],
+        "clinical_pattern_ids": [
+          "mucocutaneous_platelet_bleeding_pattern"
+        ]
+      }
+    },
+    {
+      "entity_id": "D100057",
+      "canonical_name": "赖特综合征",
+      "submission_name": "赖特综合征",
+      "aliases": [
+        "赖特综合征",
+        "反应性关节炎",
+        "Reiter syndrome",
+        "reactive arthritis",
+        "尿道炎关节炎结膜炎综合征",
+        "关节炎-尿道炎-结膜炎综合征"
+      ],
+      "submittable": true,
+      "source_kind": "controlled_extension",
+      "parent_entity_id": "",
+      "parent_name": "",
+      "icd10": "",
+      "department": "风湿免疫科",
+      "diagnosis_type": "disease",
+      "body_system": "rheumatology",
+      "disease_family": "seronegative_spondyloarthritis",
+      "family": "seronegative_spondyloarthritis",
+      "exam_bundle": [
+        "血常规",
+        "尿液分析（UA）",
+        "尿培养",
+        "淋球菌和衣原体核酸检测",
+        "HLA-B27检测",
+        "关节液检查",
+        "眼科裂隙灯检查"
+      ],
+      "discriminating_exam_bundle": [
+        "淋球菌和衣原体核酸检测",
+        "HLA-B27检测",
+        "关节液检查",
+        "眼科裂隙灯检查",
+        "尿培养",
+        "尿液分析（UA）"
+      ],
+      "treatment_bundle": [],
+      "evidence_profile": {
+        "required_groups": [
+          [
+            {
+              "finding": "arthritis"
+            },
+            {
+              "finding": "arthralgia"
+            },
+            {
+              "finding": "inflammatory_joint_pain"
+            },
+            {
+              "finding": "asymmetric_lower_limb_arthritis"
+            }
+          ],
+          [
+            {
+              "finding": "urethritis"
+            },
+            {
+              "finding": "dysuria"
+            },
+            {
+              "finding": "genitourinary_infection"
+            },
+            {
+              "finding": "recent_genitourinary_infection"
+            }
+          ],
+          [
+            {
+              "finding": "conjunctivitis"
+            },
+            {
+              "finding": "ocular_redness"
+            },
+            {
+              "finding": "uveitis"
+            }
+          ]
+        ],
+        "supporting_evidence": [
+          {
+            "finding": "postinfectious_arthritis_uroocular_pattern",
+            "weight": 0.58
+          },
+          {
+            "finding": "arthritis",
+            "weight": 0.34
+          },
+          {
+            "finding": "arthralgia",
+            "weight": 0.24
+          },
+          {
+            "finding": "inflammatory_joint_pain",
+            "weight": 0.34
+          },
+          {
+            "finding": "asymmetric_lower_limb_arthritis",
+            "weight": 0.42
+          },
+          {
+            "finding": "urethritis",
+            "weight": 0.36
+          },
+          {
+            "finding": "dysuria",
+            "weight": 0.22
+          },
+          {
+            "finding": "genitourinary_infection",
+            "weight": 0.24
+          },
+          {
+            "finding": "conjunctivitis",
+            "weight": 0.36
+          },
+          {
+            "finding": "ocular_redness",
+            "weight": 0.28
+          },
+          {
+            "finding": "uveitis",
+            "weight": 0.42
+          }
+        ],
+        "contradictions": [
+          {
+            "finding": "trauma_history",
+            "penalty": 0.32
+          },
+          {
+            "finding": "post_traumatic_joint_pain",
+            "penalty": 0.35
+          }
+        ],
+        "diagnostic_patterns": [
+          {
+            "pattern_id": "reiter_triads_anchor_pattern",
+            "pattern_type": "anchor_pattern",
+            "logic": "all_of",
+            "required": [
+              {
+                "any_of": [
+                  "arthritis",
+                  "arthralgia",
+                  "inflammatory_joint_pain",
+                  "asymmetric_lower_limb_arthritis"
+                ]
+              },
+              {
+                "any_of": [
+                  "urethritis",
+                  "dysuria",
+                  "genitourinary_infection",
+                  "recent_genitourinary_infection"
+                ]
+              },
+              {
+                "any_of": [
+                  "conjunctivitis",
+                  "ocular_redness",
+                  "uveitis"
+                ]
+              }
+            ],
+            "effect": {
+              "eligibility": "PrimaryEligible"
+            }
+          },
+          {
+            "pattern_id": "reiter_arthritis_genitourinary_workup_pattern",
+            "pattern_type": "anchor_pattern",
+            "logic": "all_of",
+            "required": [
+              {
+                "any_of": [
+                  "arthritis",
+                  "arthralgia",
+                  "inflammatory_joint_pain",
+                  "asymmetric_lower_limb_arthritis"
+                ]
+              },
+              {
+                "any_of": [
+                  "urethritis",
+                  "dysuria",
+                  "genitourinary_infection"
+                ]
+              }
+            ],
+            "effect": {
+              "eligibility": "Deferred",
+              "reason": "NeedsAnchor"
+            }
+          }
+        ]
+      },
+      "metadata": {
+        "sources": [
+          "clinical_pattern_seed"
+        ],
+        "clinical_pattern_ids": [
+          "postinfectious_arthritis_uroocular_pattern"
+        ]
+      }
     }
   ]
 }

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .clinical_evidence import EvidenceBundle, EvidenceGraph, Observation
+from .clinical_pattern_compiler import ClinicalPattern, ClinicalPatternCompiler
 from .disease_retrieval import DiseaseRetriever
 from .mechanism_reasoner import MechanismHypothesis, MechanismReasoner
 
@@ -34,6 +35,7 @@ class CandidatePool:
     disease_categories: List[Dict[str, Any]] = field(default_factory=list)
     open_world_candidates: List[Dict[str, Any]] = field(default_factory=list)
     mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    clinical_patterns: List[Dict[str, Any]] = field(default_factory=list)
 
     def add(
         self,
@@ -126,6 +128,7 @@ class CandidatePool:
             "disease_categories": list(self.disease_categories),
             "open_world_candidates": list(self.open_world_candidates),
             "mechanism_hypotheses": list(self.mechanism_hypotheses),
+            "clinical_patterns": list(self.clinical_patterns),
         }
 
 
@@ -137,6 +140,8 @@ class CandidateGenerator:
         self.resolver = resolver
         self.disease_retriever = DiseaseRetriever(knowledge, resolver)
         self.mechanism_reasoner = MechanismReasoner()
+        ref_dir = str(getattr(knowledge, "ref_dir", "data/ref_data") or "data/ref_data")
+        self.clinical_pattern_compiler = ClinicalPatternCompiler(ref_dir)
 
     def generate(
         self,
@@ -148,8 +153,11 @@ class CandidateGenerator:
     ) -> CandidatePool:
         bundle = evidence or _bundle_from_graph(evidence_graph)
         pool = CandidatePool()
+        clinical_patterns = self.clinical_pattern_compiler.compile(bundle)
+        pool.clinical_patterns = [item.to_dict() for item in clinical_patterns]
         mechanisms = self.mechanism_reasoner.evaluate(bundle)
         pool.mechanism_hypotheses = [item.to_dict() for item in mechanisms]
+        self._from_clinical_patterns(pool, clinical_patterns)
         self._from_mechanisms(pool, mechanisms)
         self._from_llm(pool, llm_result or {})
         self._from_rag(pool, rag_chunks or [])
@@ -157,6 +165,62 @@ class CandidateGenerator:
         self._from_disease_retriever(pool, bundle)
         self._from_evidence(pool, bundle)
         return pool
+
+    def _from_clinical_patterns(
+        self,
+        pool: CandidatePool,
+        patterns: Sequence[ClinicalPattern],
+    ) -> None:
+        for pattern in patterns or []:
+            candidates = self.clinical_pattern_compiler.candidate_rules(pattern.pattern_id)
+            if not candidates:
+                continue
+            evidence_links = [pattern.pattern_id] + list(pattern.supporting_findings or [])
+            for item in candidates:
+                raw_name = str(item.get("entity_id") or item.get("name") or "").strip()
+                if not raw_name:
+                    continue
+                resolution = self.resolver.resolve(raw_name)
+                try:
+                    priority = float(item.get("priority", 0.8) or 0.8)
+                except (TypeError, ValueError):
+                    priority = 0.8
+                prior = min(
+                    0.92,
+                    max(0.35, 0.28 + 0.48 * pattern.confidence + 0.18 * priority),
+                )
+                metadata = {
+                    "pattern_id": pattern.pattern_id,
+                    "pattern_type": pattern.pattern_type,
+                    "body_system": pattern.body_system,
+                    "mechanism_ids": list(pattern.mechanism_ids),
+                    "family_ids": list(pattern.family_ids),
+                    "candidate_role": str(item.get("role") or "pattern_candidate"),
+                    "pattern_confidence": pattern.confidence,
+                    "pattern_information_value": pattern.information_value,
+                    "source_level": pattern.source_level,
+                    "verified_pattern": bool(pattern.verified),
+                }
+                if resolution.canonical_name:
+                    pool.add(
+                        item.get("name") or resolution.canonical_name,
+                        resolution.canonical_name,
+                        "clinical_pattern",
+                        prior=prior,
+                        evidence_links=evidence_links,
+                        metadata=metadata,
+                        entity_id=getattr(resolution, "entity_id", ""),
+                        submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                        submittable=bool(getattr(resolution, "submittable", True)),
+                    )
+                    continue
+                pool.add_open_world(
+                    item.get("name") or raw_name,
+                    "clinical_pattern",
+                    prior=prior,
+                    evidence_links=evidence_links,
+                    metadata=dict(metadata, submittable=False),
+                )
 
     def _from_llm(self, pool: CandidatePool, llm_result: Dict[str, Any]) -> None:
         resolutions = self.resolver.resolve_result(llm_result or {})

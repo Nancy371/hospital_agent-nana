@@ -15,6 +15,7 @@ from .case_board import (
     judge_decision_is_stale,
 )
 from .clinical_evidence import EvidenceBundle, Observation
+from .clinical_pattern_compiler import ClinicalPatternCompiler
 from .diagnosis_eligibility import (
     DEFERRED,
     DIFFERENTIAL_ONLY,
@@ -290,6 +291,7 @@ class DiagnosisDecision:
     judge_decision: Dict[str, Any] = field(default_factory=dict)
     open_world_candidates: List[Dict[str, Any]] = field(default_factory=list)
     mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    clinical_patterns: List[Dict[str, Any]] = field(default_factory=list)
     retrieval_views: List[Dict[str, Any]] = field(default_factory=list)
     evidence_conflicts: List[Dict[str, Any]] = field(default_factory=list)
     conflict_affected_diagnoses: List[str] = field(default_factory=list)
@@ -337,6 +339,7 @@ class DiagnosisDecision:
             "judge_decision": dict(self.judge_decision),
             "open_world_candidates": list(self.open_world_candidates),
             "mechanism_hypotheses": list(self.mechanism_hypotheses),
+            "clinical_patterns": list(self.clinical_patterns),
             "retrieval_views": list(self.retrieval_views),
             "evidence_conflicts": list(self.evidence_conflicts),
             "conflict_affected_diagnoses": list(self.conflict_affected_diagnoses),
@@ -1121,6 +1124,7 @@ class DiagnosisDecisionEngine:
         self.resolver = OpenWorldDiagnosisResolver(self.knowledge, config=config)
         self.candidate_generator = CandidateGenerator(self.knowledge, self.resolver)
         self.mechanism_reasoner = MechanismReasoner()
+        self.clinical_pattern_compiler = ClinicalPatternCompiler(ref_dir)
         self.judge = DiagnosisJudge(config=config, knowledge=self.knowledge)
         self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
         self.conflict_arbiter = EvidenceConflictArbiter(self.knowledge)
@@ -1192,14 +1196,18 @@ class DiagnosisDecisionEngine:
         priors = candidate_pool.priors()
         sources_by_name = candidate_pool.sources_by_name()
         mechanism_hypotheses = list(candidate_pool.mechanism_hypotheses)
+        clinical_patterns = list(candidate_pool.clinical_patterns)
         open_world_candidates = self._annotate_open_world_candidates(
             list(candidate_pool.open_world_candidates),
             mechanism_hypotheses,
         )
-        retrieval_views = [
-            item.to_dict()
-            for item in self.mechanism_reasoner.retrieval_views(evidence)
-        ]
+        retrieval_views = (
+            self.clinical_pattern_compiler.retrieval_views(evidence)
+            + [
+                item.to_dict()
+                for item in self.mechanism_reasoner.retrieval_views(evidence)
+            ]
+        )
         scores = []
         for name, entry in self.knowledge.entries.items():
             entity_id = str(entry.get("entity_id") or "")
@@ -1288,6 +1296,7 @@ class DiagnosisDecisionEngine:
             differential_only_diagnoses=differential_only,
             open_world_candidates=open_world_candidates,
             mechanism_hypotheses=mechanism_hypotheses,
+            clinical_patterns=clinical_patterns,
             retrieval_views=retrieval_views,
             evidence_conflicts=evidence_conflicts,
             conflict_affected_diagnoses=[
@@ -2510,7 +2519,7 @@ class DiagnosisDecisionEngine:
 
     def build_retrieval_views(self, evidence: EvidenceBundle) -> List[Dict[str, Any]]:
         mechanisms = self.mechanism_reasoner.evaluate(evidence)
-        return [
+        return self.clinical_pattern_compiler.retrieval_views(evidence) + [
             item.to_dict()
             for item in self.mechanism_reasoner.retrieval_views(evidence, mechanisms)
         ]
