@@ -80,6 +80,56 @@
       }
     },
     {
+      "pattern_id": "pavm_ct_vascular_connection_pattern",
+      "rule_id": "PATTERN-PAVM-CT-001",
+      "logic": {
+        "any_of": [
+          "abnormal_pulmonary_av_connection_described",
+          {
+            "all_of": [
+              "feeding_pulmonary_artery_present",
+              "draining_pulmonary_vein_present"
+            ]
+          },
+          {
+            "all_of": [
+              "abnormal_pulmonary_vascular_cluster",
+              "early_pulmonary_venous_enhancement"
+            ]
+          }
+        ]
+      },
+      "output": {
+        "evidence_id": "enhanced_ct_vascular_malformation",
+        "evidence_level": "diagnostic_pattern",
+        "polarity": "positive",
+        "confidence": 0.94,
+        "information_value": 0.97
+      }
+    },
+    {
+      "pattern_id": "pavm_bubble_echo_shunt_pattern",
+      "rule_id": "PATTERN-PAVM-ECHO-001",
+      "logic": {
+        "any_of": [
+          "bubble_echo_right_to_left_shunt",
+          {
+            "all_of": [
+              "delayed_bubbles_in_left_heart",
+              "intrapulmonary_right_to_left_shunt_observed"
+            ]
+          }
+        ]
+      },
+      "output": {
+        "evidence_id": "right_to_left_shunt",
+        "evidence_level": "diagnostic_pattern",
+        "polarity": "positive",
+        "confidence": 0.92,
+        "information_value": 0.96
+      }
+    },
+    {
       "pattern_id": "pulmonary_av_fistula_pattern",
       "rule_id": "PATTERN-PAVM-001",
       "logic": {
@@ -91,14 +141,16 @@
             "any_of": [
               "right_to_left_shunt",
               "pulmonary_vascular_shunt",
-              "pulmonary_avm_mechanism"
+              "pulmonary_avm_mechanism",
+              "intrapulmonary_right_to_left_shunt_observed"
             ]
           },
           {
             "any_of": [
               "pulmonary_cta_positive",
               "enhanced_ct_vascular_malformation",
-              "bubble_echo_right_to_left_shunt"
+              "bubble_echo_right_to_left_shunt",
+              "abnormal_pulmonary_av_connection_described"
             ]
           }
         ]

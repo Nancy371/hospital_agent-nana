@@ -49,6 +49,9 @@ __all__ = [
     "PatternCompiler",
     "StaleJudgeDecisionError",
     "DeterministicEvidenceVerifier",
+    "ExamResultIntentBinding",
+    "TargetedExamParseResult",
+    "TargetedExamResultParser",
     "TargetedEvidenceVerifier",
     "VerificationResult",
     "evidence_snapshot_hash",
@@ -154,6 +157,13 @@ def __getattr__(name: str):
     if name in ("DeterministicEvidenceVerifier", "VerificationResult"):
         from . import targeted_evidence_verifier as _targeted_evidence_verifier
         return getattr(_targeted_evidence_verifier, name)
+    if name in (
+        "ExamResultIntentBinding",
+        "TargetedExamParseResult",
+        "TargetedExamResultParser",
+    ):
+        from . import targeted_exam_result_parser as _targeted_exam_result_parser
+        return getattr(_targeted_exam_result_parser, name)
     if name in ("EvidencePatternCompiler", "EvidencePatternMatch"):
         from . import evidence_pattern_compiler as _evidence_pattern_compiler
         return getattr(_evidence_pattern_compiler, name)

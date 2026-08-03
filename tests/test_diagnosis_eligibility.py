@@ -84,6 +84,51 @@ class DiagnosisEligibilityGateTests(unittest.TestCase):
         self.assertEqual(result.reason, ANCHORS_SATISFIED)
         self.assertIn("vitamin_d_low", result.satisfied_required_anchors)
 
+    def test_structural_chd_extension_requires_objective_structural_anchor(self):
+        cor = candidate(
+            diagnosis="三房心",
+            diagnosis_type="structural",
+            matched_evidence=["cyanosis", "dyspnea"],
+            core_matched_evidence=["cyanosis"],
+            diagnostic_matched_evidence=[],
+            source_prior=0.72,
+        )
+
+        result = self.knowledge_gate.evaluate(
+            cor,
+            evidence=EvidenceBundle(
+                [
+                    Observation("cyanosis", "physical_exam"),
+                    Observation("dyspnea", "patient_report"),
+                ]
+            ),
+        )
+
+        self.assertEqual(result.status, DEFERRED)
+        self.assertIn("left_atrial_membrane", " ".join(result.missing_required_anchors))
+
+    def test_structural_chd_extension_with_objective_anchor_is_primary_eligible(self):
+        cor = candidate(
+            diagnosis="三房心",
+            diagnosis_type="structural",
+            matched_evidence=["cyanosis", "left_atrial_membrane"],
+            core_matched_evidence=["left_atrial_membrane"],
+            diagnostic_matched_evidence=["left_atrial_membrane"],
+            source_prior=0.72,
+        )
+
+        result = self.knowledge_gate.evaluate(
+            cor,
+            evidence=EvidenceBundle(
+                [
+                    Observation("cyanosis", "physical_exam"),
+                    Observation("left_atrial_membrane", "exam_result"),
+                ]
+            ),
+        )
+
+        self.assertEqual(result.status, PRIMARY_ELIGIBLE)
+
     def test_missing_pericardial_anchor_does_not_exclude_candidate(self):
         tb_pericarditis = candidate(
             diagnosis="tuberculous_pericarditis",

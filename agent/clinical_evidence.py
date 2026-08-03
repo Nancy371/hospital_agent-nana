@@ -872,6 +872,13 @@ class Observation:
     specificity_level: str = ""
     clinical_pattern: str = ""
     mechanism_ids: List[str] = field(default_factory=list)
+    source_exam: str = ""
+    order_id: str = ""
+    target_gap_ids: List[str] = field(default_factory=list)
+    entity_id: str = ""
+    verification_method: str = ""
+    parser_profile: str = ""
+    gap_closure_assessment: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -885,6 +892,20 @@ class Observation:
             data.pop("clinical_pattern", None)
         if not self.mechanism_ids:
             data.pop("mechanism_ids", None)
+        if not self.source_exam:
+            data.pop("source_exam", None)
+        if not self.order_id:
+            data.pop("order_id", None)
+        if not self.target_gap_ids:
+            data.pop("target_gap_ids", None)
+        if not self.entity_id:
+            data.pop("entity_id", None)
+        if not self.verification_method:
+            data.pop("verification_method", None)
+        if not self.parser_profile:
+            data.pop("parser_profile", None)
+        if not self.gap_closure_assessment:
+            data.pop("gap_closure_assessment", None)
         return data
 
 
@@ -2555,6 +2576,7 @@ class HybridEvidenceCompiler:
         exam_results: Optional[Dict[str, Any]],
         diagnosis_result: Optional[Dict[str, Any]] = None,
         raw_case_text: str = "",
+        additional_observations: Optional[Sequence[Observation]] = None,
     ) -> EvidenceBundle:
         base = self.normalizer.normalize(
             collected_info,
@@ -2562,7 +2584,10 @@ class HybridEvidenceCompiler:
             raw_case_text=raw_case_text,
         )
         reasoning = self.reasoning_adapter.adapt(diagnosis_result or {})
-        observations = self.merge_observations(base.observations, reasoning)
+        observations = self.merge_observations(
+            list(base.observations) + list(additional_observations or []),
+            reasoning,
+        )
         finalized = self.normalizer._finalize_observations(observations)
         bundle = EvidenceBundle(finalized)
         self.last_audit = self._build_audit(bundle, reasoning)

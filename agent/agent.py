@@ -44,9 +44,15 @@ from .clinical_evidence import (
 from .diagnosis_eligibility import DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED, PRIMARY_ELIGIBLE
 from .diagnosis_engine import DiagnosisDecisionEngine
 from .diagnosis_critic import DiagnosisCritic
+from .evidence_pattern_compiler import EvidencePatternCompiler
 from .diagnostic_learning import DiagnosticLearningStore
 from .candidate_policy_store import CandidatePolicyStore, RuleGeneralizer
 from .treatment_safety import TreatmentSafetyGate
+from .targeted_exam_result_parser import (
+    ExamResultIntentBinding,
+    TargetedExamResultParser,
+    binding_from_authorization_detail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +73,10 @@ def _overall_score(report: Dict[str, Any]) -> Optional[float]:
     if not vals:
         return None
     return sum(vals) / len(vals)
+
+
+def _compact_exam_name(value: Any) -> str:
+    return re.sub(r"[\s_\-（）()［\]\[\]、，,。：:；;]+", "", str(value or "").lower())
 
 
 # ============ 诊疗阶段枚举 ============
@@ -740,6 +750,11 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._case_post_submit_reserve_seconds = 0.0
         self._last_diagnosis_audit: Dict[str, Any] = {}
         self._last_exam_authorization: List[Dict[str, Any]] = []
+        self.targeted_exam_result_parser = TargetedExamResultParser()
+        self.exam_recovery_pattern_compiler = EvidencePatternCompiler(ref_dir=ref_dir)
+        self._exam_result_intent_bindings: List[Dict[str, Any]] = []
+        self._targeted_exam_result_parses: List[Dict[str, Any]] = []
+        self._targeted_exam_observations: List[Observation] = []
 
         # 规划器（延迟初始化，因为需要绑定异步方法）
         self._planner: Optional[Planner] = None
@@ -921,6 +936,9 @@ class MyDoctorAgent(BaseDoctorAgent):
         )
         self._last_diagnosis_audit = {}
         self._last_exam_authorization = []
+        self._exam_result_intent_bindings = []
+        self._targeted_exam_result_parses = []
+        self._targeted_exam_observations = []
         runner = (
             self._execute_fast_path(patient_id)
             if self.fast_mode
@@ -972,8 +990,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         )
         fallback = self.quality_agent.default_final_result(reason)
         if self.diagnosis_chain_enabled:
-            evidence_graph = self.evidence_agent.build_graph(collected_info, exam_results)
-            evidence = evidence_graph.bundle
+            evidence = self._normalize_with_exam_recovery(collected_info, exam_results)
             decision = self.diagnosis_engine.decide(fallback, [], evidence)
             fallback = self.diagnosis_engine.apply_to_result(fallback, decision, evidence)
         else:
@@ -1134,6 +1151,13 @@ class MyDoctorAgent(BaseDoctorAgent):
                         if isinstance(exam_data, dict) and exam_data.get("status") != "invalid":
                             new_results[exam_name] = exam_data
                 if new_results:
+                    self._record_targeted_exam_result_recovery(
+                        patient_id=patient_id,
+                        stage="fast_exam",
+                        ordered_items=list(exam_items),
+                        new_results=new_results,
+                        strategy=strategy,
+                    )
                     exam_results.update(new_results)
                     self.memory_manager.update_exam_results(patient_id, new_results)
                     planner._record_action(
@@ -1459,7 +1483,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         thinking: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         try:
-            evidence = self.clinical_normalizer.normalize(collected_info, exam_results)
+            evidence = self._normalize_with_exam_recovery(collected_info, exam_results)
             llm_result: Dict[str, Any] = {}
             if isinstance(thinking, dict):
                 candidates = (
@@ -1555,6 +1579,164 @@ class MyDoctorAgent(BaseDoctorAgent):
             if len(selected) >= limit:
                 break
         return selected
+
+    def _normalize_with_exam_recovery(
+        self,
+        collected_info: Optional[Dict[str, Any]],
+        exam_results: Optional[Dict[str, Any]],
+        raw_case_text: str = "",
+    ) -> EvidenceBundle:
+        base = self.clinical_normalizer.normalize(
+            collected_info,
+            exam_results,
+            raw_case_text=raw_case_text,
+        )
+        if not self._targeted_exam_observations:
+            return base
+        observations = self.evidence_compiler.merge_observations(
+            list(base.observations),
+            list(self._targeted_exam_observations),
+        )
+        return self._append_exam_recovery_patterns(
+            EvidenceBundle(self.clinical_normalizer._finalize_observations(observations))
+        )
+
+    def _compile_evidence_with_exam_recovery(
+        self,
+        collected_info: Optional[Dict[str, Any]],
+        exam_results: Optional[Dict[str, Any]],
+        diagnosis_result: Optional[Dict[str, Any]] = None,
+        raw_case_text: str = "",
+    ) -> EvidenceBundle:
+        bundle = self.evidence_compiler.compile(
+            collected_info,
+            exam_results,
+            diagnosis_result,
+            raw_case_text=raw_case_text,
+            additional_observations=list(self._targeted_exam_observations),
+        )
+        return self._append_exam_recovery_patterns(bundle)
+
+    def _append_exam_recovery_patterns(self, evidence: EvidenceBundle) -> EvidenceBundle:
+        if not self._targeted_exam_observations:
+            return evidence
+        derived = self.exam_recovery_pattern_compiler.compile([], evidence)
+        if not derived:
+            return evidence
+        observations = self.evidence_compiler.merge_observations(
+            list(evidence.observations),
+            list(derived),
+        )
+        return EvidenceBundle(self.clinical_normalizer._finalize_observations(observations))
+
+    def _record_targeted_exam_result_recovery(
+        self,
+        *,
+        patient_id: str,
+        stage: str,
+        ordered_items: List[str],
+        new_results: Dict[str, Any],
+        strategy: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not new_results:
+            return
+        details = [
+            item
+            for item in (strategy or {}).get("exam_authorization_details", []) or []
+            if isinstance(item, dict) and item.get("target_gaps")
+        ]
+        if not details:
+            return
+        pairs = self._match_ordered_items_to_results(ordered_items, new_results)
+        observations_before = len(self._targeted_exam_observations)
+        for index, (ordered_exam, actual_exam, raw_result) in enumerate(pairs, start=1):
+            detail = self._authorization_detail_for_exam(ordered_exam, actual_exam, details)
+            if not detail:
+                self._targeted_exam_result_parses.append(
+                    {
+                        "status": "unbound",
+                        "ordered_exam": ordered_exam,
+                        "actual_result_exam": actual_exam,
+                        "gap_closure_allowed": False,
+                        "stage": stage,
+                    }
+                )
+                continue
+            binding = binding_from_authorization_detail(
+                detail=detail,
+                requested_exam=ordered_exam,
+                actual_result_exam=actual_exam,
+                patient_id=patient_id,
+                stage=stage,
+                order_index=len(self._exam_result_intent_bindings) + index,
+            )
+            self._exam_result_intent_bindings.append(binding.to_dict())
+            parsed = self.targeted_exam_result_parser.parse(raw_result, binding)
+            payload = parsed.to_dict()
+            payload["stage"] = stage
+            payload["gap_closure_allowed"] = parsed.gap_closure_assessment in {
+                "positive_closed",
+                "negative_closed",
+            }
+            self._targeted_exam_result_parses.append(payload)
+            self._targeted_exam_observations.extend(parsed.observations)
+        if len(self._targeted_exam_observations) > observations_before:
+            findings = [
+                item.finding
+                for item in self._targeted_exam_observations[observations_before:]
+            ]
+            logger.info(
+                "[ExamEvidenceRecovery] targeted evidence recovered: %s",
+                list(dict.fromkeys(findings)),
+            )
+
+    @staticmethod
+    def _match_ordered_items_to_results(
+        ordered_items: List[str],
+        new_results: Dict[str, Any],
+    ) -> List[tuple]:
+        remaining = list((new_results or {}).items())
+        pairs: List[tuple] = []
+        for ordered in ordered_items or []:
+            match_index = next(
+                (
+                    idx
+                    for idx, (name, _) in enumerate(remaining)
+                    if _compact_exam_name(name) == _compact_exam_name(ordered)
+                ),
+                -1,
+            )
+            if match_index < 0 and remaining:
+                match_index = 0
+            if match_index < 0:
+                continue
+            actual, raw = remaining.pop(match_index)
+            pairs.append((ordered, actual, raw))
+        for actual, raw in remaining:
+            pairs.append(("", actual, raw))
+        return pairs
+
+    @staticmethod
+    def _authorization_detail_for_exam(
+        ordered_exam: str,
+        actual_exam: str,
+        details: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        ordered_key = _compact_exam_name(ordered_exam)
+        actual_key = _compact_exam_name(actual_exam)
+        for detail in details:
+            keys = {
+                _compact_exam_name(detail.get("exam")),
+                _compact_exam_name(detail.get("requested_exam")),
+                _compact_exam_name(detail.get("resolved_exam")),
+            }
+            if ordered_key and ordered_key in keys:
+                return detail
+            if actual_key and actual_key in keys:
+                return detail
+        if len(details) == 1:
+            return details[0]
+        return None
 
     async def _execute_order_examination(
         self,
@@ -1721,6 +1903,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             for exam_name, exam_data in response["results"].items():
                 if exam_data.get("status") != "invalid":
                     new_results[exam_name] = exam_data
+        if new_results:
+            self._record_targeted_exam_result_recovery(
+                patient_id=patient_id,
+                stage="planner_exam",
+                ordered_items=list(new_items),
+                new_results=new_results,
+                strategy=strategy,
+            )
 
         return new_results if new_results else None
 
@@ -2538,6 +2728,57 @@ class MyDoctorAgent(BaseDoctorAgent):
         except (TypeError, ValueError):
             elapsed = None
 
+        targeted_bindings = [
+            item
+            for item in getattr(self, "_exam_result_intent_bindings", []) or []
+            if isinstance(item, dict)
+        ]
+        targeted_parses = [
+            item
+            for item in getattr(self, "_targeted_exam_result_parses", []) or []
+            if isinstance(item, dict)
+        ]
+        bound_parse_count = sum(
+            1
+            for item in targeted_parses
+            if str(item.get("binding_status") or "") == "bound"
+        )
+        targeted_parser_count = sum(
+            1
+            for item in targeted_parses
+            if str(item.get("binding_status") or "") == "bound"
+            and str(item.get("status") or "") not in {"unbound", ""}
+        )
+        targeted_recovery_count = sum(
+            1
+            for item in targeted_parses
+            if str(item.get("status") or "") in {"positive", "negative"}
+        )
+        targeted_gap_closed_count = sum(
+            1
+            for item in targeted_parses
+            if str(item.get("gap_closure_assessment") or "")
+            in {"positive_closed", "negative_closed"}
+        )
+        silent_exam_substitution_count = sum(
+            1
+            for item in targeted_bindings
+            if str(item.get("requested_exam") or "")
+            and str(item.get("actual_result_exam") or "")
+            and str(item.get("requested_exam") or "") != str(item.get("actual_result_exam") or "")
+            and not str(item.get("actual_closure_level") or "")
+        )
+        unverified_exam_evidence_leakage_count = sum(
+            1
+            for item in observations
+            if item.get("source") == "targeted_exam_result_parser"
+            and not (
+                item.get("target_gap_ids")
+                and item.get("order_id")
+                and item.get("verification_method") == "targeted_exam_result_parser"
+            )
+        )
+
         public_final = {
             key: final_result.get(key)
             for key in (
@@ -2702,6 +2943,39 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "derived_pattern_count": case_board_audit.get(
                     "derived_pattern_count"
                 ),
+                "targeted_exam_result_binding_rate": (
+                    bound_parse_count / max(1, len(targeted_parses))
+                    if targeted_parses
+                    else None
+                ),
+                "targeted_parser_coverage": (
+                    targeted_parser_count / max(1, bound_parse_count)
+                    if bound_parse_count
+                    else None
+                ),
+                "targeted_gap_evidence_recovery_rate": (
+                    targeted_recovery_count / max(1, targeted_parser_count)
+                    if targeted_parser_count
+                    else None
+                ),
+                "gap_closure_after_result_rate": (
+                    targeted_gap_closed_count / max(1, targeted_parser_count)
+                    if targeted_parser_count
+                    else None
+                ),
+                "pavm_anchor_recovery_count": sum(
+                    1
+                    for item in observations
+                    if item.get("source") == "targeted_exam_result_parser"
+                    and item.get("finding")
+                    in {
+                        "pulmonary_cta_positive",
+                        "enhanced_ct_vascular_malformation",
+                        "bubble_echo_right_to_left_shunt",
+                    }
+                ),
+                "unverified_exam_evidence_leakage_count": unverified_exam_evidence_leakage_count,
+                "silent_exam_substitution_count": silent_exam_substitution_count,
             },
             "top_candidates": top_twenty,
             "retriever_top1": retriever_top1,
@@ -2731,6 +3005,34 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "llm_calls_by_kind": dict(self._llm_call_by_kind),
                 "exam_authorization": exam_authorization_records,
                 "exam_authorization_mode": exam_authorization_mode,
+                "exam_result_intent_bindings": targeted_bindings,
+                "exam_execution_resolution": targeted_bindings,
+                "targeted_exam_result_parses": targeted_parses,
+                "gap_evidence_recovery": [
+                    {
+                        "binding_id": item.get("binding_id"),
+                        "order_id": item.get("order_id"),
+                        "target_gap_ids": item.get("target_gap_ids"),
+                        "status": item.get("status"),
+                        "gap_closure_assessment": item.get("gap_closure_assessment"),
+                        "observed_findings": [
+                            obs.get("finding")
+                            for obs in item.get("observations", []) or []
+                            if isinstance(obs, dict)
+                        ],
+                    }
+                    for item in targeted_parses
+                ],
+                "unbound_gap_exam_results": [
+                    item
+                    for item in targeted_parses
+                    if str(item.get("binding_status") or "") != "bound"
+                ],
+                "unresolved_targeted_exam_results": [
+                    item
+                    for item in targeted_parses
+                    if str(item.get("status") or "") in {"unresolved", "inconclusive"}
+                ],
                 "finding_extraction_summary": finding_extraction_summary,
                 "evidence_compiler": evidence_compiler_audit,
                 "case_board_evidence": case_board_audit,
@@ -3208,6 +3510,17 @@ class MyDoctorAgent(BaseDoctorAgent):
                 for exam_name, exam_data in response["results"].items():
                     if exam_data.get("status") != "invalid":
                         exam_results[exam_name] = exam_data
+                self._record_targeted_exam_result_recovery(
+                    patient_id=patient_id,
+                    stage="initial_exam",
+                    ordered_items=list(new_items),
+                    new_results={
+                        exam_name: exam_data
+                        for exam_name, exam_data in (response or {}).get("results", {}).items()
+                        if isinstance(exam_data, dict) and exam_data.get("status") != "invalid"
+                    },
+                    strategy=strategy,
+                )
 
         return exam_results
 
@@ -3281,12 +3594,12 @@ class MyDoctorAgent(BaseDoctorAgent):
         raw_case_text = self._raw_case_text_from_state(collected_info, chat_history)
 
         if self.diagnosis_chain_enabled:
-            evidence_graph = self.evidence_agent.build_graph(
+            evidence = self._normalize_with_exam_recovery(
                 collected_info,
                 exam_results,
                 raw_case_text=raw_case_text,
             )
-            evidence = evidence_graph.bundle
+            evidence_graph = evidence.to_graph()
             planner_candidates = self._planner_candidate_names()
             retrieval_views = self.diagnosis_engine.build_retrieval_views(evidence)
             rag_query = evidence.to_query()
@@ -3316,7 +3629,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 {"role": "user", "content": "请做出诊断并制定治疗方案，以 JSON 格式输出。"},
             ]
             diagnosis_result = await self._llm_generate_diagnosis(messages)
-            evidence = self.evidence_compiler.compile(
+            evidence = self._compile_evidence_with_exam_recovery(
                 collected_info,
                 exam_results,
                 diagnosis_result,
@@ -3405,7 +3718,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 exam_results.update(corrective_results)
                 self.memory_manager.update_exam_results(patient_id, corrective_results)
                 self._last_exam_results = dict(exam_results)
-                evidence = self.evidence_compiler.compile(
+                evidence = self._compile_evidence_with_exam_recovery(
                     collected_info,
                     exam_results,
                     diagnosis_result,
@@ -3504,6 +3817,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                     item.to_dict() for item in llm_resolutions
                 ],
                 "evidence_compiler": dict(self.evidence_compiler.last_audit),
+                "exam_result_intent_bindings": list(self._exam_result_intent_bindings),
+                "targeted_exam_result_parses": list(self._targeted_exam_result_parses),
             }
         else:
             diagnosis_prompt = self.prompt.build_diagnosis_prompt(
@@ -4948,6 +5263,13 @@ class MyDoctorAgent(BaseDoctorAgent):
             if isinstance(exam_data, dict) and exam_data.get("status") != "invalid":
                 new_results[exam_name] = exam_data
         if new_results:
+            self._record_targeted_exam_result_recovery(
+                patient_id=patient_id,
+                stage="critic_corrective_exam",
+                ordered_items=list(items),
+                new_results=new_results,
+                strategy=strategy,
+            )
             planner.exam_rounds += 1
             planner._record_action(
                 "order_examination",

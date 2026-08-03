@@ -800,6 +800,8 @@ class DiagnosticKnowledgeBase:
         leukemia = "\u767d\u8840\u75c5"
         bph = "\u524d\u5217\u817a\u589e\u751f"
         pavm = "\u80ba\u52a8\u9759\u8109\u7618"
+        cor_triatriatum = "\u4e09\u623f\u5fc3"
+        avsd = "\u5fc3\u5185\u819c\u57ab\u7f3a\u635f"
         self._overlay_entry(
             leukemia,
             supporting_evidence=[
@@ -904,6 +906,74 @@ class DiagnosticKnowledgeBase:
                             ]
                         },
                     ],
+                    "effect": {"eligibility": "PrimaryEligible"},
+                }
+            ],
+        )
+        self._overlay_entry(
+            cor_triatriatum,
+            supporting_evidence=[
+                {"finding": "left_atrial_membrane", "weight": 0.88},
+                {"finding": "cor_triatriatum", "weight": 0.92},
+                {"finding": "restrictive_fenestration", "weight": 0.72},
+                {"finding": "congenital_heart_defect", "weight": 0.22},
+                {"finding": "cyanosis", "weight": 0.18},
+            ],
+            discriminating_exams=[
+                "\u8d85\u58f0\u5fc3\u52a8\u56fe",
+                "\u7ecf\u98df\u7ba1\u8d85\u58f0\u5fc3\u52a8\u56fe\uff08TEE\uff09",
+                "\u5fc3\u810fMRI\uff08CMR\uff09",
+                "\u5fc3\u5bfc\u7ba1\u68c0\u67e5",
+            ],
+            diagnostic_patterns=[
+                {
+                    "pattern_id": "cor_triatriatum_structural_anchor_pattern",
+                    "pattern_type": "anchor_pattern",
+                    "logic": "all_of",
+                    "required": [
+                        {
+                            "any_of": [
+                                "left_atrial_membrane",
+                                "cor_triatriatum",
+                                "restrictive_fenestration",
+                            ]
+                        }
+                    ],
+                    "requires_objective_source": True,
+                    "effect": {"eligibility": "PrimaryEligible"},
+                }
+            ],
+        )
+        self._overlay_entry(
+            avsd,
+            supporting_evidence=[
+                {"finding": "atrioventricular_septal_defect", "weight": 0.9},
+                {"finding": "common_atrioventricular_valve", "weight": 0.72},
+                {"finding": "av_valve_regurgitation", "weight": 0.48},
+                {"finding": "congenital_heart_defect", "weight": 0.22},
+                {"finding": "cyanosis", "weight": 0.18},
+            ],
+            discriminating_exams=[
+                "\u8d85\u58f0\u5fc3\u52a8\u56fe",
+                "\u4e09\u7ef4\u8d85\u58f0\u5fc3\u52a8\u56fe\uff083D Echo\uff09",
+                "\u7ecf\u98df\u7ba1\u8d85\u58f0\u5fc3\u52a8\u56fe\uff08TEE\uff09",
+                "\u5fc3\u810fMRI\uff08CMR\uff09",
+                "\u5fc3\u5bfc\u7ba1\u68c0\u67e5",
+            ],
+            diagnostic_patterns=[
+                {
+                    "pattern_id": "avsd_structural_anchor_pattern",
+                    "pattern_type": "anchor_pattern",
+                    "logic": "all_of",
+                    "required": [
+                        {
+                            "any_of": [
+                                "atrioventricular_septal_defect",
+                                "common_atrioventricular_valve",
+                            ]
+                        }
+                    ],
+                    "requires_objective_source": True,
                     "effect": {"eligibility": "PrimaryEligible"},
                 }
             ],
