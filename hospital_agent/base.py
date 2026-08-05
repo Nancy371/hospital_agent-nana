@@ -258,6 +258,119 @@ class Actions:
         self._conversation_rounds: Dict[str, int] = {}
         self._ordered_examinations: Dict[str, List[str]] = {}
         self._client: Optional[httpx.AsyncClient] = None
+        self.trace_collector = None
+
+    def _trace_tool_called(
+        self,
+        tool_name: str,
+        patient_id: str = "",
+        arguments: Optional[Dict[str, Any]] = None,
+        *,
+        target_gap_ids: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        collector = getattr(self, "trace_collector", None)
+        if not collector or not getattr(collector, "enabled", False):
+            return None
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
+        try:
+            collector.emit_event(
+                "tool.called",
+                payload={
+                    "tool_name": tool_name,
+                    "tool_version": "hospital_agent.actions.v1",
+                    "call_id": call_id,
+                    "patient_id": patient_id,
+                    "arguments": arguments or {},
+                    "attempt": 1,
+                    "timeout_ms": 60000,
+                    "target_gap_ids": target_gap_ids or [],
+                },
+                stage="tool",
+                component="Actions",
+                action=tool_name,
+            )
+        except Exception:
+            if not getattr(getattr(collector, "config", None), "fail_open", True):
+                raise
+        return call_id
+
+    def _trace_tool_returned(
+        self,
+        tool_name: str,
+        call_id: Optional[str],
+        raw_result: Any,
+        normalized_result: Any = None,
+    ) -> None:
+        collector = getattr(self, "trace_collector", None)
+        if not call_id or not collector or not getattr(collector, "enabled", False):
+            return
+        try:
+            output_refs = []
+            if getattr(getattr(collector, "config", None), "capture_raw_tool_result", True):
+                raw_ref = collector.create_artifact("tool_result_raw", raw_result)
+                if raw_ref:
+                    output_refs.append(raw_ref)
+            normalized_ref = collector.create_artifact(
+                "tool_result_normalized",
+                normalized_result if normalized_result is not None else raw_result,
+            )
+            if normalized_ref:
+                output_refs.append(normalized_ref)
+            collector.emit_event(
+                "tool.returned",
+                payload={
+                    "tool_name": tool_name,
+                    "call_id": call_id,
+                    "result_status": "success",
+                    "backend_request_id": (
+                        raw_result.get("request_id")
+                        if isinstance(raw_result, dict)
+                        else None
+                    ),
+                    "retry_count": 0,
+                },
+                output_refs=output_refs,
+                stage="tool",
+                component="Actions",
+                action=tool_name,
+            )
+        except Exception:
+            if not getattr(getattr(collector, "config", None), "fail_open", True):
+                raise
+
+    def _trace_tool_failed(
+        self,
+        tool_name: str,
+        call_id: Optional[str],
+        error: BaseException,
+        *,
+        retryable: bool = False,
+        will_retry: bool = False,
+    ) -> None:
+        collector = getattr(self, "trace_collector", None)
+        if not call_id or not collector or not getattr(collector, "enabled", False):
+            return
+        try:
+            collector.emit_event(
+                "tool.failed",
+                payload={
+                    "tool_name": tool_name,
+                    "call_id": call_id,
+                    "error_type": type(error).__name__,
+                    "error_code": getattr(error, "errno", None),
+                    "message": str(error),
+                    "retryable": bool(retryable),
+                    "attempt": 1,
+                    "will_retry": bool(will_retry),
+                },
+                status="failed",
+                stage="tool",
+                component="Actions",
+                action=tool_name,
+            )
+        except Exception:
+            if not getattr(getattr(collector, "config", None), "fail_open", True):
+                raise
 
     @staticmethod
     def _normalize_endpoint_prefixes(prefixes: List[str]) -> List[str]:
@@ -470,6 +583,11 @@ class Actions:
             患者的回复文本
         """
         logger.info(f"[Action] ask_patient: patient_id={patient_id}")
+        call_id = self._trace_tool_called(
+            "ask_patient",
+            patient_id,
+            {"input_data": input_data},
+        )
         try:
             result = await self._invoke_or_direct(
                 patient_id=patient_id,
@@ -488,8 +606,10 @@ class Actions:
             self._conversation_rounds[patient_id] = (
                 self._conversation_rounds.get(patient_id, 0) + 1
             )
+            self._trace_tool_returned("ask_patient", call_id, result, {"answer": str(answer)})
             return str(answer)
         except Exception as e:
+            self._trace_tool_failed("ask_patient", call_id, e, retryable=True)
             logger.error(f"[Action] ask_patient 失败: {e}")
             raise
 
@@ -512,6 +632,11 @@ class Actions:
         logger.info(
             f"[Action] order_examination: patient_id={patient_id}, items={items}"
         )
+        call_id = self._trace_tool_called(
+            "order_examination",
+            patient_id,
+            {"items": items, "reason": reason},
+        )
         try:
             result = await self._request(
                 "POST",
@@ -524,8 +649,20 @@ class Actions:
                 },
             )
             self._remember_ordered_examinations(patient_id, result, items)
+            self._trace_tool_returned(
+                "order_examination",
+                call_id,
+                result,
+                {
+                    "ordered_items": self._ordered_examinations.get(patient_id, []),
+                    "result_names": list((result.get("results") or {}).keys())
+                    if isinstance(result, dict)
+                    else [],
+                },
+            )
             return result
         except Exception as e:
+            self._trace_tool_failed("order_examination", call_id, e, retryable=True)
             logger.error(f"[Action] order_examination 失败: {e}")
             raise
 
@@ -550,7 +687,16 @@ class Actions:
         logger.info(
             f"[Action] prescribe_treatment: patient_id={patient_id}, diagnosis={diagnosis}"
         )
-        return {
+        call_id = self._trace_tool_called(
+            "prescribe_treatment",
+            patient_id,
+            {
+                "diagnosis": diagnosis,
+                "treatment_plan": treatment_plan,
+                "reasoning": reasoning,
+            },
+        )
+        result = {
             "patient_id": patient_id,
             "team_id": self.team_id,
             "diagnosis": diagnosis,
@@ -560,6 +706,13 @@ class Actions:
             "conversation_rounds": self._conversation_rounds.get(patient_id, 0),
             "finished": True,
         }
+        self._trace_tool_returned(
+            "prescribe_treatment",
+            call_id,
+            result,
+            {"diagnosis": diagnosis, "finished": True},
+        )
+        return result
 
     async def evaluation(
         self,
@@ -576,6 +729,11 @@ class Actions:
             评测报告字典
         """
         logger.info(f"[Action] evaluation: patient_id={patient_id}")
+        call_id = self._trace_tool_called(
+            "evaluation",
+            patient_id,
+            {"final_result": final_result},
+        )
         try:
             if not self.model_api_key:
                 raise ValueError("MODEL_API_KEY is required for evaluation")
@@ -589,8 +747,10 @@ class Actions:
                     "team_id": self.team_id,
                 },
             )
+            self._trace_tool_returned("evaluation", call_id, result, result)
             return result
         except Exception as e:
+            self._trace_tool_failed("evaluation", call_id, e, retryable=True)
             logger.error(f"[Action] evaluation 失败: {e}")
             raise
 

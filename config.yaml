@@ -3,6 +3,20 @@
 # 输出目录：训练和测试运行产物的输出目录
 output_dir: outputs
 
+# Structured trace capture. Disabled by default so normal local runs and tests do
+# not create trajectory files unless a training/eval profile explicitly enables it.
+trace:
+  enabled: false
+  output_dir: outputs/traces
+  fail_open: true
+  capture_artifacts: true
+  capture_raw_tool_result: true
+  capture_raw_model_prompt: false
+  max_inline_payload_chars: 4000
+  max_artifact_bytes: 5242880
+  flush_each_event: true
+  redact_sensitive_fields: true
+
 # 标准参考数据目录；疾病/检查名称必须与其中 catalog 保持一致
 ref_data_dir: data/ref_data
 

@@ -53,6 +53,7 @@ from .targeted_exam_result_parser import (
     TargetedExamResultParser,
     binding_from_authorization_detail,
 )
+from .trace import ArtifactType, TraceCollector
 
 logger = logging.getLogger(__name__)
 
@@ -636,6 +637,8 @@ class MyDoctorAgent(BaseDoctorAgent):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+        self.trace_collector = TraceCollector.from_config(config)
+        self.actions.trace_collector = self.trace_collector
         self.prompt = DoctorPrompt()
         self.memory = DoctorMemory(config)
         self.llm = LLMClient(config)
@@ -1923,16 +1926,41 @@ class MyDoctorAgent(BaseDoctorAgent):
             patient_id: 患者 ID
         """
         logger.info(f"[Train] 开始训练患者: {patient_id}")
+        trace = getattr(self, "trace_collector", None)
+        case_span_id = None
+        if trace and trace.enabled:
+            trace.start_trace(
+                patient_id,
+                {
+                    "mode": "train",
+                    "agent": self.__class__.__name__,
+                    "fast_mode": bool(self.fast_mode),
+                    "diagnosis_chain_enabled": bool(self.diagnosis_chain_enabled),
+                    "case_timeout_seconds": self.case_timeout_seconds,
+                },
+            )
+            case_span_id = trace.start_span(
+                "case_orchestrator",
+                self.__class__.__name__,
+                "train_case",
+            )
+            trace.create_artifact(ArtifactType.RAW_CASE, {"patient_id": patient_id})
         self._reset_llm_counter()
         # 跨患者软复用：重置流程状态但保留可迁移的教��
         if self._planner is not None:
             self._planner.soft_reset(keep_lessons=True)
 
         # 规划器驱动诊疗
-        final_result = await self._run_case_pipeline(
-            patient_id,
-            post_submit_reserve_seconds=self.train_post_submit_reserve_seconds,
-        )
+        try:
+            final_result = await self._run_case_pipeline(
+                patient_id,
+                post_submit_reserve_seconds=self.train_post_submit_reserve_seconds,
+            )
+        except Exception as exc:
+            if trace and trace.enabled:
+                trace.end_span(case_span_id, status="failed", payload={"error": str(exc)})
+                trace.fail_trace(exc)
+            raise
 
         # 训练阶段：先独立获取评估，再执行反思。反思失败不能伪装成评估失败。
         report: Dict[str, Any] = {}
@@ -2045,8 +2073,154 @@ class MyDoctorAgent(BaseDoctorAgent):
             reflection_error=reflection_error,
         )
         self._last_train_result = train_result
+        if trace and trace.enabled:
+            self._emit_trace_case_artifacts(patient_id, final_result, train_result=train_result)
+            trace.end_span(case_span_id, status="success")
+            trace.complete_trace(final_result)
         logger.info(f"[Train] 完成训练患者: {patient_id}")
         return train_result
+
+    def _emit_trace_case_artifacts(
+        self,
+        patient_id: str,
+        final_result: Dict[str, Any],
+        *,
+        train_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        trace = getattr(self, "trace_collector", None)
+        if not trace or not trace.enabled:
+            return
+        audit = self._last_diagnosis_audit or {}
+        try:
+            evidence_payload = audit.get("evidence") or {
+                "collected_info": getattr(self, "_last_collected_info", {}) or {},
+                "exam_results": getattr(self, "_last_exam_results", {}) or {},
+            }
+            trace.create_artifact(ArtifactType.EVIDENCE_SET, evidence_payload)
+
+            decision_payload = audit.get("diagnosis_decision") or {}
+            decision_ref = None
+            if decision_payload:
+                decision_ref = trace.create_artifact(
+                    ArtifactType.DIAGNOSIS_DECISION,
+                    decision_payload,
+                )
+                trace.emit_decision(
+                    "diagnosis_decision",
+                    {
+                        "candidate_count": len(decision_payload.get("candidate_scores") or []),
+                        "final_diagnoses": decision_payload.get("final_diagnoses") or [],
+                        "primary_status": (
+                            (decision_payload.get("judge_decision") or {}).get("primary_status")
+                            if isinstance(decision_payload.get("judge_decision"), dict)
+                            else None
+                        ),
+                    },
+                    refs=[decision_ref] if decision_ref else [],
+                )
+
+            judge_payload = (
+                decision_payload.get("judge_decision")
+                if isinstance(decision_payload, dict)
+                else {}
+            ) or {}
+            active_gaps = (
+                judge_payload.get("active_evidence_gaps")
+                or judge_payload.get("evidence_gaps")
+                or audit.get("active_evidence_gaps")
+                or []
+            )
+            if active_gaps:
+                gap_ref = trace.create_artifact(ArtifactType.EVIDENCE_GAP, active_gaps)
+                trace.emit_decision(
+                    "evidence_gap",
+                    {
+                        "gap_count": len(active_gaps),
+                        "active_gap_ids": [
+                            str(item.get("gap_id"))
+                            for item in active_gaps
+                            if isinstance(item, dict) and item.get("gap_id")
+                        ],
+                    },
+                    refs=[gap_ref] if gap_ref else [],
+                    stage="judge",
+                    component="DiagnosisJudge",
+                    action="emit_evidence_gaps",
+                )
+
+            if self._last_exam_authorization:
+                exam_plan_ref = trace.create_artifact(
+                    ArtifactType.EXAM_PLAN,
+                    self._last_exam_authorization,
+                )
+                trace.emit_decision(
+                    "exam_plan",
+                    {
+                        "plan_count": len(self._last_exam_authorization),
+                        "authorized_exam_count": sum(
+                            len(item.get("authorized_items") or [])
+                            for item in self._last_exam_authorization
+                            if isinstance(item, dict)
+                        ),
+                    },
+                    refs=[exam_plan_ref] if exam_plan_ref else [],
+                    stage="exam_strategy",
+                    component="ExamStrategy",
+                    action="recommend_exams",
+                )
+
+            if self._exam_result_intent_bindings:
+                trace.create_artifact(
+                    ArtifactType.EXAM_RESULT_INTENT_BINDING,
+                    self._exam_result_intent_bindings,
+                )
+
+            if self._targeted_exam_result_parses or self._targeted_exam_observations:
+                evidence_update_ref = trace.create_artifact(
+                    ArtifactType.EVIDENCE_UPDATE,
+                    {
+                        "targeted_exam_result_parses": self._targeted_exam_result_parses,
+                        "targeted_exam_observations": [
+                            item.to_dict() if hasattr(item, "to_dict") else item
+                            for item in self._targeted_exam_observations
+                        ],
+                    },
+                )
+                trace.emit_event(
+                    "state.changed",
+                    payload={
+                        "state_type": "evidence_feedback",
+                        "added_evidence_count": len(self._targeted_exam_observations),
+                        "parse_count": len(self._targeted_exam_result_parses),
+                    },
+                    output_refs=[evidence_update_ref] if evidence_update_ref else [],
+                    stage="evidence_feedback",
+                    component="TargetedExamResultParser",
+                    action="recover_exam_evidence",
+                )
+
+            submitted = final_result.get("diagnosis") if isinstance(final_result, dict) else []
+            if isinstance(submitted, str):
+                submitted = [submitted]
+            submission_ref = trace.create_artifact(ArtifactType.SUBMISSION_RESULT, final_result)
+            trace.emit_submission(
+                {
+                    "submitted_diagnoses": list(submitted or []),
+                    "judge_decision_available": bool(decision_payload),
+                    "submission_status": "created",
+                    "termination_reason": ""
+                    if submitted
+                    else "NO_PRIMARY_ELIGIBLE_CANDIDATE",
+                },
+                refs=[submission_ref] if submission_ref else [],
+            )
+
+            if train_result:
+                trace.create_artifact(ArtifactType.MODULE_OUTPUT, train_result)
+        except Exception as exc:
+            if not getattr(getattr(trace, "config", None), "fail_open", True):
+                raise
+            logger.warning("[Trace] failed to emit case artifacts for %s: %s", patient_id, exc)
 
     def _build_training_result(
         self,
@@ -3150,13 +3324,37 @@ class MyDoctorAgent(BaseDoctorAgent):
             patient_id: 患者 ID
         """
         logger.info(f"[Test] 开始测试患者: {patient_id}")
+        trace = getattr(self, "trace_collector", None)
+        case_span_id = None
+        if trace and trace.enabled:
+            trace.start_trace(
+                patient_id,
+                {
+                    "mode": "test",
+                    "agent": self.__class__.__name__,
+                    "fast_mode": bool(self.fast_mode),
+                    "diagnosis_chain_enabled": bool(self.diagnosis_chain_enabled),
+                },
+            )
+            case_span_id = trace.start_span(
+                "case_orchestrator",
+                self.__class__.__name__,
+                "test_case",
+            )
+            trace.create_artifact(ArtifactType.RAW_CASE, {"patient_id": patient_id})
         self._reset_llm_counter()
         # 跨患者软复用：保留 planner 中的经验教训种子
         if self._planner is not None:
             self._planner.soft_reset(keep_lessons=True)
 
         # 规划器驱动诊疗
-        final_result = await self._run_case_pipeline(patient_id)
+        try:
+            final_result = await self._run_case_pipeline(patient_id)
+        except Exception as exc:
+            if trace and trace.enabled:
+                trace.end_span(case_span_id, status="failed", payload={"error": str(exc)})
+                trace.fail_trace(exc)
+            raise
 
         # 保存测试结果供 run_test 收集
         planner = self._get_planner()
@@ -3194,6 +3392,10 @@ class MyDoctorAgent(BaseDoctorAgent):
             "ordered_examinations": _final_payload["ordered_examinations"],
             "finished": _final_payload["finished"],
         }
+        if trace and trace.enabled:
+            self._emit_trace_case_artifacts(patient_id, _final_payload)
+            trace.end_span(case_span_id, status="success")
+            trace.complete_trace(_final_payload)
 
         logger.info(
             f"[Test] 完成测试患者: {patient_id}, 结果: "

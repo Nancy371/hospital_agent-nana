@@ -5,6 +5,7 @@ __pycache__/
 *.tmp
 *.pyc
 .pytest_cache/
+.trace_test_tmp/
 
 # Virtual env
 .env
@@ -13,6 +14,8 @@ venv/
 
 # Test / smoke temp outputs
 outputs/
+outputs/traces/
+outputs/train/
 outputs/runtime_state/
 *.log
 *.pid
