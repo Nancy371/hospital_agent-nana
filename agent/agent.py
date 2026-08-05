@@ -3059,6 +3059,27 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "pairwise_allowed_matrix": list(
                     judge_payload.get("pairwise_allowed_matrix") or []
                 ),
+                "clinical_reasoning_comparisons": list(
+                    judge_payload.get("clinical_reasoning_comparisons") or []
+                ),
+                "primary_arbitration_candidates": list(
+                    judge_payload.get("primary_arbitration_candidates") or []
+                ),
+                "primary_arbitration_decision": dict(
+                    judge_payload.get("primary_arbitration_decision") or {}
+                ),
+                "primary_anchor_revalidation": dict(
+                    judge_payload.get("primary_anchor_revalidation") or {}
+                ),
+                "arbitration_winner": str(judge_payload.get("arbitration_winner") or ""),
+                "arbitration_loser": str(judge_payload.get("arbitration_loser") or ""),
+                "arbitration_action": str(judge_payload.get("arbitration_action") or ""),
+                "arbitration_reason_codes": list(
+                    judge_payload.get("arbitration_reason_codes") or []
+                ),
+                "pairwise_discriminating_gaps": list(
+                    judge_payload.get("pairwise_discriminating_gaps") or []
+                ),
                 "pool_filter_summary": pool_filter_summary,
                 "discriminating_exams": discriminating_exams,
                 "discriminating_exam_tasks": list(

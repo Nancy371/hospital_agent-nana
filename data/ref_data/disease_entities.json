@@ -4753,6 +4753,55 @@
       ],
       "evidence_profile": {
         "required_groups": [],
+        "eligibility_anchor_policy": {
+          "mode": "any_of",
+          "accepted_anchors": [
+            "disease_specific_anchor",
+            "direct_diagnostic_evidence",
+            "diagnostic_pattern"
+          ],
+          "disease_specific_anchor_patterns": [
+            {
+              "pattern_id": "zoster_dermatomal_vesicular_anchor",
+              "required": [
+                {
+                  "any_of": [
+                    "dermatomal_pain",
+                    "unilateral_dermatomal_pain",
+                    "dermatomal_neuralgia",
+                    "unilateral_neuropathic_pain",
+                    "zoster_neuralgia"
+                  ]
+                },
+                {
+                  "any_of": [
+                    "vesicular_rash",
+                    "grouped_vesicles",
+                    "clustered_vesicles",
+                    "dermatomal_vesicles",
+                    "typical_zoster_rash"
+                  ]
+                }
+              ]
+            }
+          ],
+          "direct_diagnostic_evidence": {
+            "any_of": [
+              "diagnosis:带状疱疹",
+              "vzv_pcr_positive",
+              "varicella_zoster_virus_positive"
+            ],
+            "requires_any": [
+              "dermatomal_pain",
+              "vesicular_rash",
+              "grouped_vesicles",
+              "typical_zoster_rash",
+              "rash"
+            ]
+          },
+          "no_anchor_disposition": "DifferentialOnly",
+          "atypical_anchor_disposition": "DeferredNeedsConfirmatoryEvidence"
+        },
         "supporting_evidence": [
           {
             "terms": [

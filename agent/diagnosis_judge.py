@@ -21,6 +21,15 @@ from .diagnosis_eligibility import (
     PRIMARY_ELIGIBLE,
 )
 from .clinical_pattern_bridge import BRIDGE_REASON, CROSS_SYSTEM_SCOPE, has_active_bridge_protection
+from .clinical_reasoning_comparator import (
+    ClinicalReasoningComparator,
+    KEEP_CURRENT_AND_DEFER_CONTENDER,
+    KEEP_CURRENT_PRIMARY,
+    NO_MATERIAL_DIFFERENCE,
+    REJECT_CONTENDER,
+    SWITCH_PRIMARY,
+    UNLOCK_AND_DEFER,
+)
 from .exam_resolver import ALIAS, EQUIVALENT, EXACT, PARTIAL_SUBSTITUTE, ExamResolver
 
 
@@ -396,6 +405,8 @@ class JudgeCandidateReview:
     eligibility_status: str = ""
     eligibility_reason: str = ""
     eligibility_substatus: str = ""
+    eligibility_anchor_status: str = ""
+    eligibility_anchor_policy_audit: Dict[str, Any] = field(default_factory=dict)
     missing_required_anchors: List[str] = field(default_factory=list)
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
     clinical_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
@@ -488,6 +499,15 @@ class JudgeDecision:
     root_cause_coverage: float = 0.0
     candidate_explanation_edges: List[Dict[str, Any]] = field(default_factory=list)
     primary_override_source: str = ""
+    clinical_reasoning_comparisons: List[Dict[str, Any]] = field(default_factory=list)
+    primary_arbitration_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    primary_arbitration_decision: Dict[str, Any] = field(default_factory=dict)
+    primary_anchor_revalidation: Dict[str, Any] = field(default_factory=dict)
+    arbitration_winner: str = ""
+    arbitration_loser: str = ""
+    arbitration_action: str = ""
+    arbitration_reason_codes: List[str] = field(default_factory=list)
+    pairwise_discriminating_gaps: List[Dict[str, Any]] = field(default_factory=list)
     eligibility_distribution: Dict[str, int] = field(default_factory=dict)
     deferred_substatus_distribution: Dict[str, int] = field(default_factory=dict)
     deferred_anchor_candidates: List[str] = field(default_factory=list)
@@ -1273,6 +1293,7 @@ class DiagnosisJudge:
         section = diagnosis_section.get("judge") or {}
         self.knowledge = knowledge
         self.exam_resolver = ExamResolver(knowledge) if knowledge is not None else None
+        self.clinical_comparator = ClinicalReasoningComparator()
         self.top_k = int(section.get("top_k", 20) or 20)
         self.differential_top_k = int(
             section.get(
@@ -1462,6 +1483,23 @@ class DiagnosisJudge:
             if self._eligibility_status(item) == PRIMARY_ELIGIBLE
         ]
         primary = self._choose_primary(primary_candidates)
+        arbitration = self._primary_arbitration(primary, differential_pool, pairwise)
+        if arbitration.get("selected_candidate") is not None:
+            primary = arbitration["selected_candidate"]
+        pairwise_gap_tasks = self._pairwise_gap_exam_tasks(
+            arbitration.get("pairwise_discriminating_gaps") or [],
+            differential_pool,
+        )
+        if pairwise_gap_tasks:
+            discriminating_exam_tasks = self._merge_discriminating_exam_tasks(
+                pairwise_gap_tasks,
+                discriminating_exam_tasks,
+            )
+            discriminating_exams = [
+                str(task.get("exam") or "").strip()
+                for task in discriminating_exam_tasks
+                if str(task.get("exam") or "").strip()
+            ]
         gap_state_by_candidate = self._gap_state_by_candidate(ranked_all)
         gap_state_distribution = self._gap_state_distribution(gap_state_by_candidate)
         if primary is None:
@@ -1528,7 +1566,7 @@ class DiagnosisJudge:
             decision.reasoning = self._reasoning(decision)
             return decision
 
-        defer_reason = self._defer_primary_lock_reason(
+        defer_reason = str(arbitration.get("defer_reason") or "") or self._defer_primary_lock_reason(
             primary,
             differential_pool,
             pairwise,
@@ -1540,8 +1578,16 @@ class DiagnosisJudge:
         eligible_ranked = [
             item for item in ranked if self._eligibility_status(item) == PRIMARY_ELIGIBLE
         ]
-        secondary = self._select_secondary(primary, eligible_ranked, max_final_diagnoses)
-        final = [primary.diagnosis] + [item.diagnosis for item in secondary]
+        secondary = (
+            self._select_secondary(primary, eligible_ranked, max_final_diagnoses)
+            if self._eligibility_status(primary) == PRIMARY_ELIGIBLE and not needs_discriminating
+            else []
+        )
+        final = (
+            [primary.diagnosis] + [item.diagnosis for item in secondary]
+            if self._eligibility_status(primary) == PRIMARY_ELIGIBLE and not needs_discriminating
+            else []
+        )
 
         if needs_discriminating:
             evidence_gap_targets = self._deferred_evidence_gap_targets(
@@ -1612,6 +1658,7 @@ class DiagnosisJudge:
         decision.discriminating_findings = discriminating_findings
         decision.discriminating_exams = discriminating_exams
         decision.discriminating_exam_tasks = discriminating_exam_tasks
+        self._apply_primary_arbitration_audit(decision, arbitration)
         self._apply_deferred_gap_decision_audit(
             decision,
             differential_pool,
@@ -2102,6 +2149,316 @@ class DiagnosisJudge:
 
     def _pairwise_discriminating_exams(self, left: Any, right: Any) -> List[str]:
         return self._candidate_exam_union([left, right])[: self.discriminating_exam_max_items]
+
+    def _primary_arbitration(
+        self,
+        primary: Any,
+        pool: Sequence[Any],
+        pairwise: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not primary:
+            return {
+                "comparisons": [],
+                "candidates": [],
+                "decision": {},
+                "pairwise_discriminating_gaps": [],
+            }
+        pair_names = {
+            tuple(sorted((str(item.get("left") or ""), str(item.get("right") or ""))))
+            for item in pairwise or []
+            if isinstance(item, dict)
+        }
+        contenders = []
+        for item in pool or []:
+            if not item or item is primary or self._name(item) == self._name(primary):
+                continue
+            if tuple(sorted((self._name(primary), self._name(item)))) not in pair_names:
+                continue
+            if not self.clinical_comparator.material_contender(item, primary):
+                continue
+            contenders.append(item)
+        contenders = sorted(
+            contenders,
+            key=lambda item: (
+                1 if has_active_bridge_protection(item, CROSS_SYSTEM_SCOPE) else 0,
+                self._bridge_strength_rank(item),
+                len(self.clinical_comparator.pair_high_value_evidence(primary, item)),
+                float(getattr(item, "max_gap_value", 0.0) or 0.0),
+                self._core_coverage(item),
+                self._judge_score(item),
+            ),
+            reverse=True,
+        )[:3]
+        records: List[Dict[str, Any]] = []
+        candidate_audits: List[Dict[str, Any]] = []
+        gaps: List[Dict[str, Any]] = []
+        selected = primary
+        selected_action = KEEP_CURRENT_PRIMARY
+        selected_reason_codes: List[str] = []
+        defer_reason = ""
+
+        for contender in contenders:
+            high_value = self.clinical_comparator.pair_high_value_evidence(
+                primary,
+                contender,
+            )
+            record = self.clinical_comparator.compare(
+                primary,
+                contender,
+                judge_score_current=self._judge_score(primary),
+                judge_score_contender=self._judge_score(contender),
+                high_value_evidence=high_value,
+            )
+            records.append(record)
+            candidate_audits.append(
+                {
+                    "candidate": self._name(contender),
+                    "entity_id": str(getattr(contender, "entity_id", "") or ""),
+                    "entered_by": (
+                        "bridge_protection"
+                        if has_active_bridge_protection(contender, CROSS_SYSTEM_SCOPE)
+                        else "diagnostic_pattern_or_high_value_evidence"
+                    ),
+                    "anchor_status": record.get("candidate_b_analysis", {}).get(
+                        "anchor_status",
+                        "",
+                    ),
+                    "matched_bridge_patterns": list(
+                        record.get("candidate_b_analysis", {}).get(
+                            "matched_bridge_patterns",
+                            [],
+                        )
+                    ),
+                    "matched_diagnostic_patterns": list(
+                        record.get("candidate_b_analysis", {}).get(
+                            "matched_diagnostic_patterns",
+                            [],
+                        )
+                    ),
+                    "recommended_action": record.get("recommended_action", ""),
+                }
+            )
+            action = str(record.get("recommended_action") or "")
+            if action == SWITCH_PRIMARY:
+                selected = contender
+                selected_action = action
+                selected_reason_codes = list(record.get("decision_reason_codes") or [])
+                break
+            if action == UNLOCK_AND_DEFER:
+                selected = contender
+                selected_action = action
+                selected_reason_codes = list(record.get("decision_reason_codes") or [])
+                defer_reason = (
+                    "better_explanatory_candidate_requires_gap_closure:"
+                    f" {self._name(contender)} challenges {self._name(primary)}"
+                )
+                gaps.append(self._pairwise_discriminating_gap(primary, contender, record))
+                break
+            if action == KEEP_CURRENT_AND_DEFER_CONTENDER:
+                gaps.append(self._pairwise_discriminating_gap(primary, contender, record))
+                if selected_action == KEEP_CURRENT_PRIMARY:
+                    selected_action = action
+                    selected_reason_codes = list(record.get("decision_reason_codes") or [])
+            elif action not in {REJECT_CONTENDER, NO_MATERIAL_DIFFERENCE}:
+                selected_action = action
+                selected_reason_codes = list(record.get("decision_reason_codes") or [])
+
+        if not records:
+            return {
+                "comparisons": [],
+                "candidates": [],
+                "decision": {
+                    "action": KEEP_CURRENT_PRIMARY,
+                    "selected_primary": self._name(primary),
+                    "reason_codes": ["NO_MATERIAL_ARBITRATION_CONTENDER"],
+                },
+                "selected_candidate": primary,
+                "pairwise_discriminating_gaps": [],
+            }
+        return {
+            "comparisons": records,
+            "candidates": candidate_audits,
+            "decision": {
+                "action": selected_action,
+                "selected_primary": self._name(selected),
+                "original_primary": self._name(primary),
+                "reason_codes": selected_reason_codes,
+            },
+            "selected_candidate": selected,
+            "defer_reason": defer_reason,
+            "pairwise_discriminating_gaps": gaps,
+        }
+
+    def _pairwise_discriminating_gap(
+        self,
+        current_primary: Any,
+        contender: Any,
+        comparison: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        left = self._name(current_primary)
+        right = self._name(contender)
+        left_analysis = dict(comparison.get("candidate_a_analysis") or {})
+        right_analysis = dict(comparison.get("candidate_b_analysis") or {})
+        target_evidence = list(
+            dict.fromkeys(
+                list(right_analysis.get("actionable_gaps") or [])
+                + list(right_analysis.get("unexplained_high_value_evidence") or [])
+                + list(left_analysis.get("unexplained_high_value_evidence") or [])
+                + list(right_analysis.get("explained_high_value_evidence") or [])
+            )
+        )[:8]
+        closure_exams = self._candidate_exam_union([current_primary, contender])[
+            : self.discriminating_exam_max_items
+        ]
+        gap_id = "PWG-" + (
+            str(getattr(current_primary, "entity_id", "") or left or "primary")
+            + "-"
+            + str(getattr(contender, "entity_id", "") or right or "contender")
+        ).replace(" ", "_")
+        return {
+            "gap_id": gap_id,
+            "gap_type": "pairwise_discrimination",
+            "candidate_a": left,
+            "candidate_a_entity_id": str(getattr(current_primary, "entity_id", "") or ""),
+            "candidate_b": right,
+            "candidate_b_entity_id": str(getattr(contender, "entity_id", "") or ""),
+            "target_question": (
+                f"distinguish whether {right} or {left} better explains the "
+                "verified high-value evidence pattern"
+            ),
+            "target_evidence": target_evidence,
+            "closure_exams": closure_exams,
+            "expected_effect_on_arbitration": {
+                "contender_pattern_confirmed": "favor_candidate_b",
+                "current_primary_anchor_confirmed": "favor_candidate_a",
+                "both_unconfirmed": "remain_deferred",
+            },
+            "source_comparison_id": str(comparison.get("comparison_id") or ""),
+            "reason_codes": list(comparison.get("decision_reason_codes") or []),
+        }
+
+    def _pairwise_gap_exam_tasks(
+        self,
+        gaps: Sequence[Dict[str, Any]],
+        pool: Sequence[Any],
+    ) -> List[Dict[str, Any]]:
+        if not gaps:
+            return []
+        pool_size = max(1, len([item for item in pool or [] if item]))
+        tasks: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for gap in gaps or []:
+            if not isinstance(gap, dict):
+                continue
+            gap_id = str(gap.get("gap_id") or "")
+            targets = [str(gap.get("candidate_a") or ""), str(gap.get("candidate_b") or "")]
+            targets = [item for item in targets if item]
+            findings = [str(item) for item in gap.get("target_evidence") or [] if str(item)]
+            target_claim = findings[0] if findings else ""
+            for exam in gap.get("closure_exams") or []:
+                text = str(exam or "").strip()
+                if not text:
+                    continue
+                key = (gap_id, text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                tasks.append(
+                    {
+                        "exam": text,
+                        "target_candidates": list(dict.fromkeys(targets)),
+                        "target_findings": findings[:12],
+                        "target_claims": [target_claim] if target_claim else [],
+                        "exam_type": "pairwise_discrimination",
+                        "expected_effect": "resolve_primary_arbitration_pairwise_gap",
+                        "source": ["clinical_reasoning_primary_arbitration"],
+                        "pool_candidate_count": pool_size,
+                        "target_candidate_count": len(set(targets)),
+                        "information_gain_hint": 1.02,
+                        "exam_source": "pairwise_discrimination_exam",
+                        "priority_bucket": "high_value_pairwise_gap_closure",
+                        "source_gap_id": gap_id,
+                        "target_pair": list(dict.fromkeys(targets)),
+                        "target_question": str(gap.get("target_question") or ""),
+                        "target_claim": target_claim,
+                        "exam_role": self._pairwise_exam_role(text, target_claim),
+                        "expected_arbitration_effect": dict(
+                            gap.get("expected_effect_on_arbitration") or {}
+                        ),
+                    }
+                )
+        return tasks
+
+    @staticmethod
+    def _pairwise_exam_role(exam: str, target_claim: str = "") -> str:
+        text = f"{exam} {target_claim}".lower()
+        compact = "".join(text.split())
+        if any(token in compact for token in ("hla-b27", "hlab27", "esr", "crp")):
+            return "supportive"
+        if any(token in text for token in ("衣原体", "淋球菌", "核酸", "培养", "病原")):
+            return "trigger_evidence"
+        if any(token in text for token in ("眼", "裂隙灯", "结膜", "葡萄膜")):
+            return "manifestation_evidence"
+        if any(token in text for token in ("关节", "滑膜", "积液", "晶体")):
+            return "manifestation_or_exclusion_evidence"
+        if any(token in text for token in ("皮肤", "水疱", "疱疹", "皮疹")):
+            return "current_primary_anchor_evidence"
+        return "pairwise_discrimination"
+
+    @staticmethod
+    def _bridge_strength_rank(candidate: Any) -> int:
+        ranks = {"weak": 0, "probable": 1, "strong": 2}
+        best = 0
+        for item in getattr(candidate, "bridge_protection_decisions", []) or []:
+            if not isinstance(item, dict):
+                continue
+            best = max(best, ranks.get(str(item.get("strength") or "weak").lower(), 0))
+        for item in getattr(candidate, "bridge_validation_results", []) or []:
+            if not isinstance(item, dict):
+                continue
+            best = max(best, ranks.get(str(item.get("strength") or "weak").lower(), 0))
+        return best
+
+    def _apply_primary_arbitration_audit(
+        self,
+        decision: JudgeDecision,
+        arbitration: Dict[str, Any],
+    ) -> None:
+        decision.clinical_reasoning_comparisons = list(
+            arbitration.get("comparisons") or []
+        )
+        decision.primary_arbitration_candidates = list(
+            arbitration.get("candidates") or []
+        )
+        decision.primary_arbitration_decision = dict(
+            arbitration.get("decision") or {}
+        )
+        if decision.clinical_reasoning_comparisons:
+            first = decision.clinical_reasoning_comparisons[0]
+            decision.primary_anchor_revalidation = dict(
+                first.get("candidate_a_analysis") or {}
+            )
+        decision.pairwise_discriminating_gaps = list(
+            arbitration.get("pairwise_discriminating_gaps") or []
+        )
+        decision.arbitration_action = str(
+            decision.primary_arbitration_decision.get("action") or ""
+        )
+        decision.arbitration_reason_codes = list(
+            decision.primary_arbitration_decision.get("reason_codes") or []
+        )
+        decision.arbitration_winner = str(
+            decision.primary_arbitration_decision.get("selected_primary") or ""
+        )
+        original = str(
+            decision.primary_arbitration_decision.get("original_primary") or ""
+        )
+        if original and original != decision.arbitration_winner:
+            decision.arbitration_loser = original
+            decision.primary_unlock_reason = (
+                decision.defer_reason
+                or "clinical_reasoning_primary_arbitration_changed_primary"
+            )
 
     def _defer_primary_lock_reason(
         self,
@@ -3799,6 +4156,31 @@ class DiagnosisJudge:
                 float(task.get("information_gain_hint") or 0.0),
             )
             if (
+                task.get("exam_source") == "pairwise_discrimination_exam"
+                and current.get("exam_source") not in {
+                    "deferred_gap_closure_exam",
+                    "conflict_adjudication_exam",
+                }
+            ):
+                current["exam_source"] = "pairwise_discrimination_exam"
+                current["exam_type"] = "pairwise_discrimination"
+                current["expected_effect"] = "resolve_primary_arbitration_pairwise_gap"
+                for key in (
+                    "priority_bucket",
+                    "source_gap_id",
+                    "target_pair",
+                    "target_question",
+                    "target_claim",
+                    "exam_role",
+                    "expected_arbitration_effect",
+                ):
+                    if task.get(key) not in (None, "", [], {}):
+                        current[key] = (
+                            dict(task.get(key))
+                            if isinstance(task.get(key), dict)
+                            else task.get(key)
+                        )
+            elif (
                 task.get("exam_source") == "conflict_adjudication_exam"
                 and current.get("exam_source") != "deferred_gap_closure_exam"
             ):
@@ -4879,6 +5261,12 @@ class DiagnosisJudge:
                     eligibility_substatus=str(
                         getattr(candidate, "eligibility_substatus", "") or ""
                     ),
+                    eligibility_anchor_status=str(
+                        getattr(candidate, "eligibility_anchor_status", "") or ""
+                    ),
+                    eligibility_anchor_policy_audit=dict(
+                        getattr(candidate, "eligibility_anchor_policy_audit", {}) or {}
+                    ),
                     missing_required_anchors=list(
                         getattr(candidate, "missing_required_anchors", []) or []
                     )[:6],
@@ -5362,6 +5750,14 @@ class DiagnosisJudge:
             or []
         )
         if not bool(getattr(result, "applied", False) or payload.get("applied")):
+            return judge_decision
+        if (
+            str(getattr(judge_decision, "primary_status", "") or "") != "locked"
+            or bool(getattr(judge_decision, "needs_discriminating_exams", False))
+        ):
+            payload["applied"] = False
+            payload["blocked_reason"] = "root_cause_arbitration_requires_locked_judge_primary"
+            judge_decision.root_cause_arbitration = dict(payload)
             return judge_decision
 
         primary = str(

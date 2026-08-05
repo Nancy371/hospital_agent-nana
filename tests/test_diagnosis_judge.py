@@ -3,6 +3,7 @@ import unittest
 import yaml
 
 from agent.clinical_pattern_bridge import BRIDGE_REASON, CROSS_SYSTEM_SCOPE
+from agent.clinical_reasoning_comparator import SWITCH_PRIMARY, UNLOCK_AND_DEFER
 from agent.diagnosis_engine import CandidateScore, DiagnosisDecision, DiagnosisDecisionEngine
 
 
@@ -31,6 +32,7 @@ ARRHYTHMIA = "\u5fc3\u5f8b\u5931\u5e38"
 LOW_MAGNESIUM = "\u4f4e\u9541\u8840\u75c7"
 RICKETS = "\u7ef4\u751f\u7d20D\u7f3a\u4e4f\u6027\u4f5d\u507b\u75c5"
 REACTIVE_ARTHRITIS = "\u53cd\u5e94\u6027\u5173\u8282\u708e"
+REITER = "\u8d56\u7279\u7efc\u5408\u5f81"
 PAVM = "肺动静脉瘘"
 
 
@@ -528,6 +530,142 @@ class DiagnosisJudgeTests(unittest.TestCase):
                 for item in payload["pairwise_allowed_matrix"]
             )
         )
+
+    def test_primary_arbitration_switches_when_score_primary_has_no_anchor(self):
+        zoster = candidate(
+            ZOSTER,
+            0.91,
+            required=True,
+            matched=["pain", "ocular_redness"],
+            coverage=0.46,
+            residual=0.58,
+            residual_core=3,
+        )
+        zoster.eligibility_status = "PrimaryEligible"
+        zoster.eligibility_anchor_status = "NoValidAnchor"
+        zoster.residual_evidence = ["arthralgia", "dysuria", "conjunctivitis"]
+
+        reiter = candidate(
+            REITER,
+            0.52,
+            required=True,
+            diagnosis_type="disease",
+            matched=["arthralgia", "dysuria", "conjunctivitis"],
+            coverage=0.72,
+            residual=0.18,
+            core_coverage=0.76,
+            residual_core=0,
+            core_score=0.66,
+            diagnostic_score=0.48,
+        )
+        reiter.entity_id = "D100057"
+        reiter.eligibility_status = "PrimaryEligible"
+        reiter.eligibility_anchor_status = "AnchorSatisfied"
+        reiter.evidence_pattern_matches = [
+            {
+                "pattern_id": "reiter_triads_anchor_pattern",
+                "pattern_type": "anchor_pattern",
+                "matched": True,
+                "effect": {"eligibility": "PrimaryEligible"},
+            }
+        ]
+        reiter.clinical_pattern_matches = [
+            {
+                "pattern_id": "postinfectious_arthritis_uroocular_pattern",
+                "verification_status": "verified",
+                "supporting_findings": ["arthralgia", "dysuria", "conjunctivitis"],
+            }
+        ]
+        reiter.derived_pattern_assertions = [
+            {
+                "assertion_id": "DPA-test-reiter",
+                "canonical_pattern": "reactive_arthritis_bridge_pattern",
+            }
+        ]
+        reiter.bridge_protection_decisions = [
+            {
+                "candidate_id": "D100057",
+                "source_assertion_id": "DPA-test-reiter",
+                "protection_scope": [CROSS_SYSTEM_SCOPE],
+                "protection_status": "active",
+                "reason_code": BRIDGE_REASON,
+                "strength": "strong",
+            }
+        ]
+
+        result = self.engine.judge._primary_arbitration(
+            zoster,
+            [zoster, reiter],
+            [{"left": ZOSTER, "right": REITER}],
+        )
+
+        self.assertIs(result["selected_candidate"], reiter)
+        self.assertEqual(result["decision"]["action"], SWITCH_PRIMARY)
+        self.assertIn("CURRENT_PRIMARY_HAS_NO_VALID_ANCHOR", result["decision"]["reason_codes"])
+
+    def test_primary_arbitration_unlocks_when_bridge_contender_needs_gap(self):
+        zoster = candidate(
+            ZOSTER,
+            0.91,
+            required=True,
+            matched=["pain", "ocular_redness"],
+            coverage=0.46,
+            residual=0.58,
+            residual_core=3,
+        )
+        zoster.eligibility_status = "PrimaryEligible"
+        zoster.eligibility_anchor_status = "NoValidAnchor"
+        zoster.residual_evidence = ["arthralgia", "dysuria", "conjunctivitis"]
+
+        reiter = candidate(
+            REITER,
+            0.50,
+            required=False,
+            diagnosis_type="disease",
+            matched=["arthralgia", "dysuria", "conjunctivitis"],
+            gaps=["preceding_genitourinary_infection"],
+            coverage=0.70,
+            residual=0.20,
+            core_coverage=0.72,
+            residual_core=0,
+        )
+        reiter.entity_id = "D100057"
+        reiter.eligibility_status = "Deferred"
+        reiter.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        reiter.clinical_pattern_matches = [
+            {
+                "pattern_id": "postinfectious_arthritis_uroocular_pattern",
+                "verification_status": "verified",
+                "supporting_findings": ["arthralgia", "dysuria", "conjunctivitis"],
+            }
+        ]
+        reiter.derived_pattern_assertions = [
+            {
+                "assertion_id": "DPA-test-reiter-deferred",
+                "canonical_pattern": "reactive_arthritis_bridge_pattern",
+            }
+        ]
+        reiter.bridge_protection_decisions = [
+            {
+                "candidate_id": "D100057",
+                "source_assertion_id": "DPA-test-reiter-deferred",
+                "protection_scope": [CROSS_SYSTEM_SCOPE],
+                "protection_status": "active",
+                "reason_code": BRIDGE_REASON,
+                "strength": "strong",
+            }
+        ]
+
+        result = self.engine.judge._primary_arbitration(
+            zoster,
+            [zoster, reiter],
+            [{"left": ZOSTER, "right": REITER}],
+        )
+
+        self.assertIs(result["selected_candidate"], reiter)
+        self.assertEqual(result["decision"]["action"], UNLOCK_AND_DEFER)
+        self.assertTrue(result["defer_reason"])
+        self.assertEqual(result["pairwise_discriminating_gaps"][0]["gap_type"], "pairwise_discrimination")
 
     def test_bridge_protection_does_not_override_hard_blocker(self):
         primary = candidate(LEUKEMIA, 0.72, required=True, matched=["blast_present"])

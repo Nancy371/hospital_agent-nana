@@ -114,6 +114,47 @@ class ExamInformationGainTests(unittest.TestCase):
         self.assertEqual(ranked[0], expected_deferred)
         self.assertGreater(scores[expected_deferred], scores[expected_generic])
 
+    def test_pairwise_gap_task_beats_generic_exam_ranking(self):
+        pairwise_exam = "\u6ccc\u5c3f\u751f\u6b96\u9053\u75c5\u539f\u6838\u9178\u68c0\u6d4b"
+        generic_exam = "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09"
+
+        ranked, scores = self.strategy._rank_by_information_gain(
+            candidate_diseases=["\u5e26\u72b6\u75b1\u75b9", "\u8d56\u7279\u7efc\u5408\u5f81"],
+            symptoms=["arthralgia", "dysuria", "conjunctivitis"],
+            proposed_items=[generic_exam, pairwise_exam],
+            exam_tasks=[
+                {
+                    "exam": pairwise_exam,
+                    "target_candidates": ["\u5e26\u72b6\u75b1\u75b9", "\u8d56\u7279\u7efc\u5408\u5f81"],
+                    "target_findings": ["preceding_genitourinary_infection"],
+                    "exam_type": "pairwise_discrimination",
+                    "exam_source": "pairwise_discrimination_exam",
+                    "priority_bucket": "high_value_pairwise_gap_closure",
+                    "source_gap_id": "PWG-test",
+                    "target_pair": ["\u5e26\u72b6\u75b1\u75b9", "\u8d56\u7279\u7efc\u5408\u5f81"],
+                    "target_question": "distinguish zoster from reactive arthritis",
+                    "target_claim": "preceding_genitourinary_infection",
+                    "exam_role": "trigger_evidence",
+                    "information_gain_hint": 1.02,
+                },
+                {
+                    "exam": generic_exam,
+                    "target_candidates": ["\u5e26\u72b6\u75b1\u75b9", "\u8d56\u7279\u7efc\u5408\u5f81"],
+                    "target_findings": ["inflammation"],
+                    "exam_type": "generic_inflammation",
+                    "information_gain_hint": 0.45,
+                },
+            ],
+        )
+
+        normalized_pairwise, _ = self.strategy.knowledge.normalize_examinations([pairwise_exam])
+        normalized_generic, _ = self.strategy.knowledge.normalize_examinations([generic_exam])
+        expected_pairwise = normalized_pairwise[0] if normalized_pairwise else pairwise_exam
+        expected_generic = normalized_generic[0] if normalized_generic else generic_exam
+
+        self.assertEqual(ranked[0], expected_pairwise)
+        self.assertGreater(scores[expected_pairwise], scores[expected_generic])
+
     def test_high_value_pavm_gap_closure_is_reserved_over_conflict_and_generic(self):
         strategy = ExamStrategyAgent(
             KnowledgeBase("data/ref_data"),

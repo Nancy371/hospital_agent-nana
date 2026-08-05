@@ -223,6 +223,9 @@ class CandidateScore:
     missing_required_anchors: List[str] = field(default_factory=list)
     satisfied_required_anchors: List[str] = field(default_factory=list)
     eligibility_blockers: List[str] = field(default_factory=list)
+    eligibility_anchor_status: str = ""
+    eligibility_anchor_policy: Dict[str, Any] = field(default_factory=dict)
+    eligibility_anchor_policy_audit: Dict[str, Any] = field(default_factory=dict)
     evidence_contributions: List[Dict[str, Any]] = field(default_factory=list)
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
     clinical_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
@@ -624,6 +627,8 @@ class DiagnosticKnowledgeBase:
                         merged[key] = _dedupe_objects(
                             list(merged.get(key, [])) + list(value or [])
                         )
+                    elif key == "eligibility_anchor_policy":
+                        merged[key] = dict(value or {})
                     else:
                         merged[key] = value
                 self.entries[name] = merged
@@ -678,6 +683,7 @@ class DiagnosticKnowledgeBase:
             "generalization_suppressions": [],
             "diagnostic_patterns": [],
             "accepted_bridge_patterns": [],
+            "eligibility_anchor_policy": {},
             "sources": [],
             "source_version": "",
             "department": "",
@@ -813,6 +819,10 @@ class DiagnosticKnowledgeBase:
                 entry["accepted_bridge_patterns"] = _dedupe_objects(
                     list(entry.get("accepted_bridge_patterns", []) or [])
                     + list(evidence_profile.get("accepted_bridge_patterns") or [])
+                )
+            if evidence_profile.get("eligibility_anchor_policy"):
+                entry["eligibility_anchor_policy"] = dict(
+                    evidence_profile.get("eligibility_anchor_policy") or {}
                 )
             self.entity_id_by_name[name] = entity.entity_id
             self.aliases[name] = name

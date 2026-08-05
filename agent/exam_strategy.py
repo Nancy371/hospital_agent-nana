@@ -304,6 +304,9 @@ class ExamStrategyAgent:
                 "reserved_gap_items": list(
                     differential_plan.get("reserved_gap_items") or []
                 ),
+                "reserved_pairwise_items": list(
+                    differential_plan.get("reserved_pairwise_items") or []
+                ),
                 "source_decision_version": differential_plan.get(
                     "source_decision_version",
                     0,
@@ -651,6 +654,11 @@ class ExamStrategyAgent:
             if str(task.get("exam_source") or "") == "deferred_gap_closure_exam"
             and bool(task.get("priority_override"))
         ]
+        pairwise_gap_task_items = [
+            exam
+            for exam, task in task_items_by_priority
+            if str(task.get("exam_source") or "") == "pairwise_discrimination_exam"
+        ]
         followup_task_items = [
             exam
             for exam, task in task_items_by_priority
@@ -666,6 +674,7 @@ class ExamStrategyAgent:
         priority_task_items = list(
             dict.fromkeys(
                 urgent_task_items
+                + pairwise_gap_task_items
                 + deferred_gap_task_items
                 + followup_task_items
                 + conflict_task_items
@@ -781,6 +790,20 @@ class ExamStrategyAgent:
                 "source_gap_value": float(
                     task_by_exam.get(item, {}).get("source_gap_value") or 0.0
                 ),
+                "source_gap_id": str(
+                    task_by_exam.get(item, {}).get("source_gap_id") or ""
+                ),
+                "target_pair": list(task_by_exam.get(item, {}).get("target_pair") or []),
+                "target_question": str(
+                    task_by_exam.get(item, {}).get("target_question") or ""
+                ),
+                "target_claim": str(
+                    task_by_exam.get(item, {}).get("target_claim") or ""
+                ),
+                "exam_role": str(task_by_exam.get(item, {}).get("exam_role") or ""),
+                "expected_arbitration_effect": dict(
+                    task_by_exam.get(item, {}).get("expected_arbitration_effect") or {}
+                ),
                 "gap_value_rank": task_by_exam.get(item, {}).get("gap_value_rank"),
                 "gap_value_components": dict(
                     task_by_exam.get(item, {}).get("gap_value_components") or {}
@@ -813,6 +836,11 @@ class ExamStrategyAgent:
             if detail.get("exam_source") == "deferred_gap_closure_exam"
             and detail.get("priority_override")
         ]
+        reserved_pairwise_items = [
+            detail["exam"]
+            for detail in authorization_details
+            if detail.get("exam_source") == "pairwise_discrimination_exam"
+        ]
         return {
             "items": items,
             "information_gain": information_gain,
@@ -821,6 +849,7 @@ class ExamStrategyAgent:
             "candidate_exam_pool": normalized,
             "exam_authorization_details": authorization_details,
             "reserved_gap_items": reserved_gap_items,
+            "reserved_pairwise_items": reserved_pairwise_items,
             "source_decision_version": payload.get("decision_version")
             or payload.get("case_version")
             or 0,
@@ -1083,8 +1112,14 @@ class ExamStrategyAgent:
             == "deferred_gap_closure_exam"
             and bool(task_by_exam.get(item, {}).get("priority_override"))
         ]
+        pairwise_reserved = [
+            item
+            for item in prepared
+            if str(task_by_exam.get(item, {}).get("exam_source") or "")
+            == "pairwise_discrimination_exam"
+        ]
         selected: List[str] = []
-        for item in urgent + reserved + prepared:
+        for item in urgent + pairwise_reserved + reserved + prepared:
             if item not in selected:
                 selected.append(item)
             if len(selected) >= limit:
@@ -1209,7 +1244,19 @@ class ExamStrategyAgent:
             if not normalized:
                 normalized, _ = self.knowledge.normalize_examinations([requested_exam])
             if not normalized:
-                continue
+                if str(task.get("exam_source") or "") != "pairwise_discrimination_exam":
+                    continue
+                normalized = [requested_exam]
+                resolution_payload = {
+                    **resolution_payload,
+                    "requested_exam": requested_exam,
+                    "resolved_exam": requested_exam,
+                    "resolution_type": "unresolved_catalog_gap",
+                    "diagnostic_coverage": float(
+                        task.get("diagnostic_coverage") or 0.0
+                    ),
+                    "reason": "pairwise gap exam retained for audit despite catalog miss",
+                }
             current = dict(task)
             for exam in normalized:
                 current_for_exam = dict(current)
@@ -1256,6 +1303,7 @@ class ExamStrategyAgent:
         elif source not in {
             "evidence_claim_followup_exam",
             "pattern_anchor_workup_exam",
+            "pairwise_discrimination_exam",
         }:
             return False
         text = str(exam or "").lower()
@@ -1359,6 +1407,25 @@ class ExamStrategyAgent:
                         if isinstance(incoming.get(key), dict)
                         else incoming.get(key)
                     )
+        if keep_incoming and incoming.get("exam_source") == "pairwise_discrimination_exam":
+            for key in (
+                "exam_source",
+                "exam_type",
+                "expected_effect",
+                "priority_bucket",
+                "source_gap_id",
+                "target_pair",
+                "target_question",
+                "target_claim",
+                "exam_role",
+                "expected_arbitration_effect",
+            ):
+                if incoming.get(key) not in (None, "", [], {}):
+                    result[key] = (
+                        dict(incoming.get(key))
+                        if isinstance(incoming.get(key), dict)
+                        else incoming.get(key)
+                    )
         return result
 
     def _strict_authorized_exam_plan(
@@ -1417,6 +1484,8 @@ class ExamStrategyAgent:
             "pattern_anchor_workup_exam",
         }:
             return "targeted_evidence_followup"
+        if source == "pairwise_discrimination_exam":
+            return "high_value_pairwise_gap_closure"
         if source == "conflict_adjudication_exam":
             return "conflict_adjudication"
         exam_type = str((task or {}).get("exam_type") or "")
@@ -1428,7 +1497,8 @@ class ExamStrategyAgent:
     def _exam_task_priority_key(cls, task: Dict[str, Any]) -> tuple:
         bucket_name = cls._exam_task_priority_bucket(task)
         bucket = {
-            "urgent_safety": 6,
+            "urgent_safety": 7,
+            "high_value_pairwise_gap_closure": 6,
             "high_value_deferred_gap_closure": 5,
             "targeted_evidence_followup": 4,
             "conflict_adjudication": 3,
@@ -1854,6 +1924,8 @@ class ExamStrategyAgent:
                 relevance[exam] = relevance.get(exam, 0.0) + 1.25
             if str(task.get("exam_source") or "") == "deferred_gap_closure_exam":
                 relevance[exam] = relevance.get(exam, 0.0) + 1.0
+            if str(task.get("exam_source") or "") == "pairwise_discrimination_exam":
+                relevance[exam] = relevance.get(exam, 0.0) + 1.15
             task_priority[exam] = max(
                 task_priority.get(exam, (0, 0, 0.0, 0.0, -9999, 0.0)),
                 self._exam_task_priority_key(task),
@@ -1915,6 +1987,8 @@ class ExamStrategyAgent:
                 score += 0.60
             if str(task_by_exam.get(exam, {}).get("exam_source") or "") == "deferred_gap_closure_exam":
                 score += 0.75
+            if str(task_by_exam.get(exam, {}).get("exam_source") or "") == "pairwise_discrimination_exam":
+                score += 0.70
             if exam_type == "generic_inflammation" and coverage < 2:
                 score *= 0.45
             scores[exam] = round(score, 4)

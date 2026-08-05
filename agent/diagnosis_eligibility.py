@@ -27,6 +27,10 @@ WEAK_DIFFERENTIAL_SIGNAL = "WeakDifferentialSignal"
 INSUFFICIENT_EXPLANATION = "InsufficientExplanation"
 ANCHORS_SATISFIED = "AnchorsSatisfied"
 PATTERN_CONTRADICTED = "PatternContradicted"
+ANCHOR_SATISFIED = "AnchorSatisfied"
+PATTERN_SUPPORTED_BUT_UNCONFIRMED = "PatternSupportedButUnconfirmed"
+NO_VALID_ANCHOR = "NoValidAnchor"
+HARD_BLOCKED = "HardBlocked"
 
 
 _PULMONARY_CRYPTOCOCCOSIS_ANCHORS = {
@@ -60,6 +64,9 @@ class EligibilityResult:
     evidence_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
     positive_evidence_score: float = 0.0
     evidence_specificity_score: float = 0.0
+    anchor_status: str = ""
+    anchor_policy: Dict[str, Any] = field(default_factory=dict)
+    anchor_policy_audit: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -324,6 +331,25 @@ class DiagnosisEligibilityGate:
         self.specificity_calculator = EvidenceSpecificityCalculator(knowledge)
         self.pattern_evaluator = DiagnosticPatternEvaluator(knowledge)
 
+    @staticmethod
+    def _texts(values: Any) -> List[str]:
+        if values is None:
+            return []
+        if isinstance(values, (str, bytes)):
+            text = str(values).strip()
+            return [text] if text else []
+        try:
+            iterator = iter(values)
+        except TypeError:
+            text = str(values).strip()
+            return [text] if text else []
+        result: List[str] = []
+        for value in iterator:
+            text = str(value or "").strip()
+            if text:
+                result.append(text)
+        return result
+
     def evaluate_all(
         self,
         candidates: Sequence[Any],
@@ -348,7 +374,7 @@ class DiagnosisEligibilityGate:
         if getattr(candidate, "unresolved_evidence_conflict", False):
             blockers.append("unresolved_reasoning_structured_evidence_conflict")
             return self._result(candidate, DEFERRED, CONFLICT_NEEDS_ADJUDICATION, missing, satisfied, blockers)
-        pattern_summary = self.pattern_evaluator.evaluate(candidate, evidence=evidence)
+        pattern_summary: Dict[str, Any] = self.pattern_evaluator.evaluate(candidate, evidence=evidence)
         if pattern_summary.get("has_patterns"):
             pattern_audit = list(pattern_summary.get("matches", []) or [])
             pattern_audit.extend(pattern_summary.get("missing_primary_patterns", []) or [])
@@ -365,6 +391,34 @@ class DiagnosisEligibilityGate:
                     blockers or pattern_summary.get("negative_hits", []),
                 )
             if pattern_summary.get("primary_eligible_matches"):
+                anchor_decision = self._anchor_policy_decision(
+                    candidate,
+                    evidence=evidence,
+                    pattern_summary=pattern_summary,
+                )
+                if anchor_decision.get("override_status"):
+                    self._apply_anchor_policy_audit(candidate, anchor_decision)
+                    missing = list(
+                        dict.fromkeys(
+                            list(missing)
+                            + list(anchor_decision.get("missing_required_anchors") or [])
+                        )
+                    )
+                    blockers = list(
+                        dict.fromkeys(
+                            list(blockers)
+                            + list(anchor_decision.get("blockers") or [])
+                        )
+                    )
+                    return self._result(
+                        candidate,
+                        str(anchor_decision.get("override_status") or DIFFERENTIAL_ONLY),
+                        str(anchor_decision.get("reason") or NO_VALID_ANCHOR),
+                        missing,
+                        satisfied,
+                        blockers,
+                    )
+                self._apply_anchor_policy_audit(candidate, anchor_decision)
                 missing = []
                 return self._result(candidate, PRIMARY_ELIGIBLE, ANCHORS_SATISFIED, missing, satisfied, blockers)
             if pattern_summary.get("differential_matches"):
@@ -396,6 +450,34 @@ class DiagnosisEligibilityGate:
         if sanity_gap:
             missing = list(dict.fromkeys(list(missing) + [sanity_gap]))
             return self._result(candidate, DEFERRED, NEEDS_ANCHOR, missing, satisfied, blockers)
+        anchor_decision = self._anchor_policy_decision(
+            candidate,
+            evidence=evidence,
+            pattern_summary=pattern_summary if isinstance(pattern_summary, dict) else None,
+        )
+        if anchor_decision.get("override_status"):
+            self._apply_anchor_policy_audit(candidate, anchor_decision)
+            missing = list(
+                dict.fromkeys(
+                    list(missing)
+                    + list(anchor_decision.get("missing_required_anchors") or [])
+                )
+            )
+            blockers = list(
+                dict.fromkeys(
+                    list(blockers)
+                    + list(anchor_decision.get("blockers") or [])
+                )
+            )
+            return self._result(
+                candidate,
+                str(anchor_decision.get("override_status") or DIFFERENTIAL_ONLY),
+                str(anchor_decision.get("reason") or NO_VALID_ANCHOR),
+                missing,
+                satisfied,
+                blockers,
+            )
+        self._apply_anchor_policy_audit(candidate, anchor_decision)
         if self._insufficient_explanation(candidate):
             return self._result(candidate, DIFFERENTIAL_ONLY, INSUFFICIENT_EXPLANATION, missing, satisfied, blockers)
         return self._result(candidate, PRIMARY_ELIGIBLE, ANCHORS_SATISFIED, missing, satisfied, blockers)
@@ -409,6 +491,9 @@ class DiagnosisEligibilityGate:
         setattr(candidate, "evidence_pattern_matches", list(result.evidence_pattern_matches))
         setattr(candidate, "positive_evidence_score", result.positive_evidence_score)
         setattr(candidate, "evidence_specificity_score", result.evidence_specificity_score)
+        setattr(candidate, "eligibility_anchor_status", result.anchor_status)
+        setattr(candidate, "eligibility_anchor_policy", dict(result.anchor_policy))
+        setattr(candidate, "eligibility_anchor_policy_audit", dict(result.anchor_policy_audit))
         setattr(candidate, "eligibility_substatus", self._deferred_substatus(candidate, result))
         if result.status == PRIMARY_ELIGIBLE:
             setattr(candidate, "required_met", True)
@@ -462,7 +547,292 @@ class DiagnosisEligibilityGate:
             evidence_pattern_matches=list(getattr(candidate, "evidence_pattern_matches", []) or []),
             positive_evidence_score=float(getattr(candidate, "positive_evidence_score", 0.0) or 0.0),
             evidence_specificity_score=float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0),
+            anchor_status=str(getattr(candidate, "eligibility_anchor_status", "") or ""),
+            anchor_policy=dict(getattr(candidate, "eligibility_anchor_policy", {}) or {}),
+            anchor_policy_audit=dict(getattr(candidate, "eligibility_anchor_policy_audit", {}) or {}),
         )
+
+    def _anchor_policy_decision(
+        self,
+        candidate: Any,
+        *,
+        evidence: Any = None,
+        pattern_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        entry = self._entry(candidate)
+        if not entry:
+            return self._anchor_audit(ANCHOR_SATISFIED, policy={})
+        if getattr(candidate, "hard_contradiction", False):
+            return self._anchor_audit(
+                HARD_BLOCKED,
+                policy=dict(entry.get("eligibility_anchor_policy") or {}),
+                blockers=list(getattr(candidate, "hard_contradicted_evidence", []) or []),
+                override_status=EXCLUDED,
+                reason=HARD_CONTRADICTION,
+            )
+        policy = dict(entry.get("eligibility_anchor_policy") or {})
+        required_groups = list(entry.get("required_groups", []) or [])
+        diagnostic_patterns = list(entry.get("diagnostic_patterns", []) or [])
+        if not policy:
+            if required_groups or diagnostic_patterns:
+                return self._anchor_audit(ANCHOR_SATISFIED, policy={})
+            if self._legacy_empty_group_has_anchor(candidate):
+                return self._anchor_audit(
+                    ANCHOR_SATISFIED,
+                    policy={"mode": "legacy_empty_group_specific_signal"},
+                )
+            return self._anchor_audit(
+                NO_VALID_ANCHOR,
+                policy={"mode": "missing_anchor_policy_inventory_only"},
+                missing=["valid_diagnostic_anchor"],
+                blockers=["empty_required_groups_without_valid_anchor"],
+            )
+
+        accepted = set(self._texts(policy.get("accepted_anchors") or []))
+        matched_anchor_types: List[str] = []
+        missing_anchor_groups: List[str] = []
+        partial_signal = False
+
+        if "required_evidence_group" in accepted and required_groups:
+            if self._satisfied_anchors(candidate):
+                matched_anchor_types.append("required_evidence_group")
+            else:
+                missing_anchor_groups.append("required_evidence_group")
+        if "diagnostic_pattern" in accepted:
+            primary_matches = list((pattern_summary or {}).get("primary_eligible_matches") or [])
+            if primary_matches:
+                matched_anchor_types.append("diagnostic_pattern")
+            elif diagnostic_patterns:
+                missing_anchor_groups.append("diagnostic_pattern")
+        if "disease_specific_anchor" in accepted:
+            pattern_result = self._match_anchor_patterns(
+                candidate,
+                list(policy.get("disease_specific_anchor_patterns") or policy.get("anchor_patterns") or []),
+            )
+            if pattern_result["matched"]:
+                matched_anchor_types.append("disease_specific_anchor")
+            else:
+                partial_signal = partial_signal or bool(pattern_result["partial"])
+                missing_anchor_groups.extend(pattern_result["missing"])
+        if "direct_diagnostic_evidence" in accepted:
+            direct_result = self._match_direct_diagnostic_anchor(candidate, policy)
+            if direct_result["matched"]:
+                matched_anchor_types.append("direct_diagnostic_evidence")
+            else:
+                partial_signal = partial_signal or bool(direct_result["partial"])
+                missing_anchor_groups.extend(direct_result["missing"])
+
+        if matched_anchor_types:
+            return self._anchor_audit(
+                ANCHOR_SATISFIED,
+                policy=policy,
+                matched_anchor_types=matched_anchor_types,
+                missing=missing_anchor_groups,
+            )
+
+        if partial_signal:
+            disposition = str(
+                policy.get("atypical_anchor_disposition")
+                or policy.get("no_anchor_disposition")
+                or DEFERRED
+            )
+            return self._anchor_audit(
+                PATTERN_SUPPORTED_BUT_UNCONFIRMED,
+                policy=policy,
+                missing=missing_anchor_groups or ["confirmatory_anchor"],
+                blockers=["pattern_supported_but_anchor_unconfirmed"],
+                override_status=self._eligibility_status_from_disposition(disposition),
+                reason=NEEDS_ANCHOR,
+            )
+
+        disposition = str(policy.get("no_anchor_disposition") or DIFFERENTIAL_ONLY)
+        return self._anchor_audit(
+            NO_VALID_ANCHOR,
+            policy=policy,
+            missing=missing_anchor_groups or ["valid_diagnostic_anchor"],
+            blockers=["no_valid_diagnostic_anchor"],
+            override_status=self._eligibility_status_from_disposition(disposition),
+            reason=NO_VALID_ANCHOR,
+        )
+
+    def _apply_anchor_policy_audit(self, candidate: Any, audit: Dict[str, Any]) -> None:
+        if not audit:
+            return
+        setattr(candidate, "eligibility_anchor_status", str(audit.get("anchor_status") or ""))
+        setattr(candidate, "eligibility_anchor_policy", dict(audit.get("policy") or {}))
+        setattr(candidate, "eligibility_anchor_policy_audit", dict(audit))
+
+    def _anchor_audit(
+        self,
+        anchor_status: str,
+        *,
+        policy: Dict[str, Any],
+        matched_anchor_types: Optional[Sequence[str]] = None,
+        missing: Optional[Sequence[str]] = None,
+        blockers: Optional[Sequence[str]] = None,
+        override_status: str = "",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "anchor_status": anchor_status,
+            "policy": dict(policy or {}),
+            "matched_anchor_types": list(matched_anchor_types or []),
+            "missing_required_anchors": list(dict.fromkeys(missing or [])),
+            "blockers": list(dict.fromkeys(blockers or [])),
+            "override_status": override_status,
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _eligibility_status_from_disposition(disposition: str) -> str:
+        if disposition in {PRIMARY_ELIGIBLE, DEFERRED, DIFFERENTIAL_ONLY, EXCLUDED}:
+            return disposition
+        lowered = str(disposition or "").lower()
+        if "deferred" in lowered:
+            return DEFERRED
+        if "exclude" in lowered:
+            return EXCLUDED
+        if "primary" in lowered:
+            return PRIMARY_ELIGIBLE
+        return DIFFERENTIAL_ONLY
+
+    def _match_anchor_patterns(
+        self,
+        candidate: Any,
+        patterns: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        matched = set(getattr(candidate, "matched_evidence", []) or [])
+        any_partial = False
+        missing: List[str] = []
+        for pattern in patterns or []:
+            if not isinstance(pattern, dict):
+                continue
+            required = pattern.get("required") or pattern.get("all_of") or []
+            result = self._condition_result({"all_of": required}, matched)
+            if result["matched"]:
+                return {"matched": True, "partial": False, "missing": []}
+            any_partial = any_partial or bool(result["matched_findings"])
+            pattern_id = str(pattern.get("pattern_id") or "anchor_pattern")
+            for item in result["missing_findings"]:
+                missing.append(f"{pattern_id}:{item}")
+        return {
+            "matched": False,
+            "partial": any_partial,
+            "missing": list(dict.fromkeys(missing)),
+        }
+
+    def _match_direct_diagnostic_anchor(
+        self,
+        candidate: Any,
+        policy: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        matched = set(getattr(candidate, "matched_evidence", []) or [])
+        config = dict(policy.get("direct_diagnostic_evidence") or {})
+        diagnosis = str(getattr(candidate, "diagnosis", "") or "")
+        direct = config.get("any_of") or [f"diagnosis:{diagnosis}"]
+        compatible = config.get("requires_any") or []
+        direct_result = self._condition_result({"any_of": direct}, matched)
+        compatible_result = (
+            self._condition_result({"any_of": compatible}, matched)
+            if compatible
+            else {"matched": True, "matched_findings": [], "missing_findings": []}
+        )
+        return {
+            "matched": bool(direct_result["matched"] and compatible_result["matched"]),
+            "partial": bool(direct_result["matched"] or compatible_result["matched"]),
+            "missing": list(
+                dict.fromkeys(
+                    [f"direct_diagnostic_evidence:{item}" for item in direct_result["missing_findings"]]
+                    + [
+                        f"direct_diagnostic_compatible_manifestation:{item}"
+                        for item in compatible_result["missing_findings"]
+                    ]
+                )
+            ),
+        }
+
+    def _condition_result(self, condition: Any, matched: Set[str]) -> Dict[str, Any]:
+        if isinstance(condition, str):
+            text = str(condition or "").strip()
+            hit = text in matched
+            return {
+                "matched": hit,
+                "matched_findings": [text] if hit else [],
+                "missing_findings": [] if hit else [text],
+            }
+        if not isinstance(condition, dict):
+            text = str(condition or "")
+            return {"matched": False, "matched_findings": [], "missing_findings": [text]}
+        if "finding" in condition:
+            return self._condition_result(str(condition.get("finding") or ""), matched)
+        if "any_of" in condition:
+            matched_findings: List[str] = []
+            missing_findings: List[str] = []
+            for item in condition.get("any_of") or []:
+                result = self._condition_result(item, matched)
+                matched_findings.extend(result["matched_findings"])
+                missing_findings.extend(result["missing_findings"])
+            return {
+                "matched": bool(matched_findings),
+                "matched_findings": list(dict.fromkeys(matched_findings)),
+                "missing_findings": list(dict.fromkeys(missing_findings)),
+            }
+        if "all_of" in condition:
+            matched_findings = []
+            missing_findings = []
+            all_matched = True
+            for item in condition.get("all_of") or []:
+                result = self._condition_result(item, matched)
+                matched_findings.extend(result["matched_findings"])
+                missing_findings.extend(result["missing_findings"])
+                all_matched = all_matched and bool(result["matched"])
+            return {
+                "matched": all_matched,
+                "matched_findings": list(dict.fromkeys(matched_findings)),
+                "missing_findings": list(dict.fromkeys(missing_findings)),
+            }
+        if "min_count" in condition:
+            try:
+                minimum = int(condition.get("min_count") or 0)
+            except (TypeError, ValueError):
+                minimum = 0
+            matched_findings = []
+            missing_findings = []
+            for item in condition.get("of") or []:
+                result = self._condition_result(item, matched)
+                matched_findings.extend(result["matched_findings"])
+                missing_findings.extend(result["missing_findings"])
+            return {
+                "matched": len(set(matched_findings)) >= max(0, minimum),
+                "matched_findings": list(dict.fromkeys(matched_findings)),
+                "missing_findings": list(dict.fromkeys(missing_findings)),
+            }
+        if "not_any_of" in condition:
+            result = self._condition_result({"any_of": condition.get("not_any_of") or []}, matched)
+            return {
+                "matched": not bool(result["matched"]),
+                "matched_findings": [],
+                "missing_findings": result["matched_findings"],
+            }
+        return {"matched": False, "matched_findings": [], "missing_findings": [str(condition)]}
+
+    @staticmethod
+    def _legacy_empty_group_has_anchor(candidate: Any) -> bool:
+        matched = {str(item) for item in getattr(candidate, "matched_evidence", []) or []}
+        diagnosis = str(getattr(candidate, "diagnosis", "") or "")
+        if f"diagnosis:{diagnosis}" in matched:
+            return True
+        if getattr(candidate, "diagnostic_matched_evidence", None):
+            return True
+        if float(getattr(candidate, "diagnostic_evidence_score", 0.0) or 0.0) >= 0.25:
+            return True
+        if (
+            float(getattr(candidate, "core_evidence_score", 0.0) or 0.0) >= 0.50
+            and float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0) >= 0.55
+        ):
+            return True
+        components = getattr(candidate, "component_scores", {}) or {}
+        return float(components.get("objective_evidence", 0.0) or 0.0) >= 1.0
 
     def _deferred_substatus(self, candidate: Any, result: EligibilityResult) -> str:
         if result.status != DEFERRED:

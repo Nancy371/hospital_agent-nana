@@ -8,6 +8,7 @@ from agent.diagnosis_eligibility import (
     DIFFERENTIAL_ONLY,
     EXCLUDED,
     NEEDS_ANCHOR,
+    NO_VALID_ANCHOR,
     PATTERN_CONTRADICTED,
     PRIMARY_ELIGIBLE,
     DiagnosisEligibilityGate,
@@ -46,6 +47,51 @@ class DiagnosisEligibilityGateTests(unittest.TestCase):
     def setUp(self):
         self.gate = DiagnosisEligibilityGate()
         self.knowledge_gate = DiagnosisEligibilityGate(DiagnosticKnowledgeBase("data/ref_data"))
+
+    def test_zoster_without_dermatomal_or_vesicular_anchor_is_not_primary_eligible(self):
+        zoster = candidate(
+            diagnosis="\u5e26\u72b6\u75b1\u75b9",
+            diagnosis_type="disease",
+            required_met=True,
+            matched_evidence=["arthralgia", "dysuria", "ocular_redness"],
+            core_matched_evidence=["ocular_redness"],
+            required_gaps=[],
+            source_prior=0.62,
+            coverage_score=0.55,
+            core_explanatory_coverage=0.42,
+        )
+
+        result = self.knowledge_gate.evaluate(zoster)
+
+        self.assertEqual(result.status, DIFFERENTIAL_ONLY)
+        self.assertEqual(result.reason, NO_VALID_ANCHOR)
+        self.assertEqual(result.anchor_status, NO_VALID_ANCHOR)
+        self.assertIn("no_valid_diagnostic_anchor", result.blockers)
+
+    def test_zoster_dermatomal_pain_plus_vesicular_rash_satisfies_anchor_policy(self):
+        zoster = candidate(
+            diagnosis="\u5e26\u72b6\u75b1\u75b9",
+            diagnosis_type="disease",
+            required_met=True,
+            matched_evidence=["dermatomal_pain", "vesicular_rash"],
+            core_matched_evidence=["dermatomal_pain", "vesicular_rash"],
+            diagnostic_matched_evidence=["vesicular_rash"],
+            required_gaps=[],
+            source_prior=0.62,
+            coverage_score=0.72,
+            core_explanatory_coverage=0.70,
+            core_evidence_score=0.62,
+            diagnostic_evidence_score=0.42,
+        )
+
+        result = self.knowledge_gate.evaluate(zoster)
+
+        self.assertEqual(result.status, PRIMARY_ELIGIBLE)
+        self.assertEqual(result.anchor_status, "AnchorSatisfied")
+        self.assertIn(
+            "disease_specific_anchor",
+            result.anchor_policy_audit.get("matched_anchor_types", []),
+        )
 
     def test_missing_vitamin_d_anchor_defers_rickets_for_workup(self):
         rickets = candidate(
