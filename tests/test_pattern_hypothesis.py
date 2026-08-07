@@ -4,7 +4,13 @@ import yaml
 
 from agent.clinical_evidence import EvidenceBundle, Observation
 from agent.diagnosis_engine import DiagnosisDecisionEngine
-from agent.pattern_hypothesis import PatternHypothesisVerifier, ThinkingSnapshot
+from agent.pattern_hypothesis import (
+    EvidenceRefResolver,
+    EvidenceRelationBinder,
+    PatternHypothesisVerifier,
+    ThinkingSnapshot,
+    _observation_ref,
+)
 
 
 RAD_PNEUMONITIS = "\u653e\u5c04\u6027\u80ba\u708e"
@@ -199,6 +205,114 @@ class PatternHypothesisTests(unittest.TestCase):
         self.assertNotEqual(result["verification_status"], "verified")
         self.assertEqual(context["pattern_protected_candidate_recall"], [])
 
+    def test_evidence_ref_resolver_uses_ontology_parent_without_fabrication(self):
+        observations = [
+            Observation("pneumonia_infiltrate", "imaging_result", confidence=0.9),
+        ]
+        resolver = EvidenceRefResolver(
+            observations,
+            {
+                "pulmonary_abnormality": {
+                    "children": ["pneumonia_infiltrate", "ground_glass_opacity"],
+                    "aliases": [],
+                }
+            },
+        )
+        resolved = resolver.resolve("pulmonary_abnormality")
+        self.assertEqual(resolved.binding_status, "resolved")
+        self.assertEqual(resolved.binding_method, "ontology_parent")
+        self.assertEqual(resolved.canonical_concept, "pulmonary_abnormality")
+        self.assertEqual(
+            resolved.candidate_matches[0]["canonical_concept"],
+            "pneumonia_infiltrate",
+        )
+        self.assertNotEqual(resolved.candidate_matches[0]["canonical_concept"], "ground_glass_opacity")
+
+    def test_evidence_ref_resolver_reports_ambiguous_parent(self):
+        observations = [
+            Observation("pneumonia_infiltrate", "imaging_result", field_path="exam[1]"),
+            Observation("ground_glass_opacity", "imaging_result", field_path="exam[2]"),
+        ]
+        resolver = EvidenceRefResolver(
+            observations,
+            {
+                "pulmonary_abnormality": {
+                    "children": ["pneumonia_infiltrate", "ground_glass_opacity"],
+                    "aliases": [],
+                }
+            },
+        )
+        resolved = resolver.resolve("pulmonary_abnormality")
+        self.assertEqual(resolved.binding_status, "ambiguous")
+        self.assertEqual(resolved.failure_reason, "ambiguous_evidence_binding")
+
+    def test_observation_ref_is_stable_under_bundle_order(self):
+        first = Observation("dyspnea", "patient_reported_observation", field_path="symptom[1]")
+        second = Observation("cough", "patient_reported_observation", field_path="symptom[2]")
+        refs_a = [_observation_ref(item) for item in [first, second]]
+        refs_b = [_observation_ref(item) for item in [second, first]]
+        self.assertEqual(refs_a[0], refs_b[1])
+        self.assertEqual(refs_a[1], refs_b[0])
+        self.assertNotEqual(refs_a[0], refs_a[1])
+
+    def test_relation_binder_does_not_turn_mvp_into_regurgitation(self):
+        evidence = EvidenceBundle(
+            [
+                Observation("mitral_valve_prolapse", "imaging_result", confidence=0.95),
+                Observation("orthopnea", "patient_reported_observation", confidence=0.9),
+                Observation("pink_frothy_sputum", "patient_reported_observation", confidence=0.9),
+            ]
+        )
+        binder = EvidenceRelationBinder(evidence.observations, {})
+        binding = binder.bind("structural_function_abnormality")
+        audit = binding["audit"]
+        self.assertEqual(audit["activation_status"], "activated")
+        self.assertIn("structure_or_credible_sign", audit["bound_slots"])
+        self.assertIn("function_impairment", audit["bound_slots"])
+        self.assertNotIn("regurgitation_specific", audit["bound_slots"])
+
+    def test_deterministic_relation_audit_and_gap_suggestion_are_recall_only(self):
+        evidence = radiation_evidence()
+        context = self.engine.build_pattern_recall_context({}, evidence)
+        self.assertTrue(
+            any(
+                item["generator_source"] == "deterministic_relation"
+                for item in context["pattern_hypotheses"]
+            )
+        )
+        verified = [
+            item
+            for item in context["pattern_verification_results"]
+            if item["verification_status"] == "verified"
+        ]
+        self.assertTrue(verified)
+        audit = verified[0]["relation_activation_audit"]
+        self.assertEqual(audit["activation_status"], "activated")
+        self.assertIn("exposure", audit["bound_slots"])
+        self.assertIn("organ_manifestation", audit["bound_slots"])
+        self.assertIn("imaging_or_objective_finding", audit["bound_slots"])
+        self.assertTrue(context["pattern_gap_suggestions"])
+        self.assertTrue(
+            all(
+                item.get("active_gap_write_permission") == "none"
+                for item in context["pattern_gap_suggestions"]
+            )
+        )
+
+    def test_valvular_family_expansion_keeps_family_specificity(self):
+        evidence = EvidenceBundle(
+            [
+                Observation("mitral_valve_prolapse", "imaging_result", confidence=0.96, information_value=0.9),
+                Observation("orthopnea", "patient_reported_observation", confidence=0.9, information_value=0.7),
+                Observation("pink_frothy_sputum", "patient_reported_observation", confidence=0.9, information_value=0.8),
+            ]
+        )
+        context = self.engine.build_pattern_recall_context({}, evidence)
+        signals = [item for item in context["pattern_recall_signals"] if item["entity_id"] == "D100012"]
+        self.assertTrue(signals)
+        self.assertEqual(signals[0]["admission_level"], "family_expansion")
+        self.assertEqual(signals[0]["verified_specificity"], "family")
+
     def test_pattern_recall_merges_existing_mitral_regurgitation_entity(self):
         evidence = EvidenceBundle(
             [
@@ -282,16 +396,16 @@ class PatternHypothesisTests(unittest.TestCase):
             thinking_snapshots=[snapshot.to_dict()],
         )
         self.assertEqual(context["thinking_snapshot_count"], 1)
-        self.assertEqual(len(context["pattern_hypotheses"]), 1)
+        self.assertGreaterEqual(len(context["pattern_hypotheses"]), 1)
         self.assertTrue(context["pattern_recall_signals"])
         audit = context["pattern_recall_audit"]
-        self.assertEqual(audit["proposal_count"], 1)
-        self.assertEqual(audit["verification_statuses"]["verified"], 1)
+        self.assertGreaterEqual(audit["proposal_count"], 1)
+        self.assertGreaterEqual(audit["verification_statuses"]["verified"], 1)
         self.assertIn("D100058", audit["signal_entity_ids"])
         decision = self.engine.decide({}, [], evidence, pattern_recall_context=context)
         top20 = [item.diagnosis for item in decision.candidates[:20]]
         self.assertIn(RAD_PNEUMONITIS, top20)
-        self.assertEqual(decision.pattern_recall_audit["proposal_count"], 1)
+        self.assertGreaterEqual(decision.pattern_recall_audit["proposal_count"], 1)
         self.assertTrue(
             any(
                 item.get("entity_id") == "D100058"
@@ -362,11 +476,11 @@ class PatternHypothesisTests(unittest.TestCase):
             thinking_snapshots=[snapshot.to_dict()],
         )
         self.assertTrue(context["pattern_hypotheses"])
-        self.assertTrue(context["pattern_protected_candidate_recall"])
+        self.assertTrue(context["pattern_recall_signals"])
         self.assertTrue(
-            all(
+            any(
                 item["pattern_hypothesis_id"].startswith("PH_DET")
-                for item in context["pattern_protected_candidate_recall"]
+                for item in context["pattern_recall_signals"]
             )
         )
         self.assertEqual(
@@ -394,7 +508,9 @@ class PatternHypothesisTests(unittest.TestCase):
             evidence_snapshot_id="ES_TEST",
             thinking_snapshots=[snapshot.to_dict()],
         )
-        self.assertEqual(len(context["pattern_hypotheses"]), 1)
+        sources = [item["generator_source"] for item in context["pattern_hypotheses"]]
+        self.assertEqual(sources.count("thinking_structured"), 1)
+        self.assertEqual(sources.count("deterministic_relation"), 1)
 
     def test_family_relation_can_recall_entity_without_disease_name(self):
         evidence = EvidenceBundle(

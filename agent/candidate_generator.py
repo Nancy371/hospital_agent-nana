@@ -205,6 +205,8 @@ class CandidateGenerator:
                 "recall_mode": signal.recall_mode,
                 "recall_strength": signal.recall_strength,
                 "protected_pool_slot": signal.protected_pool_slot,
+                "admission_level": signal.admission_level,
+                "verified_specificity": signal.verified_specificity,
                 "source_evidence_ids": list(signal.source_evidence_ids),
                 "missing_evidence_requests": list(signal.missing_evidence_requests),
                 "judge_evidence_weight": 0.0,
@@ -221,6 +223,8 @@ class CandidateGenerator:
                 "recall_mode": signal.recall_mode,
                 "recall_strength": signal.recall_strength,
                 "protected_pool_slot": signal.protected_pool_slot,
+                "admission_level": signal.admission_level,
+                "verified_specificity": signal.verified_specificity,
                 "source_evidence_ids": list(signal.source_evidence_ids),
                 "admitted_to_controlled_pool": False,
                 "admitted_to_open_world": False,
@@ -687,6 +691,9 @@ def _coerce_pattern_signal(value: Any) -> Optional[PatternRecallSignal]:
             judge_evidence_weight=0.0,
             eligibility_evidence_weight=0.0,
             gap_suggestion_only=True,
+            active_gap_write_permission="none",
+            admission_level=str(value.get("admission_level") or "family_expansion"),
+            verified_specificity=str(value.get("verified_specificity") or "family"),
         )
     except (TypeError, ValueError):
         return None

@@ -1,0 +1,117 @@
+{
+  "concepts": {
+    "pulmonary_abnormality": {
+      "aliases": [
+        "pulmonary_imaging_abnormality",
+        "pulmonary_injury",
+        "lung_abnormality",
+        "lung_injury"
+      ],
+      "children": [
+        "pneumonia_infiltrate",
+        "ground_glass_opacity",
+        "pulmonary_inflammatory_change",
+        "pulmonary_infiltrate",
+        "lung_opacity",
+        "pulmonary_consolidation",
+        "interstitial_opacity",
+        "atelectasis"
+      ],
+      "role_hints": [
+        "objective_organ_injury"
+      ]
+    },
+    "thoracic_radiotherapy": {
+      "aliases": [
+        "chest_radiotherapy",
+        "lung_radiotherapy",
+        "history_of_thoracic_radiotherapy"
+      ],
+      "children": [],
+      "role_hints": [
+        "causal_exposure"
+      ]
+    },
+    "post_radiotherapy_time_window": {
+      "aliases": [
+        "symptom_onset_after_radiotherapy",
+        "radiotherapy_before_symptoms",
+        "post_rt_time_window"
+      ],
+      "children": [],
+      "role_hints": [
+        "temporal_relation"
+      ]
+    },
+    "respiratory_manifestation": {
+      "aliases": [
+        "respiratory_symptoms",
+        "respiratory_symptom"
+      ],
+      "children": [
+        "dyspnea",
+        "cough",
+        "hypoxemia",
+        "wheeze",
+        "orthopnea"
+      ],
+      "role_hints": [
+        "organ_manifestation",
+        "functional_consequence"
+      ]
+    },
+    "left_sided_valvular_disease": {
+      "aliases": [
+        "left_heart_valvular_disease",
+        "valvular_left_heart"
+      ],
+      "children": [
+        "mitral_valve_prolapse",
+        "cardiac_murmur",
+        "left_heart_enlargement",
+        "valvular_structural_abnormality",
+        "holosystolic_apical_murmur",
+        "flail_leaflet",
+        "leaflet_prolapse"
+      ],
+      "role_hints": [
+        "structural_abnormality"
+      ]
+    },
+    "cardiac_function_impairment": {
+      "aliases": [
+        "heart_failure_manifestation",
+        "pulmonary_congestion_manifestation"
+      ],
+      "children": [
+        "dyspnea",
+        "pulmonary_edema",
+        "heart_failure_state",
+        "orthopnea",
+        "acute_heart_failure",
+        "pink_frothy_sputum",
+        "symptom:咳粉红色泡沫痰"
+      ],
+      "role_hints": [
+        "functional_consequence"
+      ]
+    },
+    "mitral_regurgitation": {
+      "aliases": [
+        "echo_mitral_regurgitation",
+        "regurgitant_jet"
+      ],
+      "children": [
+        "mitral_regurgitation",
+        "echo_mitral_regurgitation",
+        "regurgitant_jet",
+        "flail_leaflet",
+        "leaflet_prolapse",
+        "holosystolic_apical_murmur"
+      ],
+      "role_hints": [
+        "regurgitation_specific"
+      ]
+    }
+  }
+}

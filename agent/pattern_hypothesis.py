@@ -69,6 +69,92 @@ _RELATION_SLOTS = {
     "context",
 }
 
+_ROLE_ALIASES = {
+    "causal_exposure": "exposure",
+    "exposure": "exposure",
+    "temporal_relation": "temporal_relation",
+    "structural_abnormality": "structure_or_credible_sign",
+    "structure_or_credible_sign": "structure_or_credible_sign",
+    "functional_consequence": "function_impairment",
+    "function_impairment": "function_impairment",
+    "objective_organ_injury": "imaging_or_objective_finding",
+    "imaging_or_objective_finding": "imaging_or_objective_finding",
+    "organ_manifestation": "organ_manifestation",
+    "manifestation": "organ_manifestation",
+    "regurgitation_specific": "regurgitation_specific",
+}
+
+_SCHEMA_REQUIRED_SLOTS = {
+    "exposure_temporal_organ_injury": [
+        "exposure",
+        "organ_manifestation",
+        "imaging_or_objective_finding",
+    ],
+    "structural_function_abnormality": [
+        "structure_or_credible_sign",
+        "function_impairment",
+    ],
+    "left_sided_valvular_disease": [
+        "structure_or_credible_sign",
+        "function_impairment",
+    ],
+    "left_sided_valvular_regurgitation": [
+        "structure_or_credible_sign",
+        "function_impairment",
+        "regurgitation_specific",
+    ],
+}
+
+_SCHEMA_CRITICAL_CONSTRAINTS = {
+    "exposure_temporal_organ_injury": [
+        "temporal_after",
+        "anatomical_consistency",
+    ],
+    "structural_function_abnormality": [
+        "structural_function_consistency",
+    ],
+    "left_sided_valvular_disease": [
+        "structural_function_consistency",
+    ],
+    "left_sided_valvular_regurgitation": [
+        "structural_function_consistency",
+    ],
+}
+
+_SOURCE_ANCHOR_CONCEPTS = {
+    "thoracic_radiotherapy": (
+        "胸部放疗",
+        "胸部放射治疗",
+        "肺部放疗",
+        "thoracic radiotherapy",
+        "chest radiotherapy",
+    ),
+    "post_radiotherapy_time_window": (
+        "放疗后",
+        "放疗结束后",
+        "after radiotherapy",
+        "post radiotherapy",
+    ),
+    "ground_glass_opacity": (
+        "磨玻璃",
+        "ground glass",
+        "ground-glass",
+    ),
+    "pulmonary_inflammatory_change": (
+        "肺部炎性",
+        "肺部炎症",
+        "炎性改变",
+    ),
+    "pink_frothy_sputum": (
+        "粉红色泡沫痰",
+        "粉红色泡沫样痰",
+    ),
+    "mitral_valve_prolapse": (
+        "二尖瓣脱垂",
+        "mitral valve prolapse",
+    ),
+}
+
 _RADIATION_PATTERN_HINTS = (
     "radiation",
     "radiotherapy",
@@ -129,6 +215,51 @@ class EvidenceBinding:
 
 
 @dataclass
+class EvidenceReference:
+    raw_ref: str
+    resolved_observation_ref: str = ""
+    canonical_concept: str = ""
+    binding_method: str = "unresolved"
+    binding_confidence: float = 0.0
+    binding_status: str = "unresolved"
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
+    candidate_matches: List[Dict[str, Any]] = field(default_factory=list)
+    failure_reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EvidenceRoleBinding:
+    relation_schema_id: str
+    slot_id: str
+    observation_ref: str
+    canonical_concept: str
+    binding_rule: str
+    binding_confidence: float
+    polarity: str
+    evidence_level: str
+    source: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RelationConstraintResult:
+    constraint_type: str
+    from_observation_ref: str = ""
+    to_observation_ref: str = ""
+    status: str = "unresolved"
+    reason: str = ""
+    interval: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class SuggestedDisease:
     name: str
     canonical_id: str = ""
@@ -164,6 +295,7 @@ class ClinicalPatternHypothesis:
     relations: List[Dict[str, Any]] = field(default_factory=list)
     suggested_diseases: List[SuggestedDisease] = field(default_factory=list)
     missing_evidence_requests: List[Dict[str, Any]] = field(default_factory=list)
+    relation_activation_audit: Dict[str, Any] = field(default_factory=dict)
     model_confidence: float = 0.0
     generator_source: str = "diagnosis_llm_draft"
     proposal_trust_tier: str = _TRUST_TIER_QUERY_ONLY
@@ -236,6 +368,7 @@ class ClinicalPatternHypothesis:
                 )
                 if item
             ],
+            relation_activation_audit=dict(value.get("relation_activation_audit") or {}),
             model_confidence=_safe_float(value.get("model_confidence", value.get("confidence", 0.0))),
             generator_source=str(value.get("generator_source") or "diagnosis_llm_draft"),
             proposal_trust_tier=str(
@@ -382,6 +515,11 @@ class PatternVerificationResult:
     source_groups: Dict[str, List[str]] = field(default_factory=dict)
     missing_evidence_requests: List[Dict[str, Any]] = field(default_factory=list)
     hypothesis: Dict[str, Any] = field(default_factory=dict)
+    ref_resolution_audit: List[Dict[str, Any]] = field(default_factory=list)
+    slot_binding_audit: Dict[str, Any] = field(default_factory=dict)
+    relation_activation_audit: Dict[str, Any] = field(default_factory=dict)
+    admission_level: str = "family_expansion"
+    verified_specificity: str = "family"
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -406,9 +544,228 @@ class PatternRecallSignal:
     eligibility_evidence_weight: float = 0.0
     gap_suggestion_only: bool = True
     active_gap_write_permission: str = "none"
+    admission_level: str = "family_expansion"
+    verified_specificity: str = "family"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+class EvidenceRefResolver:
+    """Resolve proposal refs to existing observations without creating evidence."""
+
+    def __init__(self, observations: Sequence[Observation], ontology: Optional[Dict[str, Any]] = None):
+        self.observations = list(observations or [])
+        self.ontology = dict(ontology or {})
+        self.ref_index, self.ambiguous_refs = _build_observation_lookup(self.observations)
+        self.obs_ref_index = {_observation_ref(item): item for item in self.observations}
+        self.finding_index: Dict[str, List[Observation]] = {}
+        for item in self.observations:
+            self.finding_index.setdefault(_normalize_token(item.finding), []).append(item)
+        self.alias_to_concept: Dict[str, str] = {}
+        for concept, spec in self.ontology.items():
+            self.alias_to_concept[_normalize_token(concept)] = concept
+            for alias in spec.get("aliases", []) or []:
+                self.alias_to_concept[_normalize_token(alias)] = concept
+
+    def resolve(self, raw_ref: Any, *, expected_slot: str = "") -> EvidenceReference:
+        text = str(raw_ref or "").strip()
+        result = EvidenceReference(raw_ref=text)
+        if not text:
+            result.failure_reason = "empty_ref"
+            return result
+        exact = self._resolve_exact_observation_ref(text, result)
+        if exact:
+            return exact
+        canonical = self._resolve_canonical_exact(text, result)
+        if canonical:
+            return canonical
+        alias = self._resolve_alias_or_parent(text, result)
+        if alias:
+            return alias
+        source_anchor = self._resolve_source_anchor(text, result)
+        if source_anchor:
+            return source_anchor
+        result.binding_status = "unresolved"
+        if not result.failure_reason:
+            result.failure_reason = "ontology_mapping_missing"
+        return result
+
+    def _resolve_exact_observation_ref(self, raw_ref: str, result: EvidenceReference) -> Optional[EvidenceReference]:
+        result.attempts.append({"method": "observation_ref_exact", "matched": False})
+        obs = self.obs_ref_index.get(raw_ref) or self.ref_index.get(raw_ref)
+        if not obs:
+            return None
+        return self._resolved(result, obs, "observation_ref_exact", 1.0)
+
+    def _resolve_canonical_exact(self, raw_ref: str, result: EvidenceReference) -> Optional[EvidenceReference]:
+        key = _normalize_token(raw_ref)
+        matches = list(self.finding_index.get(key) or [])
+        result.attempts.append({"method": "canonical_exact", "matched": bool(matches)})
+        if not matches:
+            return None
+        return self._coerce_matches(result, matches, "canonical_exact", 0.98)
+
+    def _resolve_alias_or_parent(self, raw_ref: str, result: EvidenceReference) -> Optional[EvidenceReference]:
+        key = _normalize_token(raw_ref)
+        concept = self.alias_to_concept.get(key)
+        if not concept and key in self.ontology:
+            concept = key
+        result.attempts.append({"method": "controlled_alias", "matched": bool(concept and concept != raw_ref)})
+        if not concept:
+            return None
+        exact = list(self.finding_index.get(_normalize_token(concept)) or [])
+        if exact:
+            return self._coerce_matches(result, exact, "controlled_alias", 0.94, canonical=concept)
+        children = [
+            str(item)
+            for item in (self.ontology.get(concept, {}) or {}).get("children", []) or []
+            if str(item)
+        ]
+        matches: List[Observation] = []
+        child_set = {_normalize_token(item) for item in children}
+        for item in self.observations:
+            if _normalize_token(item.finding) in child_set:
+                matches.append(item)
+        result.attempts.append({"method": "ontology_parent", "matched": bool(matches), "parent": concept})
+        if not matches:
+            result.failure_reason = "ontology_child_observation_missing"
+            return None
+        return self._coerce_matches(result, matches, "ontology_parent", 0.88, canonical=concept)
+
+    def _resolve_source_anchor(self, raw_ref: str, result: EvidenceReference) -> Optional[EvidenceReference]:
+        concept = self.alias_to_concept.get(_normalize_token(raw_ref)) or raw_ref
+        anchors = _SOURCE_ANCHOR_CONCEPTS.get(concept, ())
+        result.attempts.append({"method": "source_provenance_anchor", "matched": False})
+        if not anchors:
+            return None
+        matches: List[Observation] = []
+        for item in self.observations:
+            text = f"{item.raw_text} {item.source_text} {item.field_path}".lower()
+            if any(str(anchor).lower() in text for anchor in anchors):
+                matches.append(item)
+        if not matches:
+            result.failure_reason = "requires_evidence_normalization"
+            return None
+        result.attempts[-1]["matched"] = True
+        return self._coerce_matches(result, matches, "source_provenance_anchor", 0.72, canonical=concept)
+
+    def _coerce_matches(
+        self,
+        result: EvidenceReference,
+        matches: Sequence[Observation],
+        method: str,
+        confidence: float,
+        *,
+        canonical: str = "",
+    ) -> EvidenceReference:
+        unique: Dict[str, Observation] = {}
+        for item in matches:
+            unique.setdefault(_evidence_group_id(item), item)
+        result.candidate_matches = [_observation_summary(item) for item in unique.values()]
+        if len(unique) != 1:
+            result.binding_status = "ambiguous"
+            result.binding_method = method
+            result.binding_confidence = confidence
+            result.failure_reason = "ambiguous_evidence_binding"
+            return result
+        return self._resolved(result, next(iter(unique.values())), method, confidence, canonical=canonical)
+
+    def _resolved(
+        self,
+        result: EvidenceReference,
+        obs: Observation,
+        method: str,
+        confidence: float,
+        *,
+        canonical: str = "",
+    ) -> EvidenceReference:
+        result.resolved_observation_ref = _observation_ref(obs)
+        result.canonical_concept = canonical or obs.finding
+        result.binding_method = method
+        result.binding_confidence = confidence
+        result.binding_status = "resolved"
+        result.failure_reason = ""
+        result.candidate_matches = [_observation_summary(obs)]
+        return result
+
+
+class EvidenceRelationBinder:
+    """Bind existing observations to relation-schema roles."""
+
+    def __init__(self, observations: Sequence[Observation], ontology: Optional[Dict[str, Any]] = None):
+        self.observations = list(observations or [])
+        self.ontology = dict(ontology or {})
+
+    def bind(self, relation_schema_id: str) -> Dict[str, Any]:
+        schema = _normalize_schema_id(relation_schema_id)
+        required = list(_SCHEMA_REQUIRED_SLOTS.get(schema) or [])
+        slot_candidates: Dict[str, List[EvidenceRoleBinding]] = {}
+        for item in self.observations:
+            if item.polarity != "positive" or item.shadowed_by or _lineage_rejection_reason(item):
+                continue
+            for slot, rule, confidence in _role_candidates_for_observation(schema, item, self.ontology):
+                slot_candidates.setdefault(slot, []).append(
+                    EvidenceRoleBinding(
+                        relation_schema_id=schema,
+                        slot_id=slot,
+                        observation_ref=_observation_ref(item),
+                        canonical_concept=item.finding,
+                        binding_rule=rule,
+                        binding_confidence=round(confidence, 4),
+                        polarity=item.polarity or "positive",
+                        evidence_level=item.evidence_level or "",
+                        source=item.source or "",
+                    )
+                )
+        bound_slots: Dict[str, EvidenceRoleBinding] = {}
+        ambiguous_slots: List[str] = []
+        for slot, candidates in slot_candidates.items():
+            unique_groups: Dict[str, EvidenceRoleBinding] = {}
+            for candidate in candidates:
+                obs = _observation_by_ref(self.observations, candidate.observation_ref)
+                if obs:
+                    unique_groups.setdefault(_evidence_group_id(obs), candidate)
+            ranked = sorted(unique_groups.values(), key=lambda item: item.binding_confidence, reverse=True)
+            if ranked:
+                bound_slots[slot] = ranked[0]
+            if len(ranked) > 1 and slot in required:
+                ambiguous_slots.append(slot)
+        missing = [slot for slot in required if slot not in bound_slots]
+        constraints = _evaluate_constraints(schema, bound_slots, self.observations)
+        critical = list(_SCHEMA_CRITICAL_CONSTRAINTS.get(schema) or [])
+        critical_failed = [
+            item.constraint_type
+            for item in constraints
+            if item.constraint_type in critical and item.status != "satisfied"
+        ]
+        if missing:
+            activation_status = "partial"
+        elif critical_failed:
+            activation_status = "partial"
+        else:
+            activation_status = "activated"
+        score = _activation_score(required, bound_slots, constraints)
+        audit = {
+            "relation_schema_id": schema,
+            "required_slots": required,
+            "bound_slots": sorted(bound_slots),
+            "missing_slots": missing,
+            "ambiguous_slots": ambiguous_slots,
+            "supporting_evidence": {
+                slot: bound.to_dict()
+                for slot, bound in bound_slots.items()
+            },
+            "critical_constraints": critical,
+            "constraint_results": [item.to_dict() for item in constraints],
+            "activation_status": activation_status,
+            "activation_score": round(score, 4),
+            "rejection_reasons": (
+                [f"missing_slot:{slot}" for slot in missing]
+                + [f"constraint_unmet:{name}" for name in critical_failed]
+            ),
+        }
+        return {"bindings": bound_slots, "constraints": constraints, "audit": audit}
 
 
 class PatternProposalAdapter:
@@ -425,6 +782,7 @@ class PatternProposalAdapter:
         self.config = merged
         ref_dir = str((config or {}).get("ref_data_dir") or "data/ref_data")
         self.relation_registry = _load_relation_registry(ref_dir)
+        self.evidence_ontology = _load_evidence_ontology(ref_dir)
         self.last_audit: Dict[str, Any] = {}
 
     def propose(
@@ -647,7 +1005,8 @@ class PatternProposalAdapter:
         evidence_snapshot_id: str,
     ) -> List[ClinicalPatternHypothesis]:
         result: List[ClinicalPatternHypothesis] = []
-        observation_index, ambiguous_refs = _build_observation_lookup(evidence.observations if evidence else [])
+        observations = list(evidence.observations if evidence else [])
+        resolver = EvidenceRefResolver(observations, self.evidence_ontology)
         for index, item in enumerate(snapshot.differential_diagnoses or []):
             if not isinstance(item, dict):
                 continue
@@ -660,11 +1019,19 @@ class PatternProposalAdapter:
             refs = [str(ref).strip() for ref in refs if str(ref).strip()]
             if not name or len(set(refs)) < 2:
                 continue
+            bound_observations: List[Observation] = []
+            for ref in refs:
+                resolved = resolver.resolve(ref)
+                if resolved.binding_status != "resolved":
+                    continue
+                observation = _observation_by_ref(observations, resolved.resolved_observation_ref)
+                if observation:
+                    bound_observations.append(observation)
+            if len({_evidence_group_id(item) for item in bound_observations}) < 2:
+                continue
             relation_payload = self._infer_relation_from_differential(
                 name,
-                refs,
-                observation_index,
-                ambiguous_refs,
+                bound_observations,
             )
             if not relation_payload:
                 continue
@@ -700,21 +1067,15 @@ class PatternProposalAdapter:
     def _infer_relation_from_differential(
         self,
         name: str,
-        refs: Sequence[str],
-        observation_index: Dict[str, Observation],
-        ambiguous_refs: set[str],
+        observations: Sequence[Observation],
     ) -> Dict[str, Any]:
         normalized_name = _normalize_token(name)
-        bound = [
-            observation_index.get(ref)
-            for ref in refs
-            if ref not in ambiguous_refs and observation_index.get(ref)
-        ]
-        if not bound:
+        bound = list(observations or [])
+        if len({_evidence_group_id(item) for item in bound}) < 2:
             return {}
-        if any(token in normalized_name for token in {"二尖瓣反流", "mitralregurgitation", "mitral_regurgitation", "mr"}):
+        if any(token in normalized_name for token in {"d100012", "mitralregurgitation", "mitral_regurgitation", "mr"}):
             return self._build_valvular_relation(bound, source_prefix="reasoning_bound")
-        if any(token in normalized_name for token in {"放射性肺炎", "radiationpneumonitis", "radiation_pneumonitis"}):
+        if any(token in normalized_name for token in {"d100058", "radiationpneumonitis", "radiation_pneumonitis"}):
             return self._build_radiation_relation(bound, source_prefix="reasoning_bound")
         return {}
 
@@ -731,10 +1092,19 @@ class PatternProposalAdapter:
         observations = list(evidence.observations or [])
         results: List[ClinicalPatternHypothesis] = []
         max_schemas = int(self.config.get("max_active_schemas_per_snapshot", 5) or 5)
-        for builder in (self._build_radiation_relation, self._build_valvular_relation):
+        binders = (
+            ("exposure_temporal_organ_injury", self._build_radiation_relation),
+            ("structural_function_abnormality", self._build_valvular_relation),
+        )
+        for schema_id, builder in binders:
             if len(results) >= max_schemas:
                 break
-            payload = builder(observations, source_prefix="deterministic_relation")
+            relation_binding = EvidenceRelationBinder(observations, self.evidence_ontology).bind(schema_id)
+            payload = builder(
+                observations,
+                source_prefix="deterministic_relation",
+                relation_binding=relation_binding,
+            )
             if not payload:
                 continue
             payload["pattern_hypothesis_id"] = _stable_id(
@@ -754,21 +1124,25 @@ class PatternProposalAdapter:
                 results.append(hypothesis)
         return results[: int(self.config.get("max_proposals_per_source", 3) or 3)]
 
-    def _build_radiation_relation(self, observations: Sequence[Observation], *, source_prefix: str) -> Dict[str, Any]:
-        exposure = _best_observation(
+    def _build_radiation_relation(
+        self,
+        observations: Sequence[Observation],
+        *,
+        source_prefix: str,
+        relation_binding: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        relation_binding = relation_binding or EvidenceRelationBinder(
             observations,
-            {"thoracic_radiotherapy", "chest_radiotherapy", "lung_radiotherapy"},
-        )
-        temporal = _best_observation(
-            observations,
-            {"post_radiotherapy_time_window", "symptom_onset_after_radiotherapy", "radiotherapy_before_symptoms"},
-        )
-        manifestation = _best_observation(observations, {"dyspnea", "cough", "hypoxemia"})
-        objective = _best_observation(
-            observations,
-            {"ground_glass_opacity", "pulmonary_inflammatory_change", "pulmonary_imaging_abnormality"},
-        )
-        if not all([exposure, temporal, manifestation, objective]):
+            self.evidence_ontology,
+        ).bind("exposure_temporal_organ_injury")
+        audit = relation_binding.get("audit") or {}
+        if audit.get("activation_status") != "activated":
+            return {}
+        bound = relation_binding.get("bindings") or {}
+        exposure = _observation_by_ref(observations, bound["exposure"].observation_ref)
+        manifestation = _observation_by_ref(observations, bound["organ_manifestation"].observation_ref)
+        objective = _observation_by_ref(observations, bound["imaging_or_objective_finding"].observation_ref)
+        if not exposure or not manifestation or not objective:
             return {}
         return {
             "pattern_name": "post_thoracic_radiotherapy_lung_injury_pattern",
@@ -777,63 +1151,55 @@ class PatternProposalAdapter:
             "suggested_family": "radiation_related_lung_injury",
             "evidence_bindings": [
                 _binding_for(exposure, "exposure"),
-                _binding_for(temporal, "temporal_relation"),
                 _binding_for(manifestation, "organ_manifestation"),
                 _binding_for(objective, "imaging_or_objective_finding"),
             ],
             "relations": [
-                {"type": "temporal_after", "from": exposure.finding, "to": manifestation.finding},
-                {"type": "anatomical_consistency", "from": exposure.finding, "to": objective.finding},
+                {"type": "temporal_after", "from": _observation_ref(exposure), "to": _observation_ref(manifestation)},
+                {"type": "anatomical_consistency", "from": _observation_ref(exposure), "to": _observation_ref(objective)},
             ],
             "suggested_diseases": [{"name": "D100058", "canonical_id": "D100058"}],
             "missing_evidence_requests": [{"target_evidence": "infection_exclusion", "importance": "supportive"}],
             "generator_source": source_prefix,
+            "relation_activation_audit": audit,
         }
 
-    def _build_valvular_relation(self, observations: Sequence[Observation], *, source_prefix: str) -> Dict[str, Any]:
-        structure = _best_observation(
+    def _build_valvular_relation(
+        self,
+        observations: Sequence[Observation],
+        *,
+        source_prefix: str,
+        relation_binding: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        relation_binding = relation_binding or EvidenceRelationBinder(
             observations,
-            {
-                "cardiac_murmur",
-                "left_heart_enlargement",
-                "valvular_structural_abnormality",
-                "holosystolic_apical_murmur",
-            },
-        )
-        function = _best_observation(
-            observations,
-            {
-                "dyspnea",
-                "pulmonary_edema",
-                "heart_failure_state",
-                "orthopnea",
-                "acute_heart_failure",
-            },
-        )
-        if not structure or not function or _evidence_group_id(structure) == _evidence_group_id(function):
+            self.evidence_ontology,
+        ).bind("structural_function_abnormality")
+        audit = relation_binding.get("audit") or {}
+        if audit.get("activation_status") != "activated":
             return {}
-        regurgitation = _best_observation(
-            observations,
-            {
-                "mitral_regurgitation",
-                "echo_mitral_regurgitation",
-                "regurgitant_jet",
-                "flail_leaflet",
-                "leaflet_prolapse",
-                "holosystolic_apical_murmur",
-            },
+        bound = relation_binding.get("bindings") or {}
+        structure = _observation_by_ref(observations, bound["structure_or_credible_sign"].observation_ref)
+        function = _observation_by_ref(observations, bound["function_impairment"].observation_ref)
+        regurgitation_binding = bound.get("regurgitation_specific")
+        regurgitation = (
+            _observation_by_ref(observations, regurgitation_binding.observation_ref)
+            if regurgitation_binding
+            else None
         )
+        if not structure or not function:
+            return {}
         bindings = [_binding_for(structure, "structure_or_credible_sign"), _binding_for(function, "function_impairment")]
         family = "valvular_left_heart"
         pattern_type = "structural_function_abnormality"
         pattern_name = "left_sided_valvular_disease_pattern"
-        relations = [{"type": "structural_function_abnormality", "from": structure.finding, "to": function.finding}]
+        relations = [{"type": "structural_function_abnormality", "from": _observation_ref(structure), "to": _observation_ref(function)}]
         if regurgitation:
             bindings.append(_binding_for(regurgitation, "regurgitation_specific"))
             family = "valvular_left_heart"
             pattern_type = "left_sided_valvular_regurgitation"
             pattern_name = "left_sided_valvular_regurgitation_pattern"
-            relations.append({"type": "anatomical_consistency", "from": regurgitation.finding, "to": structure.finding})
+            relations.append({"type": "anatomical_consistency", "from": _observation_ref(regurgitation), "to": _observation_ref(structure)})
         return {
             "pattern_name": pattern_name,
             "pattern_type": pattern_type,
@@ -844,6 +1210,7 @@ class PatternProposalAdapter:
             "suggested_diseases": [{"name": "D100012", "canonical_id": "D100012"}],
             "missing_evidence_requests": [{"target_evidence": "echo_regurgitant_jet", "importance": "confirmatory"}],
             "generator_source": source_prefix,
+            "relation_activation_audit": audit,
         }
 
     def _proposal_trust_tier(self, payload: Dict[str, Any]) -> str:
@@ -861,15 +1228,28 @@ class PatternProposalAdapter:
         return _TRUST_TIER_QUERY_ONLY
 
     def _dedupe(self, hypotheses: Sequence[ClinicalPatternHypothesis]) -> List[ClinicalPatternHypothesis]:
-        result: List[ClinicalPatternHypothesis] = []
-        seen: set[str] = set()
+        by_key: Dict[str, ClinicalPatternHypothesis] = {}
+        order: List[str] = []
+
+        def priority(item: ClinicalPatternHypothesis) -> int:
+            source = str(item.generator_source or "")
+            if source == "deterministic_relation":
+                return 3
+            if source == "thinking_structured":
+                return 2
+            if source == "diagnosis_llm_draft":
+                return 1
+            return 0
+
         for hypothesis in hypotheses or []:
             key = _proposal_signature(hypothesis)
-            if key in seen:
+            if key not in by_key:
+                order.append(key)
+                by_key[key] = hypothesis
                 continue
-            seen.add(key)
-            result.append(hypothesis)
-        return result
+            if priority(hypothesis) > priority(by_key[key]):
+                by_key[key] = hypothesis
+        return [by_key[key] for key in order if key in by_key]
 
 
 class PatternProposalCompiler(PatternProposalAdapter):
@@ -885,6 +1265,8 @@ class PatternHypothesisVerifier:
         merged = dict(_DEFAULT_CONFIG)
         merged.update(dict(section or {}))
         self.config = merged
+        ref_dir = str((config or {}).get("ref_data_dir") or "data/ref_data")
+        self.evidence_ontology = _load_evidence_ontology(ref_dir)
 
     def parse_hypotheses(
         self,
@@ -946,11 +1328,14 @@ class PatternHypothesisVerifier:
         case_version: int = 0,
         evidence_snapshot_id: str = "",
     ) -> PatternVerificationResult:
-        observation_index, ambiguous_refs = _build_observation_lookup(evidence.observations if evidence else [])
+        observations = list(evidence.observations if evidence else [])
+        observation_index, _ambiguous_refs = _build_observation_lookup(observations)
+        resolver = EvidenceRefResolver(observations, self.evidence_ontology)
         valid_ids: List[str] = []
         invalid_ids: List[str] = []
         source_groups: Dict[str, List[str]] = {}
         source_group_ids: Dict[str, List[str]] = {}
+        ref_resolution_audit: List[Dict[str, Any]] = []
         rejection_reasons: List[str] = []
         contradiction_strength = 0.0
 
@@ -960,12 +1345,21 @@ class PatternHypothesisVerifier:
             rejection_reasons.append("stale_case_version")
 
         for binding in hypothesis.evidence_bindings:
-            evidence_id = binding.evidence_id
-            if evidence_id in ambiguous_refs:
+            evidence_id = str(binding.evidence_id or "").strip()
+            group = _normal_group(binding.relation_slot)
+            resolved = resolver.resolve(evidence_id, expected_slot=group)
+            ref_resolution_audit.append(
+                {
+                    "raw_ref": evidence_id,
+                    "expected_slot": group,
+                    "resolution": resolved.to_dict(),
+                }
+            )
+            if resolved.binding_status == "ambiguous":
                 invalid_ids.append(evidence_id)
                 rejection_reasons.append("ambiguous_evidence_binding")
                 continue
-            observation = observation_index.get(evidence_id)
+            observation = _observation_by_ref(observations, resolved.resolved_observation_ref)
             if not observation:
                 invalid_ids.append(evidence_id)
                 continue
@@ -983,8 +1377,7 @@ class PatternHypothesisVerifier:
                 invalid_ids.append(evidence_id)
                 rejection_reasons.append("polarity_mismatch")
                 continue
-            valid_ids.append(evidence_id)
-            group = _normal_group(binding.relation_slot)
+            valid_ids.append(resolved.resolved_observation_ref)
             if binding.role == "contradiction":
                 group = "exclusion_or_contradiction"
                 contradiction_strength = max(
@@ -1005,19 +1398,69 @@ class PatternHypothesisVerifier:
             rejection_reasons.append("no_valid_source_evidence")
 
         valid_ref_set = set(valid_ids)
+        resolved_relations: List[Dict[str, Any]] = []
         for relation in hypothesis.relations or []:
             relation_type = str(relation.get("type") or "").strip()
             if relation_type and relation_type not in _CONTROLLED_RELATION_TYPES:
                 rejection_reasons.append("unsupported_relation_type")
-            endpoint_refs = [
-                str(relation.get("from") or relation.get("from_evidence_ref") or "").strip(),
-                str(relation.get("to") or relation.get("to_evidence_ref") or "").strip(),
-            ]
-            for ref in endpoint_refs:
-                if ref and ref not in valid_ref_set:
+            resolved_relation = dict(relation)
+            for key in ("from", "to"):
+                raw_ref = str(
+                    relation.get(key)
+                    or relation.get(f"{key}_evidence_ref")
+                    or ""
+                ).strip()
+                if not raw_ref:
+                    continue
+                ref_result = resolver.resolve(raw_ref)
+                ref_resolution_audit.append(
+                    {
+                        "raw_ref": raw_ref,
+                        "expected_slot": "relation_endpoint",
+                        "relation_type": relation_type,
+                        "resolution": ref_result.to_dict(),
+                    }
+                )
+                if ref_result.binding_status == "ambiguous":
+                    rejection_reasons.append("ambiguous_evidence_binding")
+                    continue
+                if ref_result.binding_status != "resolved":
                     rejection_reasons.append("relation_endpoint_unbound")
+                    continue
+                resolved_relation[key] = ref_result.resolved_observation_ref
+                if ref_result.resolved_observation_ref not in valid_ref_set:
+                    rejection_reasons.append("relation_endpoint_unbound")
+            resolved_relations.append(resolved_relation)
 
-        relation_results = _verify_relation_claims(hypothesis, observation_index, valid_ref_set)
+        resolved_hypothesis = ClinicalPatternHypothesis(
+            pattern_hypothesis_id=hypothesis.pattern_hypothesis_id,
+            case_id=hypothesis.case_id,
+            case_version=hypothesis.case_version,
+            evidence_snapshot_id=hypothesis.evidence_snapshot_id,
+            pattern_name=hypothesis.pattern_name,
+            pattern_type=hypothesis.pattern_type,
+            suggested_family=hypothesis.suggested_family,
+            relation_schema_id=hypothesis.relation_schema_id,
+            evidence_bindings=list(hypothesis.evidence_bindings),
+            relations=resolved_relations,
+            suggested_diseases=list(hypothesis.suggested_diseases),
+            missing_evidence_requests=list(hypothesis.missing_evidence_requests),
+            relation_activation_audit=dict(hypothesis.relation_activation_audit),
+            model_confidence=hypothesis.model_confidence,
+            generator_source=hypothesis.generator_source,
+            proposal_trust_tier=hypothesis.proposal_trust_tier,
+            model_id=hypothesis.model_id,
+            prompt_version=hypothesis.prompt_version,
+            created_at=hypothesis.created_at,
+        )
+        relation_activation_audit = dict(hypothesis.relation_activation_audit or {})
+        relation_results = _verify_relation_claims(
+            resolved_hypothesis,
+            observation_index,
+            valid_ref_set,
+            source_groups=source_groups,
+            relation_activation_audit=relation_activation_audit,
+        )
         for relation_result in relation_results:
             status = str(relation_result.get("status") or "")
             if status == "contradicted":
@@ -1029,9 +1472,9 @@ class PatternHypothesisVerifier:
         if not entity_links:
             rejection_reasons.append("entity_unresolved")
 
-        support_strength = _support_strength(source_groups, evidence.observations if evidence else [])
-        relation_complete = _relation_complete(hypothesis, source_groups, source_group_ids, relation_results)
-        critical_complete = _critical_anchor_complete(hypothesis, source_groups, source_group_ids)
+        support_strength = _support_strength(source_groups, observations)
+        relation_complete = _relation_complete(resolved_hypothesis, source_groups, source_group_ids, relation_results)
+        critical_complete = _critical_anchor_complete(resolved_hypothesis, source_groups, source_group_ids, relation_results)
         if not critical_complete:
             rejection_reasons.append("critical_anchor_incomplete")
         if not relation_complete:
@@ -1073,6 +1516,65 @@ class PatternHypothesisVerifier:
                 self.config.get("allow_eligibility_evidence_contribution", False)
             ),
         }
+        slot_binding_audit = {
+            "relation_schema_id": _normalize_schema_id(
+                hypothesis.relation_schema_id or hypothesis.pattern_type
+            ),
+            "required_slots": list(
+                _SCHEMA_REQUIRED_SLOTS.get(
+                    _normalize_schema_id(hypothesis.relation_schema_id or hypothesis.pattern_type),
+                    [],
+                )
+            ),
+            "bound_slots": sorted(
+                key for key, values in source_groups.items() if values and key != "exclusion_or_contradiction"
+            ),
+            "missing_slots": [
+                slot
+                for slot in _SCHEMA_REQUIRED_SLOTS.get(
+                    _normalize_schema_id(hypothesis.relation_schema_id or hypothesis.pattern_type),
+                    [],
+                )
+                if not source_groups.get(slot)
+            ],
+            "ambiguous_slots": [],
+            "supporting_evidence": {
+                slot: list(values)
+                for slot, values in source_groups.items()
+                if values
+            },
+        }
+        if not relation_activation_audit:
+            relation_activation_audit = {
+                "relation_schema_id": slot_binding_audit["relation_schema_id"],
+                "required_slots": list(slot_binding_audit["required_slots"]),
+                "bound_slots": list(slot_binding_audit["bound_slots"]),
+                "missing_slots": list(slot_binding_audit["missing_slots"]),
+                "critical_constraints": list(
+                    _SCHEMA_CRITICAL_CONSTRAINTS.get(slot_binding_audit["relation_schema_id"], [])
+                ),
+                "constraint_results": [
+                    {
+                        "constraint_type": item.get("type"),
+                        "from_observation_ref": item.get("from"),
+                        "to_observation_ref": item.get("to"),
+                        "status": "satisfied" if item.get("status") == "verified" else item.get("status"),
+                        "reason": item.get("reason", ""),
+                    }
+                    for item in relation_results
+                ],
+                "activation_status": "activated" if relation_complete and critical_complete else "partial",
+                "activation_score": round(support_strength, 4),
+                "rejection_reasons": [
+                    reason
+                    for reason in {
+                        *[f"missing_slot:{slot}" for slot in slot_binding_audit["missing_slots"]],
+                        *[str(item.get("reason") or "") for item in relation_results if item.get("reason")],
+                    }
+                    if reason
+                ],
+            }
+        specificity = "entity" if source_groups.get("regurgitation_specific") else "family"
 
         status = STATUS_VERIFIED
         hard_rejections = {
@@ -1115,7 +1617,12 @@ class PatternHypothesisVerifier:
             verified_at=_utc_now(),
             source_groups=source_groups,
             missing_evidence_requests=list(hypothesis.missing_evidence_requests),
-            hypothesis=hypothesis.to_dict(),
+            hypothesis=resolved_hypothesis.to_dict(),
+            ref_resolution_audit=ref_resolution_audit,
+            slot_binding_audit=slot_binding_audit,
+            relation_activation_audit=relation_activation_audit,
+            admission_level="entity_specific" if specificity == "entity" else "family_expansion",
+            verified_specificity=specificity,
         )
 
     def signals_from_results(
@@ -1169,6 +1676,8 @@ class PatternHypothesisVerifier:
                         canonical_name=link.canonical_name,
                         submission_name=link.submission_name,
                         raw_name=link.raw_name,
+                        admission_level=result.admission_level,
+                        verified_specificity=result.verified_specificity,
                     )
                 )
         return signals
@@ -1431,7 +1940,7 @@ def _evidence_group_id(item: Observation) -> str:
 
 def _binding_for(item: Observation, slot: str) -> Dict[str, Any]:
     return {
-        "evidence_id": item.finding,
+        "evidence_id": _observation_ref(item),
         "role": "support",
         "expected_polarity": item.polarity or "positive",
         "relation_slot": slot,
@@ -1481,6 +1990,7 @@ def _lineage_rejection_reason(item: Observation) -> str:
 
 def _normal_group(value: Any) -> str:
     text = str(value or "support").strip() or "support"
+    text = _ROLE_ALIASES.get(text, text)
     return text if text in _RELATION_SLOTS else "support"
 
 
@@ -1505,7 +2015,7 @@ def _support_strength(source_groups: Dict[str, List[str]], observations: Sequenc
         "organ_manifestation": 0.18,
         "imaging_or_objective_finding": 0.24,
         "structure_or_credible_sign": 0.32,
-        "function_impairment": 0.28,
+        "function_impairment": 0.40,
         "regurgitation_specific": 0.24,
         "support": 0.14,
         "context": 0.06,
@@ -1533,13 +2043,19 @@ def _relation_complete(
     if any(item.get("status") == "contradicted" for item in relation_results or []):
         return False
     schema = str(hypothesis.relation_schema_id or hypothesis.pattern_type or "").lower()
+    verified_relation_types = {
+        str(item.get("type") or "")
+        for item in relation_results or []
+        if item.get("status") == "verified"
+    }
     if schema == "exposure_temporal_organ_injury":
         return bool(
             source_groups.get("exposure")
-            and source_groups.get("temporal_relation")
             and source_groups.get("organ_manifestation")
             and source_groups.get("imaging_or_objective_finding")
-            and _independent_group_count(source_group_ids) >= 4
+            and "temporal_after" in verified_relation_types
+            and "anatomical_consistency" in verified_relation_types
+            and _independent_group_count(source_group_ids) >= 3
         )
     if schema in {"structural_function_abnormality", "left_sided_valvular_disease"}:
         return bool(
@@ -1556,11 +2072,6 @@ def _relation_complete(
         )
     if source_groups.get("temporal_relation"):
         return True
-    verified_relation_types = {
-        str(item.get("type") or "")
-        for item in relation_results or []
-        if item.get("status") == "verified"
-    }
     if verified_relation_types & {"anatomical_consistency", "vascular_shunt_pattern"}:
         return _independent_group_count(source_group_ids) >= 2
     for relation in hypothesis.relations or []:
@@ -1575,21 +2086,38 @@ def _critical_anchor_complete(
     hypothesis: ClinicalPatternHypothesis,
     source_groups: Dict[str, List[str]],
     source_group_ids: Dict[str, List[str]],
+    relation_results: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> bool:
     text = f"{hypothesis.pattern_name} {hypothesis.pattern_type} {hypothesis.relation_schema_id} {hypothesis.suggested_family}".lower()
     groups = {key for key, values in source_groups.items() if values}
     schema = str(hypothesis.relation_schema_id or hypothesis.pattern_type or "").lower()
+    verified_relation_types = {
+        str(item.get("type") or "")
+        for item in relation_results or []
+        if item.get("status") == "verified"
+    }
     if schema == "exposure_temporal_organ_injury" or any(token in text for token in _RADIATION_PATTERN_HINTS):
         exposure_findings = set(source_groups.get("exposure") or [])
-        temporal_findings = set(source_groups.get("temporal_relation") or [])
         objective_findings = set(source_groups.get("imaging_or_objective_finding") or [])
         manifestation_findings = set(source_groups.get("organ_manifestation") or [])
         return (
             "thoracic_radiotherapy" in exposure_findings
-            and "post_radiotherapy_time_window" in temporal_findings
-            and bool(objective_findings & {"ground_glass_opacity", "pulmonary_inflammatory_change"})
+            and "temporal_after" in verified_relation_types
+            and bool(
+                objective_findings
+                & {
+                    "ground_glass_opacity",
+                    "pulmonary_inflammatory_change",
+                    "pulmonary_infiltrate",
+                    "pneumonia_infiltrate",
+                    "lung_opacity",
+                    "pulmonary_consolidation",
+                    "interstitial_opacity",
+                    "atelectasis",
+                }
+            )
             and bool(manifestation_findings & {"dyspnea", "cough", "hypoxemia"})
-            and _independent_group_count(source_group_ids) >= 4
+            and _independent_group_count(source_group_ids) >= 3
         )
     if schema in {"structural_function_abnormality", "left_sided_valvular_disease"}:
         return (
@@ -1624,6 +2152,9 @@ def _verify_relation_claims(
     hypothesis: ClinicalPatternHypothesis,
     observation_index: Dict[str, Observation],
     valid_refs: set[str],
+    *,
+    source_groups: Optional[Dict[str, List[str]]] = None,
+    relation_activation_audit: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for relation in hypothesis.relations or []:
@@ -1641,11 +2172,18 @@ def _verify_relation_claims(
             status = "unresolved"
             reason = "relation_endpoint_unbound"
         elif relation_type == "temporal_after":
-            if not _temporal_after_verified(left, right):
+            if not (
+                _temporal_after_verified(left, right)
+                or bool((source_groups or {}).get("temporal_relation"))
+                or _audit_constraint_satisfied(relation_activation_audit, "temporal_after")
+            ):
                 status = "unresolved"
                 reason = "temporal_relation_unresolved"
         elif relation_type == "anatomical_consistency":
-            if not _anatomical_consistency_verified(left, right):
+            if not (
+                _anatomical_consistency_verified(left, right)
+                or _audit_constraint_satisfied(relation_activation_audit, "anatomical_consistency")
+            ):
                 status = "unresolved"
                 reason = "anatomical_relation_unresolved"
         elif relation_type == "structural_function_abnormality":
@@ -1668,6 +2206,18 @@ def _verify_relation_claims(
     return results
 
 
+def _audit_constraint_satisfied(audit: Optional[Dict[str, Any]], constraint_type: str) -> bool:
+    if not isinstance(audit, dict):
+        return False
+    for item in audit.get("constraint_results") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("constraint_type") or item.get("type") or "")
+        if name == constraint_type and str(item.get("status") or "") in {"satisfied", "verified"}:
+            return True
+    return False
+
+
 def _temporal_after_verified(left: Optional[Observation], right: Optional[Observation]) -> bool:
     if not left or not right:
         return False
@@ -1675,9 +2225,9 @@ def _temporal_after_verified(left: Optional[Observation], right: Optional[Observ
     right_text = f"{right.finding} {right.temporality} {right.raw_text} {right.source_text}".lower()
     if left.finding in {"post_radiotherapy_time_window", "symptom_onset_after_radiotherapy", "radiotherapy_before_symptoms"}:
         return True
-    if "after" in right_text or "post" in right_text or "later" in right_text:
+    if "after" in right_text or "post" in right_text or "later" in right_text or "之后" in right_text or "后" in right_text:
         return True
-    if "ago" in left_text and ("current" in right_text or not right.temporality):
+    if "ago" in left_text or "prior" in left_text or "history" in left_text or "既往" in left_text or "曾" in left_text:
         return True
     return False
 
@@ -1685,9 +2235,9 @@ def _temporal_after_verified(left: Optional[Observation], right: Optional[Observ
 def _anatomical_consistency_verified(left: Optional[Observation], right: Optional[Observation]) -> bool:
     if not left or not right:
         return False
-    merged = f"{left.finding} {right.finding} {left.anatomy} {right.anatomy}".lower()
-    pulmonary_markers = ("thoracic", "chest", "lung", "pulmonary", "ground_glass", "肺")
-    cardiac_markers = ("cardiac", "heart", "mitral", "left_heart", "valvular", "心")
+    merged = f"{left.finding} {right.finding} {left.anatomy} {right.anatomy} {left.source_text} {right.source_text}".lower()
+    pulmonary_markers = ("thoracic", "chest", "lung", "pulmonary", "ground_glass")
+    cardiac_markers = ("cardiac", "heart", "mitral", "left_heart", "valvular")
     if any(token in merged for token in pulmonary_markers):
         return True
     if any(token in merged for token in cardiac_markers):
@@ -1776,6 +2326,242 @@ def _load_relation_registry(ref_dir: str) -> Dict[str, Any]:
     }
 
 
+def _load_evidence_ontology(ref_dir: str) -> Dict[str, Any]:
+    path = os.path.join(ref_dir, "evidence_ontology.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    concepts = payload.get("concepts") if isinstance(payload.get("concepts"), dict) else payload
+    return dict(concepts or {})
+
+
+def _normalize_schema_id(value: Any) -> str:
+    text = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if text == "left_sided_valvular_disease":
+        return "structural_function_abnormality"
+    return text
+
+
+def _observation_summary(item: Observation) -> Dict[str, Any]:
+    return {
+        "observation_ref": _observation_ref(item),
+        "canonical_concept": item.finding,
+        "polarity": item.polarity or "positive",
+        "source": item.source or "",
+        "evidence_group_id": _evidence_group_id(item),
+        "field_path": item.field_path or "",
+    }
+
+
+def _observation_by_ref(observations: Sequence[Observation], ref: Any) -> Optional[Observation]:
+    text = str(ref or "").strip()
+    if not text:
+        return None
+    for item in observations or []:
+        if _observation_ref(item) == text:
+            return item
+    return None
+
+
+def _ontology_concept_for_finding(finding: str, ontology: Dict[str, Any]) -> str:
+    key = _normalize_token(finding)
+    for concept, spec in (ontology or {}).items():
+        if key == _normalize_token(concept):
+            return concept
+        aliases = {_normalize_token(item) for item in (spec.get("aliases") or []) if str(item)}
+        children = {_normalize_token(item) for item in (spec.get("children") or []) if str(item)}
+        if key in aliases or key in children:
+            return concept
+    return ""
+
+
+def _ontology_role_hints(finding: str, ontology: Dict[str, Any]) -> List[str]:
+    concept = _ontology_concept_for_finding(finding, ontology)
+    if not concept:
+        return []
+    return [
+        _ROLE_ALIASES.get(str(item or "").strip(), str(item or "").strip())
+        for item in (ontology.get(concept, {}) or {}).get("role_hints", []) or []
+        if str(item or "").strip()
+    ]
+
+
+def _role_candidates_for_observation(
+    schema: str,
+    item: Observation,
+    ontology: Dict[str, Any],
+) -> List[Tuple[str, str, float]]:
+    finding = _normalize_token(item.finding)
+    merged = f"{item.finding} {item.raw_text} {item.source_text} {item.anatomy}".lower()
+    hints = set(_ontology_role_hints(item.finding, ontology))
+    result: List[Tuple[str, str, float]] = []
+
+    def add(slot: str, rule: str, confidence: float) -> None:
+        normalized = _ROLE_ALIASES.get(slot, slot)
+        result.append((normalized, rule, confidence))
+
+    if schema == "exposure_temporal_organ_injury":
+        if finding == "thoracic_radiotherapy" or "exposure" in hints:
+            add("exposure", "canonical_or_ontology_exposure", 0.96)
+        if finding in {"dyspnea", "cough", "hypoxemia", "wheeze", "orthopnea"} or "organ_manifestation" in hints:
+            add("organ_manifestation", "respiratory_manifestation", 0.9)
+        if (
+            finding in {
+                "ground_glass_opacity",
+                "pulmonary_inflammatory_change",
+                "pulmonary_infiltrate",
+                "pneumonia_infiltrate",
+                "lung_opacity",
+                "pulmonary_consolidation",
+                "interstitial_opacity",
+                "atelectasis",
+            }
+            or "imaging_or_objective_finding" in hints
+        ):
+            add("imaging_or_objective_finding", "pulmonary_objective_abnormality", 0.92)
+        return result
+
+    if schema in {
+        "structural_function_abnormality",
+        "left_sided_valvular_regurgitation",
+    }:
+        if (
+            finding in {
+                "mitral_valve_prolapse",
+                "cardiac_murmur",
+                "left_heart_enlargement",
+                "valvular_structural_abnormality",
+                "holosystolic_apical_murmur",
+                "flail_leaflet",
+                "leaflet_prolapse",
+            }
+            or "structure_or_credible_sign" in hints
+        ):
+            add("structure_or_credible_sign", "left_valvular_structural_or_sign", 0.92)
+        if (
+            finding in {
+                "dyspnea",
+                "pulmonary_edema",
+                "heart_failure_state",
+                "orthopnea",
+                "acute_heart_failure",
+                "pink_frothy_sputum",
+            }
+            or "function_impairment" in hints
+            or "pink frothy" in merged
+        ):
+            add("function_impairment", "left_heart_functional_consequence", 0.9)
+        if finding in {
+            "mitral_regurgitation",
+            "echo_mitral_regurgitation",
+            "regurgitant_jet",
+            "flail_leaflet",
+            "leaflet_prolapse",
+            "holosystolic_apical_murmur",
+        }:
+            add("regurgitation_specific", "regurgitation_specific_concept", 0.95)
+        return result
+
+    return result
+
+
+def _evaluate_constraints(
+    schema: str,
+    bound_slots: Dict[str, EvidenceRoleBinding],
+    observations: Sequence[Observation],
+) -> List[RelationConstraintResult]:
+    result: List[RelationConstraintResult] = []
+    if schema == "exposure_temporal_organ_injury":
+        exposure = _observation_by_ref(observations, getattr(bound_slots.get("exposure"), "observation_ref", ""))
+        manifestation = _observation_by_ref(
+            observations,
+            getattr(bound_slots.get("organ_manifestation"), "observation_ref", ""),
+        )
+        objective = _observation_by_ref(
+            observations,
+            getattr(bound_slots.get("imaging_or_objective_finding"), "observation_ref", ""),
+        )
+        explicit_temporal = next(
+            (
+                item
+                for item in observations or []
+                if item.polarity == "positive"
+                and item.finding
+                in {
+                    "post_radiotherapy_time_window",
+                    "symptom_onset_after_radiotherapy",
+                    "radiotherapy_before_symptoms",
+                }
+                and not _lineage_rejection_reason(item)
+            ),
+            None,
+        )
+        temporal_status = (
+            "satisfied"
+            if explicit_temporal or _temporal_after_verified(exposure, manifestation)
+            else "unresolved"
+        )
+        result.append(
+            RelationConstraintResult(
+                constraint_type="temporal_after",
+                from_observation_ref=_observation_ref(exposure) if exposure else "",
+                to_observation_ref=_observation_ref(manifestation) if manifestation else "",
+                status=temporal_status,
+                reason=(
+                    "explicit_temporal_relation"
+                    if explicit_temporal
+                    else ("" if temporal_status == "satisfied" else "temporal_relation_unresolved")
+                ),
+            )
+        )
+        anatomy_status = "satisfied" if _anatomical_consistency_verified(exposure, objective) else "unresolved"
+        result.append(
+            RelationConstraintResult(
+                constraint_type="anatomical_consistency",
+                from_observation_ref=_observation_ref(exposure) if exposure else "",
+                to_observation_ref=_observation_ref(objective) if objective else "",
+                status=anatomy_status,
+                reason="" if anatomy_status == "satisfied" else "anatomical_relation_unresolved",
+            )
+        )
+        return result
+    if schema in {"structural_function_abnormality", "left_sided_valvular_regurgitation"}:
+        structure = _observation_by_ref(
+            observations,
+            getattr(bound_slots.get("structure_or_credible_sign"), "observation_ref", ""),
+        )
+        function = _observation_by_ref(observations, getattr(bound_slots.get("function_impairment"), "observation_ref", ""))
+        satisfied = bool(structure and function and _evidence_group_id(structure) != _evidence_group_id(function))
+        result.append(
+            RelationConstraintResult(
+                constraint_type="structural_function_consistency",
+                from_observation_ref=_observation_ref(structure) if structure else "",
+                to_observation_ref=_observation_ref(function) if function else "",
+                status="satisfied" if satisfied else "unresolved",
+                reason="" if satisfied else "structure_function_not_independent",
+            )
+        )
+        return result
+    return result
+
+
+def _activation_score(
+    required_slots: Sequence[str],
+    bound_slots: Dict[str, EvidenceRoleBinding],
+    constraints: Sequence[RelationConstraintResult],
+) -> float:
+    slot_total = max(1, len(list(required_slots or [])))
+    slot_score = len([slot for slot in required_slots if slot in bound_slots]) / slot_total
+    if not constraints:
+        return slot_score
+    constraint_score = len([item for item in constraints if item.status == "satisfied"]) / max(1, len(constraints))
+    return 0.7 * slot_score + 0.3 * constraint_score
+
+
 def _empty_source_audit() -> Dict[str, Dict[str, Any]]:
     return {
         key: {"input_present": False, "generated": 0, "skip_reason": "not_evaluated"}
@@ -1833,6 +2619,7 @@ def _proposal_signature(hypothesis: ClinicalPatternHypothesis) -> str:
     return repr(
         (
             hypothesis.relation_schema_id or hypothesis.pattern_type,
+            hypothesis.suggested_family,
             tuple(binding_parts),
         )
     )
