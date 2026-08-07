@@ -53,6 +53,7 @@ from .targeted_exam_result_parser import (
     TargetedExamResultParser,
     binding_from_authorization_detail,
 )
+from .pattern_hypothesis import ThinkingSnapshot, evidence_snapshot_hash as pattern_evidence_snapshot_hash
 from .trace import ArtifactType, TraceCollector
 
 logger = logging.getLogger(__name__)
@@ -758,6 +759,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._exam_result_intent_bindings: List[Dict[str, Any]] = []
         self._targeted_exam_result_parses: List[Dict[str, Any]] = []
         self._targeted_exam_observations: List[Observation] = []
+        self._case_id_for_thinking = ""
+        self._thinking_snapshots: List[Dict[str, Any]] = []
 
         # 规划器（延迟初始化，因为需要绑定异步方法）
         self._planner: Optional[Planner] = None
@@ -942,6 +945,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._exam_result_intent_bindings = []
         self._targeted_exam_result_parses = []
         self._targeted_exam_observations = []
+        self._case_id_for_thinking = patient_id
+        self._thinking_snapshots = []
         runner = (
             self._execute_fast_path(patient_id)
             if self.fast_mode
@@ -2118,6 +2123,36 @@ class MyDoctorAgent(BaseDoctorAgent):
                     },
                     refs=[decision_ref] if decision_ref else [],
                 )
+                pattern_hypotheses = decision_payload.get("llm_pattern_hypotheses") or []
+                if pattern_hypotheses:
+                    trace.create_artifact(ArtifactType.PATTERN_HYPOTHESIS, pattern_hypotheses)
+                pattern_verifications = (
+                    list(decision_payload.get("verified_pattern_hypotheses") or [])
+                    + list(decision_payload.get("rejected_pattern_hypotheses") or [])
+                )
+                if pattern_verifications:
+                    trace.create_artifact(
+                        ArtifactType.PATTERN_HYPOTHESIS_VERIFICATION,
+                        pattern_verifications,
+                    )
+                    entity_links = []
+                    for item in pattern_verifications:
+                        if isinstance(item, dict):
+                            entity_links.extend(item.get("entity_links") or [])
+                    if entity_links:
+                        trace.create_artifact(ArtifactType.PATTERN_ENTITY_LINK, entity_links)
+                pattern_signals = decision_payload.get("pattern_recall_signals") or []
+                if pattern_signals:
+                    trace.create_artifact(ArtifactType.PATTERN_RECALL_SIGNAL, pattern_signals)
+                pattern_audit = decision_payload.get("pattern_recall_audit") or {}
+                if pattern_audit:
+                    trace.create_artifact(ArtifactType.PATTERN_RECALL_AUDIT, pattern_audit)
+                pattern_admissions = decision_payload.get("pattern_candidate_admissions") or []
+                if pattern_admissions:
+                    trace.create_artifact(
+                        ArtifactType.PATTERN_CANDIDATE_ADMISSION,
+                        pattern_admissions,
+                    )
 
             judge_payload = (
                 decision_payload.get("judge_decision")
@@ -2967,6 +3002,16 @@ class MyDoctorAgent(BaseDoctorAgent):
             )
             if key in final_result
         }
+        pattern_recall_audit = (
+            decision.get("pattern_recall_audit")
+            if isinstance(decision, dict)
+            else {}
+        ) or {}
+        pattern_pipeline_audit = (
+            pattern_recall_audit.get("pattern_pipeline_audit")
+            if isinstance(pattern_recall_audit, dict)
+            else {}
+        ) or {}
         policy_summary = (
             self.candidate_policy_store.summary()
             if getattr(self, "candidate_policy_store", None) is not None
@@ -3210,6 +3255,8 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "finding_extraction_summary": finding_extraction_summary,
                 "evidence_compiler": evidence_compiler_audit,
                 "case_board_evidence": case_board_audit,
+                "pattern_recall_audit": pattern_recall_audit,
+                "pattern_pipeline_audit": pattern_pipeline_audit,
                 "pairwise_comparison_count": len(pairwise_comparisons),
                 "judge_primary_status": str(judge_payload.get("primary_status") or ""),
                 "needs_discriminating_exams": bool(
@@ -3858,6 +3905,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 diagnosis_result,
                 raw_case_text=raw_case_text,
             )
+            pattern_recall_context = self.diagnosis_engine.build_pattern_recall_context(
+                diagnosis_result,
+                evidence,
+                case_id=patient_id,
+                thinking_snapshots=list(self._thinking_snapshots),
+            )
             evidence_graph = evidence.to_graph()
             retrieval_views = self.diagnosis_engine.build_retrieval_views(evidence)
             llm_resolutions = self.diagnosis_engine.resolve_open_candidates(diagnosis_result)
@@ -3882,7 +3935,12 @@ class MyDoctorAgent(BaseDoctorAgent):
             )
             if final_rag_chunks:
                 rag_chunks = final_rag_chunks
-            decision = self.diagnosis_engine.decide(diagnosis_result, rag_chunks, evidence)
+            decision = self.diagnosis_engine.decide(
+                diagnosis_result,
+                rag_chunks,
+                evidence,
+                pattern_recall_context=pattern_recall_context,
+            )
             critic = await self.diagnosis_critic.review(
                 decision,
                 evidence,
@@ -3947,6 +4005,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                     diagnosis_result,
                     raw_case_text=raw_case_text,
                 )
+                pattern_recall_context = self.diagnosis_engine.build_pattern_recall_context(
+                    diagnosis_result,
+                    evidence,
+                    case_id=patient_id,
+                    thinking_snapshots=list(self._thinking_snapshots),
+                )
                 evidence_graph = evidence.to_graph()
                 rag_chunks = self.memory_manager.search_rag(
                     collected_info=collected_info,
@@ -3957,7 +4021,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                     ),
                     candidate_diseases=decision.final_diagnoses or None,
                 )
-                decision = self.diagnosis_engine.decide(diagnosis_result, rag_chunks, evidence)
+                decision = self.diagnosis_engine.decide(
+                    diagnosis_result,
+                    rag_chunks,
+                    evidence,
+                    pattern_recall_context=pattern_recall_context,
+                )
                 final_critic = await self.diagnosis_critic.review(
                     decision,
                     evidence,
@@ -5839,6 +5908,49 @@ class MyDoctorAgent(BaseDoctorAgent):
 
     # ============ 思考链 ============
 
+    def _record_thinking_snapshot(
+        self,
+        thinking: Dict[str, Any],
+        *,
+        collected_info: Dict[str, Any],
+        exam_results: Dict[str, Any],
+        chat_history: List[Dict[str, str]],
+        phase: str,
+    ) -> None:
+        if not isinstance(thinking, dict) or not self._case_id_for_thinking:
+            return
+        try:
+            raw_case_text = self._raw_case_text_from_state(collected_info, chat_history)
+            evidence = self._normalize_with_exam_recovery(
+                collected_info,
+                exam_results or {},
+                raw_case_text=raw_case_text,
+            )
+            snapshot_id = pattern_evidence_snapshot_hash(evidence)
+        except Exception:
+            snapshot_id = ""
+        try:
+            round_number = len(exam_results or {})
+            snapshot = ThinkingSnapshot.from_thinking(
+                thinking,
+                case_id=self._case_id_for_thinking,
+                patient_id=self._case_id_for_thinking,
+                phase=phase,
+                round_id=f"round_{min(max(round_number, 0), 99):02d}",
+                case_version=round_number,
+                evidence_snapshot_id=snapshot_id,
+            )
+            payload = snapshot.to_dict()
+            existing_ids = {
+                str(item.get("snapshot_id") or "")
+                for item in self._thinking_snapshots
+                if isinstance(item, dict)
+            }
+            if payload.get("snapshot_id") not in existing_ids:
+                self._thinking_snapshots.append(payload)
+        except Exception as exc:
+            logger.warning("[PatternRecall] failed to record thinking snapshot: %s", exc)
+
     async def _think(
         self,
         collected_info: Dict[str, Any],
@@ -5884,6 +5996,18 @@ class MyDoctorAgent(BaseDoctorAgent):
         except Exception as e:
             logger.warning(f"[思考] 知识库召回失败: {e}")
 
+        evidence_summary = ""
+        try:
+            raw_case_text = self._raw_case_text_from_state(collected_info, chat_history)
+            thinking_evidence = self._normalize_with_exam_recovery(
+                collected_info,
+                exam_results or {},
+                raw_case_text=raw_case_text,
+            )
+            evidence_summary = thinking_evidence.render_summary(limit=18)
+        except Exception as exc:
+            logger.warning("[PatternRecall] failed to build thinking evidence catalog: %s", exc)
+
         thinking_prompt = self.prompt.build_thinking_prompt(
             collected_info=collected_info,
             exam_results=exam_results or {},
@@ -5891,6 +6015,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             phase=phase,
             relevant_experience=relevant_experience,
             knowledge_context=knowledge_context,
+            evidence_summary=evidence_summary,
         )
         messages = [
             {"role": "system", "content": thinking_prompt},
@@ -5900,6 +6025,13 @@ class MyDoctorAgent(BaseDoctorAgent):
         result = await self._llm_chat_json(messages, temperature=0.3)
 
         if result and "differential_diagnosis" in result:
+            self._record_thinking_snapshot(
+                result,
+                collected_info=collected_info,
+                exam_results=exam_results or {},
+                chat_history=chat_history,
+                phase=phase,
+            )
             dd_names = [d.get("diagnosis", "?") for d in result.get("differential_diagnosis", [])]
             logger.info(f"[思考] 阶段={phase}, 鉴别诊断: {dd_names}")
             logger.info(f"[思考] 关键未知项: {result.get('key_unknowns', [])}")

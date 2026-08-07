@@ -157,5 +157,56 @@
         }
       ]
     }
-  ]
+  ],
+  "relation_schemas": {
+    "exposure_temporal_organ_injury": {
+      "required_relation_slots": [
+        "exposure",
+        "temporal_relation",
+        "organ_manifestation",
+        "imaging_or_objective_finding"
+      ],
+      "minimum_independent_evidence_groups": 4,
+      "objective_evidence_requirement": true,
+      "maximum_verification_level": "protected_recall",
+      "temporal_constraints": {
+        "allowed_temporal_classes": [
+          "post",
+          "after",
+          "subacute",
+          "ago"
+        ]
+      }
+    },
+    "structural_function_abnormality": {
+      "required_relation_slots": [
+        "structure_or_credible_sign",
+        "function_impairment"
+      ],
+      "minimum_independent_evidence_groups": 2,
+      "objective_evidence_requirement": false,
+      "maximum_verification_level": "recall_boost"
+    },
+    "left_sided_valvular_regurgitation": {
+      "required_relation_slots": [
+        "structure_or_credible_sign",
+        "function_impairment",
+        "regurgitation_specific"
+      ],
+      "minimum_independent_evidence_groups": 3,
+      "objective_evidence_requirement": true,
+      "maximum_verification_level": "protected_recall"
+    }
+  },
+  "family_links": {
+    "exposure_temporal_organ_injury": [
+      "radiation_related_lung_injury"
+    ],
+    "structural_function_abnormality": [
+      "valvular_left_heart"
+    ],
+    "left_sided_valvular_regurgitation": [
+      "valvular_left_heart"
+    ]
+  }
 }

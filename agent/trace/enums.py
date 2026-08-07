@@ -44,6 +44,12 @@ class ArtifactType(str, Enum):
     TOOL_RESULT_NORMALIZED = "tool_result_normalized"
     EVIDENCE_UPDATE = "evidence_update"
     RESOLVER_RESULT = "resolver_result"
+    PATTERN_HYPOTHESIS = "pattern_hypothesis"
+    PATTERN_HYPOTHESIS_VERIFICATION = "pattern_hypothesis_verification"
+    PATTERN_ENTITY_LINK = "pattern_entity_link"
+    PATTERN_RECALL_SIGNAL = "pattern_recall_signal"
+    PATTERN_RECALL_AUDIT = "pattern_recall_audit"
+    PATTERN_CANDIDATE_ADMISSION = "pattern_candidate_admission"
 
 
 EVENT_TYPE_VALUES = {item.value for item in TraceEventType}

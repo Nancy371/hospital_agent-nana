@@ -6796,7 +6796,10 @@
       "aliases": [
         "二尖瓣反流",
         "二尖瓣返流",
-        "MR"
+        "MR",
+        "mitral regurgitation",
+        "mitral_regurgitation",
+        "mitral valve regurgitation"
       ],
       "submittable": true,
       "source_kind": "controlled_extension",
@@ -6805,9 +6808,9 @@
       "icd10": "",
       "department": "心内科",
       "diagnosis_type": "structural",
-      "body_system": "",
-      "disease_family": "",
-      "family": "",
+      "body_system": "cardiovascular",
+      "disease_family": "valvular_left_heart",
+      "family": "valvular_left_heart",
       "exam_bundle": [
         "超声心动图",
         "N末端B型利钠肽原（NT-proBNP）",
@@ -10775,6 +10778,141 @@
         "clinical_pattern_ids": [
           "postinfectious_arthritis_uroocular_pattern"
         ]
+      }
+    },
+    {
+      "entity_id": "D100058",
+      "canonical_name": "放射性肺炎",
+      "submission_name": "放射性肺炎",
+      "aliases": [
+        "放射性肺炎",
+        "放疗性肺炎",
+        "radiation pneumonitis",
+        "radiation_pneumonitis"
+      ],
+      "submittable": true,
+      "source_kind": "controlled_extension",
+      "parent_entity_id": "",
+      "parent_name": "",
+      "icd10": "",
+      "department": "呼吸内科",
+      "diagnosis_type": "disease",
+      "body_system": "pulmonary",
+      "disease_family": "radiation_related_lung_injury",
+      "family": "radiation_related_lung_injury",
+      "exam_bundle": [
+        "胸部增强CT",
+        "胸部CT",
+        "血常规",
+        "C反应蛋白",
+        "病原学检查"
+      ],
+      "discriminating_exam_bundle": [
+        "胸部增强CT",
+        "胸部CT",
+        "血常规",
+        "C反应蛋白",
+        "病原学检查"
+      ],
+      "treatment_bundle": [],
+      "evidence_profile": {
+        "required_groups": [
+          [
+            {
+              "finding": "thoracic_radiotherapy"
+            }
+          ],
+          [
+            {
+              "finding": "post_radiotherapy_time_window"
+            }
+          ],
+          [
+            {
+              "finding": "ground_glass_opacity"
+            },
+            {
+              "finding": "pulmonary_inflammatory_change"
+            }
+          ]
+        ],
+        "supporting_evidence": [
+          {
+            "finding": "thoracic_radiotherapy",
+            "weight": 0.42
+          },
+          {
+            "finding": "post_radiotherapy_time_window",
+            "weight": 0.34
+          },
+          {
+            "finding": "ground_glass_opacity",
+            "weight": 0.34
+          },
+          {
+            "finding": "pulmonary_inflammatory_change",
+            "weight": 0.28
+          },
+          {
+            "finding": "dyspnea",
+            "weight": 0.12
+          },
+          {
+            "finding": "cough",
+            "weight": 0.12
+          }
+        ],
+        "contradictions": [
+          {
+            "finding": "infection_confirmed",
+            "penalty": 0.36
+          }
+        ],
+        "diagnostic_patterns": [
+          {
+            "pattern_id": "radiation_pneumonitis_anchor_pattern",
+            "pattern_type": "anchor_pattern",
+            "logic": "all_of",
+            "required": [
+              "thoracic_radiotherapy",
+              "post_radiotherapy_time_window",
+              {
+                "any_of": [
+                  "ground_glass_opacity",
+                  "pulmonary_inflammatory_change"
+                ]
+              }
+            ],
+            "not_any_of": [
+              "infection_confirmed"
+            ],
+            "requires_objective_source": true,
+            "effect": {
+              "eligibility": "PrimaryEligible"
+            }
+          }
+        ],
+        "eligibility_anchor_policy": {
+          "mode": "any_of",
+          "accepted_anchors": [
+            "required_evidence_group",
+            "diagnostic_pattern",
+            "direct_diagnostic_evidence"
+          ],
+          "no_anchor_disposition": "DifferentialOnly",
+          "atypical_anchor_disposition": "DeferredNeedsConfirmatoryEvidence"
+        }
+      },
+      "metadata": {
+        "sources": [
+          "manual_controlled_entity"
+        ],
+        "weak_query_aliases": [
+          "放疗后肺炎",
+          "放射性肺损伤",
+          "radiation-induced lung injury"
+        ],
+        "llm_pattern_hypothesis_enabled": true
       }
     }
   ]

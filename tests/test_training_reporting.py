@@ -216,6 +216,20 @@ class TrainingReportingTests(unittest.TestCase):
                     "residual_core_evidence_count": 0,
                     "high_value_gap_candidates": [],
                 },
+                "pattern_recall_audit": {
+                    "compiler_enabled": True,
+                    "pattern_pipeline_audit": {
+                        "proposal_count_by_source": {
+                            "deterministic_relation": 1,
+                        },
+                        "candidate_admissions": [
+                            {
+                                "entity_id": "D100058",
+                                "recall_mode": "recall_boost",
+                            }
+                        ],
+                    },
+                },
             },
             "evidence": {
                 "observations": [
@@ -294,6 +308,14 @@ class TrainingReportingTests(unittest.TestCase):
             result["audit"]["exam_authorization_mode"],
             "strict_diagnosis_driven",
         )
+        self.assertTrue(result["audit"]["pattern_recall_audit"]["compiler_enabled"])
+        self.assertEqual(
+            result["audit"]["pattern_pipeline_audit"]["proposal_count_by_source"][
+                "deterministic_relation"
+            ],
+            1,
+        )
+        self.assertNotIn("pattern_pipeline_audit", result["final_result"])
         self.assertIn(
             "low_magnesium",
             result["audit"]["finding_extraction_summary"]["diagnostic_findings"],

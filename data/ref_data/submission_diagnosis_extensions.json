@@ -56,5 +56,7 @@
     {"name": "尖锐湿疣", "aliases": ["生殖器疣", "肛生殖器疣", "HPV疣", "condyloma acuminatum", "genital warts"], "parent_catalog_name": null, "specificity": 0.92, "sources": ["stage2_seed53"]},
     {"name": "滴虫性阴道炎", "aliases": ["阴道毛滴虫感染", "trichomoniasis", "trichomonas vaginitis"], "parent_catalog_name": null, "specificity": 0.9, "sources": ["stage2_seed53"]},
     {"name": "脐尿管囊肿", "aliases": ["脐尿管残余囊肿", "urachal cyst", "urachal remnant cyst"], "parent_catalog_name": null, "specificity": 0.93, "sources": ["stage2_seed53"]}
+    ,
+    {"name": "放射性肺炎", "aliases": ["放疗性肺炎", "radiation pneumonitis", "radiation_pneumonitis"], "parent_catalog_name": "肺炎", "specificity": 0.94, "sources": ["manual_controlled_entity"]}
   ]
 }

@@ -9,6 +9,11 @@ from .clinical_evidence import EvidenceBundle, EvidenceGraph, Observation
 from .clinical_pattern_compiler import ClinicalPattern, ClinicalPatternCompiler
 from .disease_retrieval import DiseaseRetriever
 from .mechanism_reasoner import MechanismHypothesis, MechanismReasoner
+from .pattern_hypothesis import (
+    RECALL_BOOST,
+    RECALL_PROTECTED,
+    PatternRecallSignal,
+)
 
 
 @dataclass
@@ -36,6 +41,10 @@ class CandidatePool:
     open_world_candidates: List[Dict[str, Any]] = field(default_factory=list)
     mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
     clinical_patterns: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_verification_results: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_recall_signals: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_candidate_admissions: List[Dict[str, Any]] = field(default_factory=list)
 
     def add(
         self,
@@ -129,6 +138,10 @@ class CandidatePool:
             "open_world_candidates": list(self.open_world_candidates),
             "mechanism_hypotheses": list(self.mechanism_hypotheses),
             "clinical_patterns": list(self.clinical_patterns),
+            "pattern_hypotheses": list(self.pattern_hypotheses),
+            "pattern_verification_results": list(self.pattern_verification_results),
+            "pattern_recall_signals": list(self.pattern_recall_signals),
+            "pattern_candidate_admissions": list(self.pattern_candidate_admissions),
         }
 
 
@@ -150,21 +163,152 @@ class CandidateGenerator:
         rag_chunks: Optional[Sequence[Dict[str, Any]]] = None,
         memory_hits: Optional[Sequence[Dict[str, Any]]] = None,
         evidence: Optional[EvidenceBundle] = None,
+        pattern_recall_signals: Optional[Sequence[Any]] = None,
+        pattern_recall_context: Optional[Dict[str, Any]] = None,
     ) -> CandidatePool:
         bundle = evidence or _bundle_from_graph(evidence_graph)
         pool = CandidatePool()
+        if pattern_recall_context:
+            pool.pattern_hypotheses = list(pattern_recall_context.get("pattern_hypotheses") or [])
+            pool.pattern_verification_results = list(
+                pattern_recall_context.get("pattern_verification_results") or []
+            )
+            pool.pattern_recall_signals = list(
+                pattern_recall_context.get("pattern_recall_signals") or []
+            )
+        explicit_signals = list(pattern_recall_signals or pool.pattern_recall_signals or [])
         clinical_patterns = self.clinical_pattern_compiler.compile(bundle)
         pool.clinical_patterns = [item.to_dict() for item in clinical_patterns]
         mechanisms = self.mechanism_reasoner.evaluate(bundle)
         pool.mechanism_hypotheses = [item.to_dict() for item in mechanisms]
         self._from_clinical_patterns(pool, clinical_patterns)
         self._from_mechanisms(pool, mechanisms)
+        self._from_pattern_recall_signals(pool, explicit_signals)
         self._from_llm(pool, llm_result or {})
         self._from_rag(pool, rag_chunks or [])
         self._from_memory(pool, memory_hits or [])
         self._from_disease_retriever(pool, bundle)
         self._from_evidence(pool, bundle)
         return pool
+
+    def _from_pattern_recall_signals(
+        self,
+        pool: CandidatePool,
+        signals: Sequence[Any],
+    ) -> None:
+        for raw_signal in signals or []:
+            signal = _coerce_pattern_signal(raw_signal)
+            if not signal:
+                continue
+            metadata = {
+                "pattern_hypothesis_id": signal.pattern_hypothesis_id,
+                "recall_mode": signal.recall_mode,
+                "recall_strength": signal.recall_strength,
+                "protected_pool_slot": signal.protected_pool_slot,
+                "source_evidence_ids": list(signal.source_evidence_ids),
+                "missing_evidence_requests": list(signal.missing_evidence_requests),
+                "judge_evidence_weight": 0.0,
+                "eligibility_evidence_weight": 0.0,
+                "pattern_recall_only": True,
+                "gap_suggestion_only": True,
+                "active_gap_write_permission": "none",
+            }
+            admission = {
+                "pattern_hypothesis_id": signal.pattern_hypothesis_id,
+                "entity_id": signal.entity_id,
+                "canonical_name": signal.canonical_name,
+                "raw_name": signal.raw_name,
+                "recall_mode": signal.recall_mode,
+                "recall_strength": signal.recall_strength,
+                "protected_pool_slot": signal.protected_pool_slot,
+                "source_evidence_ids": list(signal.source_evidence_ids),
+                "admitted_to_controlled_pool": False,
+                "admitted_to_open_world": False,
+                "admission_source": "",
+                "admission_reason": "",
+                "resolver_status": "",
+            }
+            if signal.recall_mode not in {RECALL_BOOST, RECALL_PROTECTED}:
+                pool.add_open_world(
+                    signal.raw_name or signal.canonical_name or signal.entity_id,
+                    "llm_pattern_hypothesis_query",
+                    prior=0.0,
+                    evidence_links=signal.source_evidence_ids,
+                    entity_id=signal.entity_id,
+                    canonical_name=signal.canonical_name,
+                    submission_name=signal.submission_name,
+                    submittable=False,
+                    metadata=metadata,
+                )
+                admission.update(
+                    {
+                        "admitted_to_open_world": True,
+                        "admission_source": "llm_pattern_hypothesis_query",
+                        "admission_reason": "query_expansion_only",
+                        "resolver_status": "not_required_for_query_expansion",
+                    }
+                )
+                pool.pattern_candidate_admissions.append(admission)
+                continue
+            raw_name = signal.raw_name or signal.entity_id or signal.canonical_name
+            resolution = self.resolver.resolve(signal.entity_id or signal.canonical_name or raw_name)
+            admission["resolver_status"] = "resolved" if resolution.canonical_name else "unresolved"
+            prior = min(
+                0.86,
+                max(
+                    0.35,
+                    0.22 + 0.52 * float(signal.recall_strength or 0.0),
+                ),
+            )
+            if signal.protected_pool_slot:
+                prior = max(prior, 0.68)
+            if resolution.canonical_name:
+                pool.add(
+                    raw_name,
+                    resolution.canonical_name,
+                    "llm_pattern_hypothesis",
+                    prior=prior,
+                    evidence_links=signal.source_evidence_ids,
+                    metadata=metadata,
+                    entity_id=getattr(resolution, "entity_id", "") or signal.entity_id,
+                    submission_name=getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                    submittable=bool(getattr(resolution, "submittable", True)),
+                )
+                admission.update(
+                    {
+                        "admitted_to_controlled_pool": True,
+                        "canonical_name": resolution.canonical_name,
+                        "entity_id": getattr(resolution, "entity_id", "") or signal.entity_id,
+                        "submission_name": getattr(resolution, "submission_name", "") or resolution.canonical_name,
+                        "submittable": bool(getattr(resolution, "submittable", True)),
+                        "admission_source": "llm_pattern_hypothesis",
+                        "admission_reason": "verified_pattern_recall_signal",
+                        "prior": prior,
+                    }
+                )
+                pool.pattern_candidate_admissions.append(admission)
+                continue
+            pool.add_open_world(
+                raw_name,
+                "llm_pattern_hypothesis_unresolved",
+                prior=0.0,
+                evidence_links=signal.source_evidence_ids,
+                entity_id=signal.entity_id,
+                canonical_name=signal.canonical_name,
+                submission_name=signal.submission_name,
+                submittable=False,
+                metadata=dict(metadata, submittable=False),
+            )
+            admission.update(
+                {
+                    "admitted_to_open_world": True,
+                    "admission_source": "llm_pattern_hypothesis_unresolved",
+                    "admission_reason": "resolver_unresolved_after_signal",
+                    "submittable": False,
+                    "prior": 0.0,
+                }
+            )
+            pool.pattern_candidate_admissions.append(admission)
 
     def _from_clinical_patterns(
         self,
@@ -512,6 +656,40 @@ def _bundle_from_graph(graph: Optional[EvidenceGraph]) -> EvidenceBundle:
             except (TypeError, ValueError):
                 continue
     return EvidenceBundle(observations)
+
+
+def _coerce_pattern_signal(value: Any) -> Optional[PatternRecallSignal]:
+    if isinstance(value, PatternRecallSignal):
+        return value
+    if not isinstance(value, dict):
+        return None
+    try:
+        return PatternRecallSignal(
+            pattern_hypothesis_id=str(value.get("pattern_hypothesis_id") or ""),
+            entity_id=str(value.get("entity_id") or ""),
+            entity_link_confidence=float(value.get("entity_link_confidence") or 0.0),
+            recall_mode=str(value.get("recall_mode") or ""),
+            recall_strength=float(value.get("recall_strength") or 0.0),
+            protected_pool_slot=bool(value.get("protected_pool_slot", False)),
+            source_evidence_ids=[
+                str(item)
+                for item in value.get("source_evidence_ids") or []
+                if str(item)
+            ],
+            missing_evidence_requests=[
+                dict(item) if isinstance(item, dict) else {"target_evidence": str(item)}
+                for item in value.get("missing_evidence_requests") or []
+                if item
+            ],
+            canonical_name=str(value.get("canonical_name") or ""),
+            submission_name=str(value.get("submission_name") or ""),
+            raw_name=str(value.get("raw_name") or ""),
+            judge_evidence_weight=0.0,
+            eligibility_evidence_weight=0.0,
+            gap_suggestion_only=True,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _matching_observations(spec: Dict[str, Any], observations: Sequence[Observation]) -> List[Observation]:

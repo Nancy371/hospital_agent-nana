@@ -129,6 +129,21 @@ diagnosis:
   name_match_threshold: 0.84
   name_match_margin: 0.08
   max_open_world_candidates: 10
+  llm_pattern_hypothesis:
+    enabled: true
+    use_existing_diagnosis_output: true
+    use_thinking_snapshots: true
+    allow_extra_llm_call: false
+    max_hypotheses: 3
+    max_recall_candidates: 3
+    max_protected_candidates: 2
+    active_min_strength: 0.55
+    protection_min_strength: 0.75
+    min_entity_link_confidence: 0.85
+    max_expansion_rounds: 1
+    allow_direct_gap_creation: false
+    allow_judge_score_contribution: false
+    allow_eligibility_evidence_contribution: false
   trusted_threshold: 0.65
   differential_threshold: 0.35
   required_group_policy: gap_only

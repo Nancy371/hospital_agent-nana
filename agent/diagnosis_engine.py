@@ -29,6 +29,13 @@ from .diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter
 from .diagnosis_resolver import DiagnosisResolution, OpenWorldDiagnosisResolver
 from .evidence_conflicts import EvidenceConflictArbiter
 from .mechanism_reasoner import MechanismReasoner
+from .pattern_hypothesis import (
+    build_pattern_recall_context,
+    coerce_pattern_recall_context,
+    evidence_snapshot_hash as pattern_evidence_snapshot_hash,
+    PatternProposalAdapter,
+    PatternHypothesisVerifier,
+)
 from .root_cause_arbitration import RootCauseArbiter
 
 
@@ -301,6 +308,18 @@ class DiagnosisDecision:
     mechanism_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
     clinical_patterns: List[Dict[str, Any]] = field(default_factory=list)
     clinical_pattern_matches: List[Dict[str, Any]] = field(default_factory=list)
+    llm_pattern_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    verified_pattern_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    rejected_pattern_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_recall_signals: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_recall_audit: Dict[str, Any] = field(default_factory=dict)
+    pattern_candidate_admissions: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_driven_candidate_recall: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_protected_candidate_recall: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_gap_suggestions: List[Dict[str, Any]] = field(default_factory=list)
+    pattern_generated_active_gaps: int = 0
+    unverified_pattern_leakage_count: int = 0
+    pattern_expansion_round_count: int = 0
     derived_pattern_assertions: List[Dict[str, Any]] = field(default_factory=list)
     bridge_validation_results: List[Dict[str, Any]] = field(default_factory=list)
     bridge_protection_decisions: List[Dict[str, Any]] = field(default_factory=list)
@@ -354,6 +373,18 @@ class DiagnosisDecision:
             "mechanism_hypotheses": list(self.mechanism_hypotheses),
             "clinical_patterns": list(self.clinical_patterns),
             "clinical_pattern_matches": list(self.clinical_pattern_matches),
+            "llm_pattern_hypotheses": list(self.llm_pattern_hypotheses),
+            "verified_pattern_hypotheses": list(self.verified_pattern_hypotheses),
+            "rejected_pattern_hypotheses": list(self.rejected_pattern_hypotheses),
+            "pattern_recall_signals": list(self.pattern_recall_signals),
+            "pattern_recall_audit": dict(self.pattern_recall_audit),
+            "pattern_candidate_admissions": list(self.pattern_candidate_admissions),
+            "pattern_driven_candidate_recall": list(self.pattern_driven_candidate_recall),
+            "pattern_protected_candidate_recall": list(self.pattern_protected_candidate_recall),
+            "pattern_gap_suggestions": list(self.pattern_gap_suggestions),
+            "pattern_generated_active_gaps": int(self.pattern_generated_active_gaps or 0),
+            "unverified_pattern_leakage_count": int(self.unverified_pattern_leakage_count or 0),
+            "pattern_expansion_round_count": int(self.pattern_expansion_round_count or 0),
             "derived_pattern_assertions": list(self.derived_pattern_assertions),
             "bridge_validation_results": list(self.bridge_validation_results),
             "bridge_protection_decisions": list(self.bridge_protection_decisions),
@@ -1157,6 +1188,8 @@ class DiagnosisDecisionEngine:
         self.candidate_generator = CandidateGenerator(self.knowledge, self.resolver)
         self.mechanism_reasoner = MechanismReasoner()
         self.clinical_pattern_compiler = ClinicalPatternCompiler(ref_dir)
+        self.pattern_hypothesis_verifier = PatternHypothesisVerifier(self.knowledge, config=config)
+        self.pattern_proposal_adapter = PatternProposalAdapter(config)
         self.bridge_pattern_validator = BridgePatternValidator()
         self.judge = DiagnosisJudge(config=config, knowledge=self.knowledge)
         self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
@@ -1201,21 +1234,37 @@ class DiagnosisDecisionEngine:
         llm_result: Optional[Dict[str, Any]],
         rag_chunks: Optional[Sequence[Dict[str, Any]]],
         evidence: EvidenceBundle,
+        pattern_recall_context: Optional[Dict[str, Any]] = None,
     ) -> DiagnosisDecision:
+        if pattern_recall_context is None:
+            pattern_recall_context = self.build_pattern_recall_context(
+                llm_result or {},
+                evidence,
+                case_id=str((llm_result or {}).get("patient_id") or (llm_result or {}).get("case_id") or ""),
+            )
+        pattern_recall_context = coerce_pattern_recall_context(pattern_recall_context)
         candidate_pool = self.candidate_generator.generate(
             evidence_graph=evidence.to_graph(),
             llm_result=llm_result or {},
             rag_chunks=rag_chunks or [],
             evidence=evidence,
+            pattern_recall_context=pattern_recall_context,
         )
-        return self.rank(candidate_pool, evidence, llm_result=llm_result or {})
+        return self.rank(
+            candidate_pool,
+            evidence,
+            llm_result=llm_result or {},
+            pattern_recall_context=pattern_recall_context,
+        )
 
     def rank(
         self,
         candidate_pool: CandidatePool,
         evidence: EvidenceBundle,
         llm_result: Optional[Dict[str, Any]] = None,
+        pattern_recall_context: Optional[Dict[str, Any]] = None,
     ) -> DiagnosisDecision:
+        pattern_recall_context = coerce_pattern_recall_context(pattern_recall_context)
         case_id = str((llm_result or {}).get("patient_id") or (llm_result or {}).get("case_id") or "")
         case_board, evidence = self.consultation_pipeline.run(
             evidence,
@@ -1230,6 +1279,31 @@ class DiagnosisDecisionEngine:
         sources_by_name = candidate_pool.sources_by_name()
         mechanism_hypotheses = list(candidate_pool.mechanism_hypotheses)
         clinical_patterns = list(candidate_pool.clinical_patterns)
+        pattern_hypotheses = list(
+            pattern_recall_context.get("pattern_hypotheses")
+            or candidate_pool.pattern_hypotheses
+            or []
+        )
+        pattern_verification_results = list(
+            pattern_recall_context.get("pattern_verification_results")
+            or candidate_pool.pattern_verification_results
+            or []
+        )
+        pattern_recall_signals = list(
+            pattern_recall_context.get("pattern_recall_signals")
+            or candidate_pool.pattern_recall_signals
+            or []
+        )
+        verified_pattern_hypotheses = [
+            item
+            for item in pattern_verification_results
+            if isinstance(item, dict) and item.get("verification_status") == "verified"
+        ]
+        rejected_pattern_hypotheses = [
+            item
+            for item in pattern_verification_results
+            if isinstance(item, dict) and item.get("verification_status") == "rejected"
+        ]
         open_world_candidates = self._annotate_open_world_candidates(
             list(candidate_pool.open_world_candidates),
             mechanism_hypotheses,
@@ -1336,6 +1410,32 @@ class DiagnosisDecisionEngine:
             open_world_candidates=open_world_candidates,
             mechanism_hypotheses=mechanism_hypotheses,
             clinical_patterns=clinical_patterns,
+            llm_pattern_hypotheses=pattern_hypotheses,
+            verified_pattern_hypotheses=verified_pattern_hypotheses,
+            rejected_pattern_hypotheses=rejected_pattern_hypotheses,
+            pattern_recall_signals=pattern_recall_signals,
+            pattern_recall_audit=dict(pattern_recall_context.get("pattern_recall_audit") or {}),
+            pattern_candidate_admissions=list(
+                getattr(candidate_pool, "pattern_candidate_admissions", []) or []
+            ),
+            pattern_driven_candidate_recall=list(
+                pattern_recall_context.get("pattern_driven_candidate_recall") or []
+            ),
+            pattern_protected_candidate_recall=list(
+                pattern_recall_context.get("pattern_protected_candidate_recall") or []
+            ),
+            pattern_gap_suggestions=list(
+                pattern_recall_context.get("pattern_gap_suggestions") or []
+            ),
+            pattern_generated_active_gaps=int(
+                pattern_recall_context.get("pattern_generated_active_gaps") or 0
+            ),
+            unverified_pattern_leakage_count=int(
+                pattern_recall_context.get("unverified_pattern_leakage_count") or 0
+            ),
+            pattern_expansion_round_count=int(
+                pattern_recall_context.get("pattern_expansion_round_count") or 0
+            ),
             clinical_pattern_matches=self._candidate_bridge_records(
                 scores,
                 "clinical_pattern_matches",
@@ -2462,6 +2562,22 @@ class DiagnosisDecisionEngine:
         fixed["_unresolved_diagnosis_candidates"] = list(decision.unresolved_candidates)
         fixed["_open_world_diagnosis_candidates"] = list(decision.open_world_candidates)
         fixed["_mechanism_hypotheses"] = list(decision.mechanism_hypotheses)
+        fixed["_llm_pattern_hypotheses"] = list(decision.llm_pattern_hypotheses)
+        fixed["_verified_pattern_hypotheses"] = list(decision.verified_pattern_hypotheses)
+        fixed["_rejected_pattern_hypotheses"] = list(decision.rejected_pattern_hypotheses)
+        fixed["_pattern_recall_signals"] = list(decision.pattern_recall_signals)
+        fixed["_pattern_driven_candidate_recall"] = list(decision.pattern_driven_candidate_recall)
+        fixed["_pattern_protected_candidate_recall"] = list(decision.pattern_protected_candidate_recall)
+        fixed["_pattern_gap_suggestions"] = list(decision.pattern_gap_suggestions)
+        fixed["_unverified_pattern_leakage_count"] = int(
+            decision.unverified_pattern_leakage_count or 0
+        )
+        fixed["_pattern_generated_active_gaps"] = int(
+            decision.pattern_generated_active_gaps or 0
+        )
+        fixed["_pattern_expansion_round_count"] = int(
+            decision.pattern_expansion_round_count or 0
+        )
         fixed["_retrieval_views"] = list(decision.retrieval_views)
         fixed["_evidence_items"] = [item.to_dict() for item in evidence.observations]
         reasoning = str(fixed.get("reasoning") or "").strip()
@@ -2611,6 +2727,30 @@ class DiagnosisDecisionEngine:
 
     def resolve_open_candidates(self, result: Any) -> List[DiagnosisResolution]:
         return self.resolver.resolve_result(result)
+
+    def build_pattern_recall_context(
+        self,
+        llm_result: Any,
+        evidence: EvidenceBundle,
+        *,
+        case_id: str = "",
+        case_version: int = 0,
+        evidence_snapshot_id: str = "",
+        thinking_snapshots: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(llm_result, dict):
+            llm_result = {}
+        return build_pattern_recall_context(
+            self.pattern_hypothesis_verifier,
+            llm_result,
+            evidence,
+            case_id=case_id,
+            case_version=case_version,
+            evidence_snapshot_id=evidence_snapshot_id
+            or pattern_evidence_snapshot_hash(evidence),
+            thinking_snapshots=thinking_snapshots,
+            adapter=self.pattern_proposal_adapter,
+        )
 
     def build_retrieval_views(self, evidence: EvidenceBundle) -> List[Dict[str, Any]]:
         mechanisms = self.mechanism_reasoner.evaluate(evidence)

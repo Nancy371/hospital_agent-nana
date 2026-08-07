@@ -241,6 +241,8 @@ class DoctorPrompt:
 
 {experience_section}
 
+{evidence_summary}
+
 请进行临床推理，同时判断当前信息是否足够做出诊断。
 
 输出格式（JSON）：
@@ -251,7 +253,22 @@ class DoctorPrompt:
     "key_unknowns": ["需要了解的信息1", "需要了解的信息2"],
     "is_sufficient": false,
     "next_action": "下一步行动建议",
-    "action_reasoning": "为什么这个行动最有价值"
+    "action_reasoning": "为什么这个行动最有价值",
+    "clinical_pattern_proposals": [
+        {{
+            "pattern_type": "exposure_temporal_organ_injury",
+            "pattern_name": "optional_relation_pattern_name",
+            "evidence_bindings": [
+                {{"evidence_id": "structured_finding_name", "role": "support", "expected_polarity": "positive", "relation_slot": "exposure"}}
+            ],
+            "relations": [
+                {{"type": "temporal_after", "from_evidence_ref": "exposure_finding", "to_evidence_ref": "manifestation_finding"}}
+            ],
+            "suggested_family": "optional_family_hint",
+            "suggested_diseases": ["specific disease name"],
+            "missing_evidence_requests": []
+        }}
+    ]
 }}
 
 注意：
@@ -262,7 +279,10 @@ class DoctorPrompt:
    - 问诊阶段：主诉明确、现病史完整、既往史/过敏史已了解、症状细节足以鉴别 → true
    - 检查阶段：检查结果已能支持明确诊断、无需补充检查排除鉴别 → true
 5. next_action 应明确说明是为了确认还是排除哪个诊断
-6. 只输出JSON，不要输出其他内容"""
+6. clinical_pattern_proposals 是可选字段，最多 3 个；只能引用上方结构化临床证据中出现的 finding 名称作为 evidence_id。
+7. clinical_pattern_proposals 只提出可追溯的关系型候选召回假设，不代表诊断成立；不得引用 reasoning、疾病名、检查计划或不存在的证据作为 evidence。
+8. 不确定时返回空数组；不要为了填字段编造 Pattern。
+9. 只输出JSON，不要输出其他内容"""
 
     # ============ 诊断 Prompt ============
 
@@ -289,6 +309,13 @@ class DoctorPrompt:
 
 {catalog_section}
 
+Clinical pattern hypothesis instructions:
+- Fill clinical_pattern_hypotheses only when the provided structured findings support a multi-evidence pattern that may recall a missed specific disease.
+- Use only explicit structured finding names as evidence_id values; do not cite reasoning text, candidate names, ordered exam names, or inferred facts.
+- Prefer patterns involving exposure-time-organ injury, post-infectious multi-system syndromes, or mechanism-specific objective findings.
+- A pattern hypothesis is not a diagnosis and is not confirmatory evidence; it only proposes controlled candidate recall for later verification.
+- Return an empty clinical_pattern_hypotheses array when no traceable pattern is present.
+
 请综合分析以上信息，做出诊断并制定治疗方案。
 
 输出格式（JSON）：
@@ -296,6 +323,22 @@ class DoctorPrompt:
     "diagnosis": ["最可能的具体临床疾病名称"],
     "diagnosis_candidates": [
         {{"name": "候选疾病名称", "confidence": 0.0, "supporting_evidence": ["证据"]}}
+    ],
+    "clinical_pattern_hypotheses": [
+        {{
+            "pattern_name": "optional_pattern_name",
+            "pattern_type": "temporal_causal_multievidence",
+            "evidence_bindings": [
+                {{"evidence_id": "structured_finding_name", "role": "support", "expected_polarity": "positive", "relation_slot": "exposure"}}
+            ],
+            "relations": [
+                {{"type": "temporal_after", "from": "exposure_finding", "to": "manifestation_finding"}}
+            ],
+            "suggested_diseases": [
+                {{"name": "specific disease name", "canonical_id": "", "hypothesis_confidence": 0.0}}
+            ],
+            "missing_evidence_requests": []
+        }}
     ],
     "treatment_plan": "治疗方案描述",
     "reasoning": "诊断和治疗依据"
@@ -522,7 +565,6 @@ class DoctorPrompt:
             f"{knowledge_context}\n"
             "=== 知识库参考结束 ===\n"
         )
-
     def build_thinking_prompt(
         self,
         collected_info: Dict[str, Any],
@@ -531,6 +573,7 @@ class DoctorPrompt:
         phase: str,
         relevant_experience: Optional[List[Dict[str, Any]]] = None,
         knowledge_context: str = "",
+        evidence_summary: str = "",
     ) -> str:
         """构建思考链 prompt。
 
@@ -562,6 +605,7 @@ class DoctorPrompt:
             chat_history=history_str,
             phase=phase_desc,
             experience_section=experience_section,
+            evidence_summary=evidence_summary or "【结构化临床证据】暂无。",
         )
 
     def build_initial_inquiry_prompt(
