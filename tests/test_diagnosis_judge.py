@@ -824,6 +824,121 @@ class DiagnosisJudgeTests(unittest.TestCase):
         self.assertEqual(contender_profile["core_case_coverage"], 0.0)
         self.assertEqual(record["recommended_action"], "KEEP_CURRENT_AND_DEFER_CONTENDER")
 
+    def test_primary_eligible_mr_contender_not_filtered_by_incumbent_anchor(self):
+        primary = candidate(
+            "\u7ec8\u672b\u671f\u80be\u75c5",
+            0.78,
+            required=True,
+            diagnosis_type="state",
+            coverage=0.52,
+            residual=0.34,
+            core_coverage=0.50,
+            matched=["renal_failure", "edema"],
+            core_score=0.38,
+        )
+        primary.entity_id = "D_ESRD"
+        primary.body_system = "renal"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        mitral = candidate(
+            MITRAL_REGURGITATION,
+            0.72,
+            required=True,
+            diagnosis_type="structural",
+            specificity=0.90,
+            coverage=0.74,
+            residual=0.18,
+            core_coverage=0.76,
+            matched=[
+                "mitral_regurgitation",
+                "orthopnea",
+                "pulmonary_edema",
+            ],
+            core_score=0.54,
+            diagnostic_score=0.40,
+        )
+        mitral.entity_id = "D100012"
+        mitral.body_system = "cardiovascular"
+        mitral.eligibility_status = "PrimaryEligible"
+        mitral.eligibility_anchor_status = "AnchorSatisfied"
+        mitral.core_matched_evidence = ["orthopnea", "pulmonary_edema"]
+        mitral.diagnostic_matched_evidence = ["mitral_regurgitation"]
+
+        result = self.engine.judge._primary_arbitration(
+            primary,
+            [primary, mitral],
+            [{"left": "\u7ec8\u672b\u671f\u80be\u75c5", "right": MITRAL_REGURGITATION}],
+        )
+
+        self.assertTrue(result["comparisons"])
+        self.assertEqual(
+            result["comparisons"][0]["candidate_b"],
+            MITRAL_REGURGITATION,
+        )
+        audit = next(
+            item
+            for item in result["material_contender_filter"]
+            if item["entity_id"] == "D100012"
+        )
+        self.assertTrue(audit["pairwise_allowed"])
+        self.assertEqual(audit["candidate_anchor_status"], "AnchorSatisfied")
+        self.assertEqual(audit["current_primary_anchor_status"], "AnchorSatisfied")
+        self.assertTrue(audit["required_met"])
+        self.assertTrue(audit["has_core_or_diagnostic_evidence"])
+        self.assertTrue(audit["material_contender"])
+        self.assertEqual(audit["filtered_reason"], "")
+        dispositions = {
+            item["entity_id"]: item for item in result["candidate_disposition_audit"]
+        }
+        self.assertTrue(dispositions["D100012"]["comparison_present"])
+        self.assertNotEqual(
+            result["decision"]["reason_codes"],
+            ["NO_MATERIAL_ARBITRATION_CONTENDER"],
+        )
+
+    def test_topk_primary_eligible_candidate_without_disposition_is_deadlock(self):
+        primary = candidate(
+            PNEUMONIA,
+            0.82,
+            required=True,
+            matched=["cough", "pulmonary_infiltrate"],
+        )
+        primary.entity_id = "D_PRIMARY"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        mitral = candidate(
+            MITRAL_REGURGITATION,
+            0.70,
+            required=True,
+            matched=["mitral_regurgitation"],
+            core_score=0.45,
+            diagnostic_score=0.40,
+        )
+        mitral.entity_id = "D100012"
+        mitral.eligibility_status = "PrimaryEligible"
+        mitral.eligibility_anchor_status = "AnchorSatisfied"
+        mitral.required_gaps = []
+        mitral.actionable_gap_count = 0
+
+        dispositions = self.engine.judge._candidate_disposition_audit(
+            primary,
+            [primary, mitral],
+            [],
+            {},
+            {},
+        )
+
+        mitral_disposition = next(
+            item for item in dispositions if item["entity_id"] == "D100012"
+        )
+        self.assertEqual(
+            mitral_disposition["deadlock_code"],
+            "ARBITRATION_DEADLOCK",
+        )
+        self.assertEqual(mitral_disposition["failure_stage"], "contender_admission")
+
     def test_primary_arbitration_switches_when_score_primary_has_no_anchor(self):
         zoster = candidate(
             ZOSTER,

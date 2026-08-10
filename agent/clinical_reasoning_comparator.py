@@ -483,6 +483,8 @@ class ClinicalReasoningComparator:
             return False
         if str(getattr(candidate, "eligibility_status", "") or "") == EXCLUDED:
             return False
+        if self._primary_eligible_contender(candidate):
+            return True
         if has_active_bridge_protection(candidate, CROSS_SYSTEM_SCOPE):
             return True
         if self._protected_pattern_recall(candidate):
@@ -495,6 +497,20 @@ class ClinicalReasoningComparator:
             return False
         high_value = self._high_value_universe(candidate, current_primary)
         return len(self._explained_findings(candidate) & high_value) >= 2
+
+    def _primary_eligible_contender(self, candidate: Any) -> bool:
+        anchor = self.anchor_status(candidate)
+        status = str(getattr(candidate, "eligibility_status", "") or "")
+        if anchor != ANCHOR_SATISFIED and status != PRIMARY_ELIGIBLE:
+            return False
+        return bool(
+            getattr(candidate, "required_met", False)
+            or getattr(candidate, "core_matched_evidence", None)
+            or getattr(candidate, "diagnostic_matched_evidence", None)
+            or self._matched_diagnostic_patterns(candidate)
+            or self._component_score(candidate, "core_evidence_score") >= 0.20
+            or self._component_score(candidate, "diagnostic_evidence_score") > 0.0
+        )
 
     def pair_high_value_evidence(self, left: Any, right: Any) -> List[str]:
         return sorted(self._high_value_universe(left, right))

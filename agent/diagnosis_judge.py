@@ -500,8 +500,13 @@ class JudgeDecision:
     candidate_explanation_edges: List[Dict[str, Any]] = field(default_factory=list)
     primary_override_source: str = ""
     clinical_reasoning_comparisons: List[Dict[str, Any]] = field(default_factory=list)
+    contender_admission_audit: List[Dict[str, Any]] = field(default_factory=list)
+    material_contender_filter: List[Dict[str, Any]] = field(default_factory=list)
+    candidate_disposition_audit: List[Dict[str, Any]] = field(default_factory=list)
+    arbitration_deadlocks: List[Dict[str, Any]] = field(default_factory=list)
     primary_arbitration_candidates: List[Dict[str, Any]] = field(default_factory=list)
     primary_arbitration_decision: Dict[str, Any] = field(default_factory=dict)
+    primary_arbitration_summary: Dict[str, Any] = field(default_factory=dict)
     primary_anchor_revalidation: Dict[str, Any] = field(default_factory=dict)
     arbitration_winner: str = ""
     arbitration_loser: str = ""
@@ -2182,19 +2187,91 @@ class DiagnosisJudge:
             if isinstance(item, dict)
         }
         contenders = []
-        for item in pool or []:
+        admission_audit: List[Dict[str, Any]] = []
+        material_filter_audit: List[Dict[str, Any]] = []
+        for index, item in enumerate(pool or [], start=1):
             if not item or item is primary or self._name(item) == self._name(primary):
                 continue
+            pairwise_allowed = (
+                tuple(sorted((self._name(primary), self._name(item)))) in pair_names
+            )
             protected_entry = (
                 has_active_bridge_protection(item, CROSS_SYSTEM_SCOPE)
                 or self._protected_recall_candidate(item)
             )
-            if (
-                tuple(sorted((self._name(primary), self._name(item)))) not in pair_names
-                and not protected_entry
-            ):
+            candidate_anchor = self.clinical_comparator.anchor_status(item)
+            current_anchor = self.clinical_comparator.anchor_status(primary)
+            primary_eligible_entry = self._primary_eligible_arbitration_entry(item)
+            has_core_or_diagnostic = self._core_or_diagnostic_signal(item)
+            matched_pattern = bool(
+                self.clinical_comparator._matched_bridge_patterns(item)
+                or self.clinical_comparator._matched_diagnostic_patterns(item)
+            )
+            admission_decision = bool(
+                pairwise_allowed or protected_entry or primary_eligible_entry
+            )
+            admission_reason = ""
+            if primary_eligible_entry and index <= max(1, self.differential_top_k):
+                admission_reason = "TOPK_PRIMARY_ELIGIBLE"
+            elif primary_eligible_entry:
+                admission_reason = "PRIMARY_ELIGIBLE_ANCHOR"
+            elif protected_entry:
+                admission_reason = self._arbitration_entry_reason(item)
+            elif pairwise_allowed:
+                admission_reason = "PAIRWISE_ALLOWED"
+            else:
+                admission_reason = "PAIRWISE_NOT_ALLOWED"
+            if not admission_decision:
+                audit = self._material_contender_filter_record(
+                    item,
+                    primary,
+                    rank=index,
+                    pairwise_allowed=pairwise_allowed,
+                    protected_entry=protected_entry,
+                    primary_eligible_entry=primary_eligible_entry,
+                    candidate_anchor=candidate_anchor,
+                    current_anchor=current_anchor,
+                    has_core_or_diagnostic=has_core_or_diagnostic,
+                    matched_pattern=matched_pattern,
+                    material_contender=False,
+                    admission_decision=False,
+                    admission_reason=admission_reason,
+                    filtered_reason="pairwise_not_allowed_and_no_protection",
+                )
+                admission_audit.append(audit)
+                material_filter_audit.append(audit)
                 continue
-            if not self.clinical_comparator.material_contender(item, primary):
+            material_contender = self.clinical_comparator.material_contender(item, primary)
+            filtered_reason = ""
+            if not material_contender:
+                filtered_reason = self._material_contender_filtered_reason(
+                    item,
+                    primary,
+                    candidate_anchor=candidate_anchor,
+                    current_anchor=current_anchor,
+                    protected_entry=protected_entry,
+                    matched_pattern=matched_pattern,
+                    primary_eligible_entry=primary_eligible_entry,
+                )
+            audit = self._material_contender_filter_record(
+                item,
+                primary,
+                rank=index,
+                pairwise_allowed=pairwise_allowed,
+                protected_entry=protected_entry,
+                primary_eligible_entry=primary_eligible_entry,
+                candidate_anchor=candidate_anchor,
+                current_anchor=current_anchor,
+                has_core_or_diagnostic=has_core_or_diagnostic,
+                matched_pattern=matched_pattern,
+                material_contender=material_contender,
+                admission_decision=admission_decision,
+                admission_reason=admission_reason,
+                filtered_reason=filtered_reason,
+            )
+            admission_audit.append(audit)
+            material_filter_audit.append(audit)
+            if not material_contender:
                 continue
             contenders.append(item)
         contenders = sorted(
@@ -2212,6 +2289,8 @@ class DiagnosisJudge:
         records: List[Dict[str, Any]] = []
         candidate_audits: List[Dict[str, Any]] = []
         gaps: List[Dict[str, Any]] = []
+        comparison_action_by_name: Dict[str, str] = {}
+        comparison_reason_by_name: Dict[str, List[str]] = {}
         selected = primary
         selected_action = KEEP_CURRENT_PRIMARY
         selected_reason_codes: List[str] = []
@@ -2230,6 +2309,12 @@ class DiagnosisJudge:
                 high_value_evidence=high_value,
             )
             records.append(record)
+            comparison_action_by_name[self._name(contender)] = str(
+                record.get("recommended_action") or ""
+            )
+            comparison_reason_by_name[self._name(contender)] = list(
+                record.get("decision_reason_codes") or []
+            )
             candidate_audits.append(
                 {
                     "candidate": self._name(contender),
@@ -2279,14 +2364,48 @@ class DiagnosisJudge:
                 selected_action = action
                 selected_reason_codes = list(record.get("decision_reason_codes") or [])
 
+        disposition_audit = self._candidate_disposition_audit(
+            primary,
+            pool,
+            admission_audit,
+            comparison_action_by_name,
+            comparison_reason_by_name,
+        )
+        deadlocks = [
+            item for item in disposition_audit if item.get("deadlock_code") == "ARBITRATION_DEADLOCK"
+        ]
+        summary = self._primary_arbitration_summary(
+            pool,
+            records,
+            candidate_audits,
+            disposition_audit,
+            deadlocks,
+        )
         if not records:
+            eligible_challenger_count = sum(
+                1
+                for item in admission_audit
+                if item.get("primary_eligible")
+                and item.get("candidate") != self._name(primary)
+            )
+            if deadlocks:
+                reason_codes = ["ARBITRATION_DEADLOCK"]
+            elif eligible_challenger_count <= 0:
+                reason_codes = ["NO_ELIGIBLE_CHALLENGER"]
+            else:
+                reason_codes = ["NO_MATERIAL_ARBITRATION_CONTENDER"]
             return {
                 "comparisons": [],
                 "candidates": [],
+                "contender_admission_audit": admission_audit,
+                "material_contender_filter": material_filter_audit,
+                "candidate_disposition_audit": disposition_audit,
+                "arbitration_deadlocks": deadlocks,
+                "summary": summary,
                 "decision": {
                     "action": KEEP_CURRENT_PRIMARY,
                     "selected_primary": self._name(primary),
-                    "reason_codes": ["NO_MATERIAL_ARBITRATION_CONTENDER"],
+                    "reason_codes": reason_codes,
                 },
                 "selected_candidate": primary,
                 "pairwise_discriminating_gaps": [],
@@ -2294,6 +2413,11 @@ class DiagnosisJudge:
         return {
             "comparisons": records,
             "candidates": candidate_audits,
+            "contender_admission_audit": admission_audit,
+            "material_contender_filter": material_filter_audit,
+            "candidate_disposition_audit": disposition_audit,
+            "arbitration_deadlocks": deadlocks,
+            "summary": summary,
             "decision": {
                 "action": selected_action,
                 "selected_primary": self._name(selected),
@@ -2303,6 +2427,221 @@ class DiagnosisJudge:
             "selected_candidate": selected,
             "defer_reason": defer_reason,
             "pairwise_discriminating_gaps": gaps,
+        }
+
+    def _primary_eligible_arbitration_entry(self, candidate: Any) -> bool:
+        if not candidate or bool(getattr(candidate, "hard_contradiction", False)):
+            return False
+        if self._eligibility_status(candidate) == EXCLUDED:
+            return False
+        anchor = self.clinical_comparator.anchor_status(candidate)
+        if anchor != "AnchorSatisfied" and self._eligibility_status(candidate) != PRIMARY_ELIGIBLE:
+            return False
+        return bool(
+            getattr(candidate, "required_met", False)
+            or self._core_or_diagnostic_signal(candidate)
+            or self.clinical_comparator._matched_diagnostic_patterns(candidate)
+        )
+
+    def _material_contender_filter_record(
+        self,
+        candidate: Any,
+        primary: Any,
+        *,
+        rank: int,
+        pairwise_allowed: bool,
+        protected_entry: bool,
+        primary_eligible_entry: bool,
+        candidate_anchor: str,
+        current_anchor: str,
+        has_core_or_diagnostic: bool,
+        matched_pattern: bool,
+        material_contender: bool,
+        admission_decision: bool,
+        admission_reason: str,
+        filtered_reason: str,
+    ) -> Dict[str, Any]:
+        eligibility = self._eligibility_status(candidate)
+        return {
+            "candidate": self._name(candidate),
+            "candidate_id": str(getattr(candidate, "entity_id", "") or ""),
+            "entity_id": str(getattr(candidate, "entity_id", "") or ""),
+            "rank": int(rank),
+            "pairwise_allowed": bool(pairwise_allowed),
+            "candidate_anchor_status": str(candidate_anchor or ""),
+            "current_primary_anchor_status": str(current_anchor or ""),
+            "eligibility_status": eligibility,
+            "primary_eligible": bool(
+                eligibility == PRIMARY_ELIGIBLE or candidate_anchor == "AnchorSatisfied"
+            ),
+            "required_met": bool(getattr(candidate, "required_met", False)),
+            "has_core_or_diagnostic_evidence": bool(has_core_or_diagnostic),
+            "matched_pattern": bool(matched_pattern),
+            "protected_entry": bool(protected_entry),
+            "primary_eligible_entry": bool(primary_eligible_entry),
+            "admission_decision": bool(admission_decision),
+            "admission_reason": str(admission_reason or ""),
+            "material_contender": bool(material_contender),
+            "filtered_reason": str(filtered_reason or ""),
+        }
+
+    def _material_contender_filtered_reason(
+        self,
+        candidate: Any,
+        primary: Any,
+        *,
+        candidate_anchor: str,
+        current_anchor: str,
+        protected_entry: bool,
+        matched_pattern: bool,
+        primary_eligible_entry: bool,
+    ) -> str:
+        if bool(getattr(candidate, "hard_contradiction", False)):
+            return "hard_contradiction"
+        if self._eligibility_status(candidate) == EXCLUDED:
+            return "excluded_candidate"
+        if primary_eligible_entry:
+            return "primary_eligible_contender_unexpectedly_non_material"
+        if (
+            current_anchor != "NoValidAnchor"
+            and not protected_entry
+            and not matched_pattern
+            and candidate_anchor != "AnchorSatisfied"
+        ):
+            return "current_primary_has_anchor_and_contender_lacks_pattern"
+        return "non_material_after_admission"
+
+    def _candidate_disposition_audit(
+        self,
+        primary: Any,
+        pool: Sequence[Any],
+        admission_audit: Sequence[Dict[str, Any]],
+        comparison_action_by_name: Dict[str, str],
+        comparison_reason_by_name: Dict[str, List[str]],
+    ) -> List[Dict[str, Any]]:
+        admission_by_name = {
+            str(item.get("candidate") or ""): dict(item)
+            for item in admission_audit or []
+            if str(item.get("candidate") or "")
+        }
+        top_k = max(1, int(getattr(self, "differential_top_k", 5) or 5))
+        records: List[Dict[str, Any]] = []
+        for index, candidate in enumerate(pool or [], start=1):
+            if not candidate:
+                continue
+            name = self._name(candidate)
+            if not name:
+                continue
+            admission = admission_by_name.get(name, {})
+            is_primary = name == self._name(primary)
+            anchor = (
+                str(admission.get("candidate_anchor_status") or "")
+                or self.clinical_comparator.anchor_status(candidate)
+            )
+            eligibility = (
+                str(admission.get("eligibility_status") or "")
+                or self._eligibility_status(candidate)
+            )
+            primary_eligible = bool(
+                eligibility == PRIMARY_ELIGIBLE or anchor == "AnchorSatisfied"
+            )
+            gap_count = int(getattr(candidate, "actionable_gap_count", 0) or 0)
+            gap_count += len(getattr(candidate, "required_gaps", []) or [])
+            comparison_action = str(comparison_action_by_name.get(name) or "")
+            compared = bool(comparison_action)
+            rejection_reason = ""
+            disposition = ""
+            if is_primary:
+                disposition = "CURRENT_PRIMARY"
+            elif compared:
+                if comparison_action == REJECT_CONTENDER:
+                    disposition = "REJECTED_WITH_REASON"
+                    rejection_reason = "clinical_reasoning_comparator_rejected"
+                elif comparison_action == NO_MATERIAL_DIFFERENCE:
+                    disposition = "NON_MATERIAL_AFTER_COMPARISON"
+                else:
+                    disposition = "ARBITRATED"
+            elif bool(getattr(candidate, "hard_contradiction", False)):
+                disposition = "REJECTED_WITH_REASON"
+                rejection_reason = "hard_contradiction"
+            elif eligibility == EXCLUDED:
+                disposition = "REJECTED_WITH_REASON"
+                rejection_reason = "excluded_candidate"
+            elif gap_count > 0:
+                disposition = "ACTIONABLE_GAP_CREATED"
+            else:
+                disposition = "NONE"
+            deadlock_code = ""
+            failure_stage = ""
+            if (
+                not is_primary
+                and index <= top_k
+                and primary_eligible
+                and not compared
+                and not rejection_reason
+                and gap_count <= 0
+            ):
+                deadlock_code = "ARBITRATION_DEADLOCK"
+                failure_stage = (
+                    "contender_admission"
+                    if not admission.get("material_contender")
+                    else "arbitration_disposition"
+                )
+            records.append(
+                {
+                    "candidate": name,
+                    "candidate_id": str(getattr(candidate, "entity_id", "") or ""),
+                    "entity_id": str(getattr(candidate, "entity_id", "") or ""),
+                    "rank": index,
+                    "eligibility_status": eligibility,
+                    "anchor_status": anchor,
+                    "primary_eligible": primary_eligible,
+                    "pairwise_status": bool(admission.get("pairwise_allowed", False)),
+                    "material_contender_status": bool(
+                        admission.get("material_contender", False)
+                    ),
+                    "comparison_present": compared,
+                    "comparison_status": "compared" if compared else "not_compared",
+                    "comparison_outcome": comparison_action,
+                    "comparison_reason_codes": list(
+                        comparison_reason_by_name.get(name) or []
+                    ),
+                    "rejection_reason": rejection_reason,
+                    "active_gap_count": gap_count,
+                    "deferred_gap_count": len(getattr(candidate, "required_gaps", []) or []),
+                    "final_disposition": disposition,
+                    "deadlock_code": deadlock_code,
+                    "failure_stage": failure_stage,
+                }
+            )
+        return records
+
+    @staticmethod
+    def _primary_arbitration_summary(
+        pool: Sequence[Any],
+        records: Sequence[Dict[str, Any]],
+        candidate_audits: Sequence[Dict[str, Any]],
+        disposition_audit: Sequence[Dict[str, Any]],
+        deadlocks: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "primary_eligible_candidate_count": sum(
+                1 for item in disposition_audit or [] if item.get("primary_eligible")
+            ),
+            "admitted_contender_count": len(candidate_audits or []),
+            "clinical_reasoning_comparison_count": len(records or []),
+            "rejected_contender_count": sum(
+                1
+                for item in disposition_audit or []
+                if item.get("final_disposition") == "REJECTED_WITH_REASON"
+            ),
+            "gap_routed_contender_count": sum(
+                1
+                for item in disposition_audit or []
+                if item.get("final_disposition") == "ACTIONABLE_GAP_CREATED"
+            ),
+            "arbitration_deadlock_count": len(deadlocks or []),
+            "candidate_count": len([item for item in pool or [] if item]),
         }
 
     def _arbitration_entry_reason(self, contender: Any) -> str:
@@ -2450,11 +2789,26 @@ class DiagnosisJudge:
         decision.clinical_reasoning_comparisons = list(
             arbitration.get("comparisons") or []
         )
+        decision.contender_admission_audit = list(
+            arbitration.get("contender_admission_audit") or []
+        )
+        decision.material_contender_filter = list(
+            arbitration.get("material_contender_filter") or []
+        )
+        decision.candidate_disposition_audit = list(
+            arbitration.get("candidate_disposition_audit") or []
+        )
+        decision.arbitration_deadlocks = list(
+            arbitration.get("arbitration_deadlocks") or []
+        )
         decision.primary_arbitration_candidates = list(
             arbitration.get("candidates") or []
         )
         decision.primary_arbitration_decision = dict(
             arbitration.get("decision") or {}
+        )
+        decision.primary_arbitration_summary = dict(
+            arbitration.get("summary") or {}
         )
         if decision.clinical_reasoning_comparisons:
             first = decision.clinical_reasoning_comparisons[0]
