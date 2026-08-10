@@ -596,6 +596,8 @@ class DifferentialPoolFilter:
                 result.pool_filter_reasons[name] = (
                     BRIDGE_REASON
                     if self._bridge_protected(candidate)
+                    else "protected_recall_arbitration"
+                    if self._protected_recall(candidate)
                     else "forced_conflict_or_top_candidate"
                 )
                 continue
@@ -881,6 +883,8 @@ class DifferentialPoolFilter:
             return True, "causal_or_graph_relation"
         if self._bridge_protected(left) or self._bridge_protected(right):
             return True, BRIDGE_REASON
+        if self._protected_recall(left) or self._protected_recall(right):
+            return True, "protected_recall_arbitration"
         if self.judge._same_body_system(left, right) and (
             left_data["core"] or right_data["core"]
         ):
@@ -890,6 +894,9 @@ class DifferentialPoolFilter:
     @staticmethod
     def _bridge_protected(candidate: Any) -> bool:
         return has_active_bridge_protection(candidate, CROSS_SYSTEM_SCOPE)
+
+    def _protected_recall(self, candidate: Any) -> bool:
+        return self.judge._protected_recall_candidate(candidate)
 
     def _can_form_differential(
         self,
@@ -1404,6 +1411,9 @@ class DiagnosisJudge:
         claim_force_names = self._forced_pool_names_for_claims(ranked)
         gap_force_names = self._forced_pool_names_for_deferred_gap_override(ranked)
         bridge_force_names = self._forced_pool_names_for_bridge_protection(ranked)
+        protected_recall_force_names = self._forced_pool_names_for_protected_recall(
+            ranked
+        )
         force_names = list(
             dict.fromkeys(
                 list(force_names)
@@ -1411,6 +1421,7 @@ class DiagnosisJudge:
                 + claim_force_names
                 + gap_force_names
                 + bridge_force_names
+                + protected_recall_force_names
             )
         )
         candidate_pool_for_workup = [
@@ -1433,6 +1444,8 @@ class DiagnosisJudge:
             raw_pool_source[name] = "deferred_gap_priority_override"
         for name in bridge_force_names:
             raw_pool_source[name] = "bridge_protection"
+        for name in protected_recall_force_names:
+            raw_pool_source[name] = "protected_recall_arbitration"
         for name in force_names:
             raw_pool_source.setdefault(
                 name,
@@ -2172,7 +2185,14 @@ class DiagnosisJudge:
         for item in pool or []:
             if not item or item is primary or self._name(item) == self._name(primary):
                 continue
-            if tuple(sorted((self._name(primary), self._name(item)))) not in pair_names:
+            protected_entry = (
+                has_active_bridge_protection(item, CROSS_SYSTEM_SCOPE)
+                or self._protected_recall_candidate(item)
+            )
+            if (
+                tuple(sorted((self._name(primary), self._name(item)))) not in pair_names
+                and not protected_entry
+            ):
                 continue
             if not self.clinical_comparator.material_contender(item, primary):
                 continue
@@ -2214,11 +2234,7 @@ class DiagnosisJudge:
                 {
                     "candidate": self._name(contender),
                     "entity_id": str(getattr(contender, "entity_id", "") or ""),
-                    "entered_by": (
-                        "bridge_protection"
-                        if has_active_bridge_protection(contender, CROSS_SYSTEM_SCOPE)
-                        else "diagnostic_pattern_or_high_value_evidence"
-                    ),
+                    "entered_by": self._arbitration_entry_reason(contender),
                     "anchor_status": record.get("candidate_b_analysis", {}).get(
                         "anchor_status",
                         "",
@@ -2288,6 +2304,13 @@ class DiagnosisJudge:
             "defer_reason": defer_reason,
             "pairwise_discriminating_gaps": gaps,
         }
+
+    def _arbitration_entry_reason(self, contender: Any) -> str:
+        if has_active_bridge_protection(contender, CROSS_SYSTEM_SCOPE):
+            return "bridge_protection"
+        if self._protected_recall_candidate(contender):
+            return "protected_recall"
+        return "diagnostic_pattern_or_high_value_evidence"
 
     def _pairwise_discriminating_gap(
         self,
@@ -3635,6 +3658,41 @@ class DiagnosisJudge:
         ]
         protected.sort(key=self._bridge_protection_sort_key, reverse=True)
         return [self._name(item) for item in protected[:3]]
+
+    def _forced_pool_names_for_protected_recall(
+        self,
+        candidates: Sequence[Any],
+    ) -> List[str]:
+        protected = [
+            item
+            for item in candidates or []
+            if self._protected_recall_candidate(item)
+            and self._name(item)
+            and not getattr(item, "hard_contradiction", False)
+        ]
+        protected.sort(
+            key=lambda item: (
+                self._core_coverage(item),
+                float(getattr(item, "max_gap_value", 0.0) or 0.0),
+                self._judge_score(item),
+            ),
+            reverse=True,
+        )
+        return [self._name(item) for item in protected[:3]]
+
+    @staticmethod
+    def _protected_recall_candidate(candidate: Any) -> bool:
+        for source in getattr(candidate, "candidate_sources", []) or []:
+            if not isinstance(source, dict):
+                continue
+            metadata = dict(source.get("metadata") or {})
+            if (
+                str(source.get("source") or "") == "llm_pattern_hypothesis"
+                and bool(metadata.get("protected_pool_slot"))
+                and str(metadata.get("recall_mode") or "") == "protected_recall"
+            ):
+                return True
+        return False
 
     def _bridge_protection_sort_key(self, candidate: Any) -> tuple:
         strength_rank = 0

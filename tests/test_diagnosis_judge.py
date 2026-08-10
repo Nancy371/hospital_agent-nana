@@ -531,6 +531,69 @@ class DiagnosisJudgeTests(unittest.TestCase):
             )
         )
 
+    def test_protected_recall_candidate_gets_arbitration_consideration(self):
+        primary = candidate(
+            FRACTURE,
+            0.78,
+            required=True,
+            matched=["osteophyte", "activity_related_joint_pain"],
+            coverage=0.32,
+            residual=0.68,
+            residual_core=3,
+        )
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        radiation = candidate(
+            "\u653e\u5c04\u6027\u80ba\u708e",
+            0.31,
+            required=False,
+            matched=[
+                "thoracic_radiotherapy",
+                "ground_glass_opacity",
+                "pulmonary_consolidation",
+                "lesion_within_prior_radiation_field",
+            ],
+            gaps=["post_radiotherapy_time_window"],
+            coverage=0.74,
+            residual=0.22,
+            core_coverage=0.78,
+            residual_core=0,
+            core_score=0.66,
+            diagnostic_score=0.42,
+        )
+        radiation.entity_id = "D100058"
+        radiation.eligibility_status = "Deferred"
+        radiation.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        radiation.candidate_sources = [
+            {
+                "source": "llm_pattern_hypothesis",
+                "entity_id": "D100058",
+                "metadata": {
+                    "recall_mode": "protected_recall",
+                    "protected_pool_slot": True,
+                    "pattern_hypothesis_id": "PH_DET_radiation",
+                    "pattern_recall_only": True,
+                    "judge_evidence_weight": 0.0,
+                    "eligibility_evidence_weight": 0.0,
+                },
+            }
+        ]
+
+        decision = self.run_candidates([primary, radiation])
+        payload = decision.judge_decision
+
+        self.assertIn("\u653e\u5c04\u6027\u80ba\u708e", payload["differential_candidates"])
+        self.assertEqual(
+            payload["pool_filter_reasons"].get("\u653e\u5c04\u6027\u80ba\u708e"),
+            "protected_recall_arbitration",
+        )
+        self.assertTrue(payload["primary_arbitration_candidates"])
+        self.assertEqual(
+            payload["primary_arbitration_candidates"][0]["entered_by"],
+            "protected_recall",
+        )
+
     def test_primary_arbitration_switches_when_score_primary_has_no_anchor(self):
         zoster = candidate(
             ZOSTER,

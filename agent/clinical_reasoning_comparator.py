@@ -280,6 +280,8 @@ class ClinicalReasoningComparator:
             return False
         if has_active_bridge_protection(candidate, CROSS_SYSTEM_SCOPE):
             return True
+        if self._protected_pattern_recall(candidate):
+            return True
         if self._matched_bridge_patterns(candidate):
             return True
         if self._matched_diagnostic_patterns(candidate):
@@ -392,6 +394,7 @@ class ClinicalReasoningComparator:
 
     def _matched_bridge_patterns(self, candidate: Any) -> List[str]:
         result: List[str] = []
+        result.extend(self._protected_pattern_recall(candidate))
         for assertion in getattr(candidate, "derived_pattern_assertions", []) or []:
             if isinstance(assertion, dict):
                 value = str(assertion.get("canonical_pattern") or "")
@@ -406,6 +409,22 @@ class ClinicalReasoningComparator:
                 if value:
                     result.append(value)
         return list(dict.fromkeys(result))
+
+    @staticmethod
+    def _protected_pattern_recall(candidate: Any) -> List[str]:
+        result: List[str] = []
+        for source in getattr(candidate, "candidate_sources", []) or []:
+            if not isinstance(source, dict):
+                continue
+            metadata = dict(source.get("metadata") or {})
+            if (
+                str(source.get("source") or "") == "llm_pattern_hypothesis"
+                and bool(metadata.get("protected_pool_slot"))
+                and str(metadata.get("recall_mode") or "") == "protected_recall"
+            ):
+                pattern_id = str(metadata.get("pattern_hypothesis_id") or "")
+                result.append(pattern_id or "verified_pattern_recall")
+        return list(dict.fromkeys(item for item in result if item))
 
     def _actionable_gaps(self, candidate: Any) -> List[str]:
         values = list(self._texts(getattr(candidate, "required_gaps", []) or []))

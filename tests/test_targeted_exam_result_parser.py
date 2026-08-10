@@ -13,6 +13,132 @@ from agent.targeted_exam_result_parser import (
 
 
 class TargetedExamResultParserTests(unittest.TestCase):
+    def test_gap_aware_ct_extracts_radiation_field_claim_support(self):
+        parser = TargetedExamResultParser()
+        binding = ExamResultIntentBinding(
+            binding_id="B-RP-1",
+            order_id="O-RP-1",
+            requested_exam="胸部增强CT",
+            resolved_exam="CT扫描（CT）",
+            actual_result_exam="CT扫描（CT）",
+            target_gap_ids=["G-D100058-03"],
+            target_claims=[
+                "pulmonary_objective_abnormality",
+                "radiation_field_lung_consistency",
+            ],
+            target_candidate="放射性肺炎",
+            entity_id="D100058",
+        )
+        parsed = parser.parse(
+            {
+                "status": "abnormal",
+                "result": {
+                    "conclusion": (
+                        "中下肺野可见斑片状磨玻璃影和实变，"
+                        "局限于既往放疗照射野内，伴轻度容积减小。"
+                    )
+                },
+            },
+            binding,
+        )
+
+        findings = {item.finding for item in parsed.observations}
+        self.assertEqual(parsed.status, "positive")
+        self.assertEqual(parsed.gap_closure_assessment, "positive_closed")
+        self.assertEqual(parsed.gap_resolution_status, "RESOLVED_SUPPORTED")
+        self.assertIn("ground_glass_opacity", findings)
+        self.assertIn("pulmonary_consolidation", findings)
+        self.assertIn("pulmonary_volume_loss", findings)
+        self.assertIn("lesion_within_prior_radiation_field", findings)
+        self.assertNotIn("radiation_pneumonitis", findings)
+        self.assertNotIn("D100058", findings)
+        claim_by_id = {item["target_claim"]: item for item in parsed.claim_matches}
+        self.assertEqual(
+            claim_by_id["radiation_field_lung_consistency"]["claim_status"],
+            "SUPPORTED",
+        )
+        self.assertTrue(parsed.material_evidence_delta["material_evidence_changed"])
+
+    def test_gap_aware_ct_can_contradict_radiation_field_claim(self):
+        parser = TargetedExamResultParser()
+        binding = ExamResultIntentBinding(
+            binding_id="B-RP-2",
+            order_id="O-RP-2",
+            requested_exam="胸部CT",
+            resolved_exam="CT扫描（CT）",
+            actual_result_exam="CT扫描（CT）",
+            target_gap_ids=["G-D100058-03"],
+            target_claims=["radiation_field_lung_consistency"],
+            target_candidate="放射性肺炎",
+            entity_id="D100058",
+        )
+        parsed = parser.parse(
+            {
+                "status": "abnormal",
+                "result": {
+                    "conclusion": "双肺弥漫分布磨玻璃影，病变明显超出原照射区域。"
+                },
+            },
+            binding,
+        )
+
+        findings = {item.finding for item in parsed.observations}
+        self.assertEqual(parsed.status, "negative")
+        self.assertEqual(parsed.gap_closure_assessment, "negative_closed")
+        self.assertEqual(parsed.gap_resolution_status, "RESOLVED_CONTRADICTED")
+        self.assertIn("lesion_outside_prior_radiation_field", findings)
+        claim = parsed.claim_matches[0]
+        self.assertEqual(claim["target_claim"], "radiation_field_lung_consistency")
+        self.assertEqual(claim["claim_status"], "CONTRADICTED")
+
+    def test_gap_aware_ct_missing_field_relation_is_unresolved_not_negative(self):
+        parser = TargetedExamResultParser()
+        binding = ExamResultIntentBinding(
+            binding_id="B-RP-3",
+            order_id="O-RP-3",
+            requested_exam="胸部CT",
+            resolved_exam="CT扫描（CT）",
+            actual_result_exam="CT扫描（CT）",
+            target_gap_ids=["G-D100058-03"],
+            target_claims=["radiation_field_lung_consistency"],
+            target_candidate="放射性肺炎",
+            entity_id="D100058",
+        )
+        parsed = parser.parse(
+            {
+                "status": "abnormal",
+                "result": {"conclusion": "右肺可见磨玻璃影，未描述与既往放疗野关系。"},
+            },
+            binding,
+        )
+
+        self.assertEqual(parsed.status, "inconclusive")
+        self.assertEqual(parsed.gap_resolution_status, "UNRESOLVED")
+        self.assertEqual(parsed.claim_matches[0]["claim_status"], "UNRESOLVED")
+        self.assertNotEqual(parsed.gap_closure_assessment, "negative_closed")
+
+    def test_gap_aware_ct_negation_does_not_create_positive_ground_glass(self):
+        parser = TargetedExamResultParser()
+        binding = ExamResultIntentBinding(
+            binding_id="B-RP-4",
+            order_id="O-RP-4",
+            requested_exam="胸部CT",
+            resolved_exam="CT扫描（CT）",
+            actual_result_exam="CT扫描（CT）",
+            target_gap_ids=["G-D100058-04"],
+            target_claims=["ground_glass_opacity"],
+            target_candidate="放射性肺炎",
+            entity_id="D100058",
+        )
+        parsed = parser.parse(
+            {"status": "normal", "result": {"conclusion": "双肺未见磨玻璃影。"}},
+            binding,
+        )
+
+        by_finding = {item.finding: item for item in parsed.observations}
+        self.assertEqual(by_finding["ground_glass_opacity"].polarity, "negative")
+        self.assertEqual(parsed.claim_matches[0]["claim_status"], "CONTRADICTED")
+
     def test_enhanced_ct_bound_to_pavm_gap_recovers_vascular_anchor(self):
         parser = TargetedExamResultParser()
         binding = ExamResultIntentBinding(

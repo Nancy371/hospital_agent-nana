@@ -114,6 +114,45 @@ class ExamInformationGainTests(unittest.TestCase):
         self.assertEqual(ranked[0], expected_deferred)
         self.assertGreater(scores[expected_deferred], scores[expected_generic])
 
+    def test_radiation_gap_task_carries_evidence_question_claim(self):
+        chest_ct = "\u80f8\u90e8CT\u626b\u63cf\uff08Chest CT\uff09"
+        result = self.strategy.recommend(
+            collected_info={"symptoms": ["dyspnea", "cough"]},
+            candidate_diseases=["\u653e\u5c04\u6027\u80ba\u708e"],
+            proposed_items=[],
+            existing_results={},
+            judge_decision={
+                "primary": "\u80ba\u4e0d\u5f20",
+                "active_evidence_gaps": [
+                    {
+                        "gap_id": "G-D100058-derived_pattern_gap-1-post_radiotherapy_time_window",
+                        "candidate": "\u653e\u5c04\u6027\u80ba\u708e",
+                        "entity_id": "D100058",
+                        "target_evidence": "post_radiotherapy_time_window",
+                        "gap_value": 0.72,
+                        "closure_exams": [chest_ct],
+                        "expected_transition": {
+                            "positive": "PrimaryEligible",
+                            "negative": "DifferentialOnly",
+                        },
+                    }
+                ],
+            },
+        )
+
+        details = result["exam_authorization_details"]
+        ct_detail = next(item for item in details if item["exam"] == chest_ct)
+        self.assertIn("radiation_field_lung_consistency", ct_detail["target_claims"])
+        self.assertIn("ground_glass_opacity", ct_detail["target_findings"])
+        self.assertEqual(ct_detail["exam_role"], "target_claim_resolution")
+        self.assertIn("radiation field", ct_detail["target_question"])
+        self.assertEqual(
+            ct_detail["expected_arbitration_effect"][
+                "radiation_field_lung_consistency_supported"
+            ],
+            "favor_D100058",
+        )
+
     def test_pairwise_gap_task_beats_generic_exam_ranking(self):
         pairwise_exam = "\u6ccc\u5c3f\u751f\u6b96\u9053\u75c5\u539f\u6838\u9178\u68c0\u6d4b"
         generic_exam = "\u5168\u8840\u7ec6\u80de\u8ba1\u6570\uff08CBC\uff09"

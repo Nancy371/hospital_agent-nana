@@ -800,6 +800,20 @@ class ExamStrategyAgent:
                 "target_claim": str(
                     task_by_exam.get(item, {}).get("target_claim") or ""
                 ),
+                "target_claims": list(
+                    task_by_exam.get(item, {}).get("target_claims") or []
+                ),
+                "clinical_question": str(
+                    task_by_exam.get(item, {}).get("clinical_question")
+                    or task_by_exam.get(item, {}).get("target_question")
+                    or ""
+                ),
+                "positive_resolution_rules": list(
+                    task_by_exam.get(item, {}).get("positive_resolution_rules") or []
+                ),
+                "negative_resolution_rules": list(
+                    task_by_exam.get(item, {}).get("negative_resolution_rules") or []
+                ),
                 "exam_role": str(task_by_exam.get(item, {}).get("exam_role") or ""),
                 "expected_arbitration_effect": dict(
                     task_by_exam.get(item, {}).get("expected_arbitration_effect") or {}
@@ -923,8 +937,7 @@ class ExamStrategyAgent:
                 )
                 coverage = float(resolution.diagnostic_coverage or 0.0)
                 closure_priority = max(0, 101 - exam_rank)
-                tasks.append(
-                    {
+                task = {
                         "exam": exam_text,
                         "target_candidates": target_candidates,
                         "target_findings": [target] if target else [],
@@ -966,8 +979,74 @@ class ExamStrategyAgent:
                         "exam_resolution": resolution.to_dict(),
                         "override_reason": "highest-value evidence gap closure",
                     }
-                )
+                tasks.append(self._with_evidence_question_contract(task, gap))
         return tasks
+
+    @staticmethod
+    def _with_evidence_question_contract(
+        task: Dict[str, Any],
+        gap: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Attach decision-question claims for gaps whose result needs interpretation."""
+        result = dict(task or {})
+        candidate_text = " ".join(
+            str(item or "")
+            for item in list(result.get("target_candidates") or [])
+            + [
+                gap.get("candidate"),
+                gap.get("entity_id"),
+                gap.get("target_evidence"),
+                gap.get("gap_id"),
+            ]
+        )
+        compact = "".join(candidate_text.lower().split())
+        is_radiation_lung_gap = any(
+            marker in compact
+            for marker in (
+                "d100058",
+                "radiation",
+                "radiotherapy",
+                "post_radiotherapy",
+                "放射",
+                "放疗",
+            )
+        )
+        if not is_radiation_lung_gap:
+            return result
+        claims = list(result.get("target_claims") or [])
+        findings = list(result.get("target_findings") or [])
+        for claim in (
+            "radiation_field_lung_consistency",
+            "ground_glass_opacity",
+            "pulmonary_consolidation",
+        ):
+            if claim not in claims:
+                claims.append(claim)
+            if claim not in findings:
+                findings.append(claim)
+        result["target_claims"] = claims
+        result["target_findings"] = findings
+        result["target_question"] = (
+            "Does the pulmonary imaging abnormality spatially match the prior "
+            "radiation field?"
+        )
+        result["clinical_question"] = result["target_question"]
+        result["positive_resolution_rules"] = [
+            "lesion_within_prior_radiation_field",
+            "opacity_within_radiation_field",
+            "radiation_field_distribution",
+        ]
+        result["negative_resolution_rules"] = [
+            "lesion_outside_prior_radiation_field",
+            "diffuse_non_field_distribution",
+        ]
+        result["expected_arbitration_effect"] = {
+            "radiation_field_lung_consistency_supported": "favor_D100058",
+            "radiation_field_lung_consistency_contradicted": "demote_D100058",
+            "unresolved": "remain_deferred",
+        }
+        result["exam_role"] = "target_claim_resolution"
+        return result
 
     def _exam_tasks_from_priority_overrides(
         self,
@@ -993,8 +1072,7 @@ class ExamStrategyAgent:
                         exam_text,
                         candidate=candidate or entity_id or None,
                     )
-                    tasks.append(
-                        {
+                    task = {
                             "exam": exam_text,
                             "target_candidates": target_candidates,
                             "target_findings": [target] if target else [],
@@ -1059,7 +1137,7 @@ class ExamStrategyAgent:
                                 or "high-value deferred evidence gap"
                             ),
                         }
-                    )
+                    tasks.append(self._with_evidence_question_contract(task, gap))
         return tasks
 
     def _prepare_differential_order_items(

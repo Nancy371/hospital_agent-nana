@@ -23,12 +23,24 @@ PARTIAL = "partial"
 NON_CLOSING = "non_closing"
 UNSUPPORTED = "unsupported"
 
+SUPPORTED = "SUPPORTED"
+CONTRADICTED = "CONTRADICTED"
+CLAIM_UNRESOLVED = "UNRESOLVED"
+
+OPEN = "OPEN"
+RESOLVED_SUPPORTED = "RESOLVED_SUPPORTED"
+RESOLVED_CONTRADICTED = "RESOLVED_CONTRADICTED"
+GAP_UNRESOLVED = "UNRESOLVED"
+
 
 @dataclass
 class ExamResultIntentBinding:
     binding_id: str
     order_id: str
     requested_exam: str
+    exam_intent_id: str = ""
+    execution_id: str = ""
+    result_id: str = ""
     resolved_exam: str = ""
     actual_result_exam: str = ""
     target_gap_ids: List[str] = field(default_factory=list)
@@ -63,6 +75,9 @@ class ExamResultIntentBinding:
         return cls(
             binding_id=binding_id or _stable_id("binding", order_id or requested),
             order_id=order_id or _stable_id("order", requested),
+            exam_intent_id=str(value.get("exam_intent_id") or binding_id or order_id or ""),
+            execution_id=str(value.get("execution_id") or ""),
+            result_id=str(value.get("result_id") or ""),
             requested_exam=requested,
             resolved_exam=str(value.get("resolved_exam") or requested),
             actual_result_exam=str(value.get("actual_result_exam") or ""),
@@ -107,6 +122,11 @@ class TargetedExamParseResult:
     binding_status: str = "bound"
     actual_result_exam: str = ""
     execution_status: str = ""
+    atomic_observations: List[Dict[str, Any]] = field(default_factory=list)
+    relation_observations: List[Dict[str, Any]] = field(default_factory=list)
+    claim_matches: List[Dict[str, Any]] = field(default_factory=list)
+    gap_resolution_status: str = OPEN
+    material_evidence_delta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -148,10 +168,13 @@ class TargetedExamResultParser:
             actual_result_exam=binding.actual_result_exam,
             execution_status=binding.execution_status,
         )
-        if not binding.target_gap_ids or not self._is_pavm_binding(binding):
-            base.status = UNBOUND if not binding.target_gap_ids else UNRESOLVED
+        if not binding.target_gap_ids:
+            base.status = UNBOUND
             base.gap_closure_assessment = "not_closable"
+            base.gap_resolution_status = OPEN
             return base
+        if not self._is_pavm_binding(binding):
+            return self._parse_generic_targeted(raw_exam_result, binding, base)
         return self._parse_pavm(raw_exam_result, binding, base)
 
     def parse_all(
@@ -170,6 +193,231 @@ class TargetedExamResultParser:
                 continue
             parsed.append(self.parse(raw, binding))
         return parsed
+
+    def _parse_generic_targeted(
+        self,
+        raw_exam_result: Any,
+        binding: ExamResultIntentBinding,
+        result: TargetedExamParseResult,
+    ) -> TargetedExamParseResult:
+        text = result.source_text
+        observations: List[Observation] = []
+        atomic: List[Dict[str, Any]] = []
+        relations: List[Dict[str, Any]] = []
+        matched: List[str] = []
+
+        def add_observation(
+            finding: str,
+            *,
+            polarity: str = "positive",
+            confidence: float = 0.88,
+            evidence_level: str = "observed_exam_result",
+            information_value: float = 0.78,
+            observation_type: str = "",
+            semantic_level: str = "fact",
+            anatomy: str = "",
+            rule_id: str = "",
+            verification_method: str = "targeted_exam_result_parser",
+        ) -> Observation:
+            span = _support_span_for_terms(text, _TERMS_BY_FINDING.get(finding, ())) or text[:320]
+            item = Observation(
+                finding=finding,
+                source="targeted_exam_result_parser"
+                if verification_method == "targeted_exam_result_parser"
+                else verification_method,
+                polarity=polarity,
+                confidence=confidence,
+                raw_text=text,
+                source_text=span,
+                field_path=f"exam_result.{binding.actual_result_exam or binding.resolved_exam or binding.requested_exam}",
+                evidence_level=evidence_level,
+                information_value=information_value,
+                anatomy=anatomy,
+                source_exam=binding.actual_result_exam or binding.resolved_exam or binding.requested_exam,
+                order_id=binding.order_id,
+                target_gap_ids=list(binding.target_gap_ids),
+                entity_id=binding.entity_id,
+                verification_method=verification_method,
+                parser_profile=binding.parser_profile,
+                gap_closure_assessment=result.gap_closure_assessment,
+                observation_type=observation_type,
+                semantic_level=semantic_level,
+                source_refs=[binding.result_id] if binding.result_id else [],
+                source_texts=[span] if span else [],
+            )
+            observations.append(item)
+            if rule_id:
+                matched.append(rule_id)
+            return item
+
+        for finding, spec in _GENERIC_ATOMIC_RULES:
+            if _matched_positive(text, spec["terms"]):
+                item = add_observation(
+                    finding,
+                    confidence=float(spec.get("confidence") or 0.86),
+                    information_value=float(spec.get("information_value") or 0.76),
+                    observation_type=str(spec.get("observation_type") or "imaging_finding"),
+                    anatomy=str(spec.get("anatomy") or ""),
+                    rule_id=str(spec.get("rule_id") or finding),
+                )
+                atomic.append(
+                    {
+                        "concept": item.finding,
+                        "polarity": item.polarity,
+                        "source_span": item.source_text,
+                        "observation_type": item.observation_type,
+                        "anatomical_site": item.anatomy,
+                        "confidence": item.confidence,
+                    }
+                )
+            elif _matched_negative(text, spec["terms"]):
+                item = add_observation(
+                    finding,
+                    polarity="negative",
+                    confidence=0.84,
+                    information_value=float(spec.get("information_value") or 0.7),
+                    observation_type=str(spec.get("observation_type") or "imaging_finding"),
+                    anatomy=str(spec.get("anatomy") or ""),
+                    rule_id=f"{spec.get('rule_id') or finding}_negative",
+                )
+                atomic.append(
+                    {
+                        "concept": item.finding,
+                        "polarity": item.polarity,
+                        "source_span": item.source_text,
+                        "observation_type": item.observation_type,
+                        "anatomical_site": item.anatomy,
+                        "confidence": item.confidence,
+                    }
+                )
+
+        relation_status_by_claim: Dict[str, str] = {}
+        if _has_any(text, _RADIATION_FIELD_WITHIN_TERMS):
+            item = add_observation(
+                "lesion_within_prior_radiation_field",
+                confidence=0.92,
+                evidence_level="explicit_relation",
+                information_value=0.9,
+                observation_type="imaging_finding",
+                anatomy="lung",
+                rule_id="lesion_within_prior_radiation_field",
+            )
+            relations.append(
+                {
+                    "relation_type": "lesion_within_prior_radiation_field",
+                    "subject": "pulmonary_lesion",
+                    "object": "prior_radiation_field",
+                    "polarity": "positive",
+                    "source_span": item.source_text,
+                    "observation_ref": item.finding,
+                }
+            )
+            relation_status_by_claim["radiation_field_lung_consistency"] = SUPPORTED
+        if _has_any(text, _RADIATION_FIELD_OUTSIDE_TERMS):
+            item = add_observation(
+                "lesion_outside_prior_radiation_field",
+                confidence=0.92,
+                evidence_level="explicit_relation",
+                information_value=0.9,
+                observation_type="imaging_finding",
+                anatomy="lung",
+                rule_id="lesion_outside_prior_radiation_field",
+            )
+            relations.append(
+                {
+                    "relation_type": "lesion_outside_prior_radiation_field",
+                    "subject": "pulmonary_lesion",
+                    "object": "prior_radiation_field",
+                    "polarity": "positive",
+                    "source_span": item.source_text,
+                    "observation_ref": item.finding,
+                }
+            )
+            relation_status_by_claim["radiation_field_lung_consistency"] = CONTRADICTED
+
+        claim_matches = self._match_target_claims(
+            binding.target_claims,
+            observations,
+            relation_status_by_claim,
+        )
+        supported = [item for item in claim_matches if item.get("claim_status") == SUPPORTED]
+        contradicted = [item for item in claim_matches if item.get("claim_status") == CONTRADICTED]
+        if supported:
+            result.status = POSITIVE
+            result.gap_closure_assessment = "positive_closed"
+            result.gap_resolution_status = RESOLVED_SUPPORTED
+        elif contradicted:
+            result.status = NEGATIVE
+            result.gap_closure_assessment = "negative_closed"
+            result.gap_resolution_status = RESOLVED_CONTRADICTED
+        elif observations:
+            result.status = INCONCLUSIVE
+            result.gap_closure_assessment = "partial"
+            result.gap_resolution_status = GAP_UNRESOLVED
+        else:
+            result.status = UNRESOLVED
+            result.gap_closure_assessment = "not_closed"
+            result.gap_resolution_status = OPEN
+
+        for item in observations:
+            item.gap_closure_assessment = result.gap_closure_assessment
+        result.observations = _dedupe_observations(observations)
+        result.atomic_observations = atomic
+        result.relation_observations = relations
+        result.claim_matches = claim_matches
+        matched_claims = {
+            str(item.get("target_claim") or "")
+            for item in claim_matches
+            if item.get("claim_status") in {SUPPORTED, CONTRADICTED}
+        }
+        result.unmatched_target_claims = [
+            claim for claim in binding.target_claims or [] if claim not in matched_claims
+        ]
+        result.matched_rules = list(dict.fromkeys(matched))
+        result.material_evidence_delta = _material_evidence_delta(
+            result.observations,
+            claim_matches,
+            result.gap_resolution_status,
+        )
+        return result
+
+    @staticmethod
+    def _match_target_claims(
+        target_claims: Sequence[str],
+        observations: Sequence[Observation],
+        relation_status_by_claim: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        findings = {item.finding: item for item in observations or []}
+        matches: List[Dict[str, Any]] = []
+        for claim in target_claims or []:
+            claim_id = str(claim or "").strip()
+            if not claim_id:
+                continue
+            status = relation_status_by_claim.get(claim_id, CLAIM_UNRESOLVED)
+            supporting: List[str] = []
+            contradicting: List[str] = []
+            if status == SUPPORTED:
+                supporting = ["lesion_within_prior_radiation_field"]
+            elif status == CONTRADICTED:
+                contradicting = ["lesion_outside_prior_radiation_field"]
+            elif claim_id in findings:
+                obs = findings[claim_id]
+                if obs.polarity == "negative":
+                    status = CONTRADICTED
+                    contradicting = [claim_id]
+                else:
+                    status = SUPPORTED
+                    supporting = [claim_id]
+            matches.append(
+                {
+                    "target_claim": claim_id,
+                    "claim_status": status,
+                    "supporting_observations": supporting,
+                    "contradicting_observations": contradicting,
+                    "matcher_version": "target_claim_matcher_v1",
+                }
+            )
+        return matches
 
     def _parse_pavm(
         self,
@@ -406,9 +654,21 @@ def binding_from_authorization_detail(
     target_candidates = _text_list(detail.get("target_candidates") or [])
     candidate = target_candidates[0] if target_candidates else ""
     entity_id = str(detail.get("entity_id") or "")
+    if not entity_id:
+        entity_id = next(
+            (
+                item
+                for item in target_candidates
+                if re.match(r"^D\d+", str(item or "").strip(), flags=re.IGNORECASE)
+            ),
+            "",
+        )
     binding = ExamResultIntentBinding(
         binding_id=_stable_id("binding", order_id),
         order_id=order_id,
+        exam_intent_id=str(detail.get("exam_intent_id") or _stable_id("intent", order_id)),
+        execution_id=str(detail.get("execution_id") or _stable_id("execution", order_id, actual_result_exam or requested_exam)),
+        result_id=str(detail.get("result_id") or _stable_id("result", order_id, actual_result_exam or requested_exam)),
         requested_exam=str(detail.get("requested_exam") or requested_exam),
         resolved_exam=str(detail.get("resolved_exam") or detail.get("exam") or requested_exam),
         actual_result_exam=actual_result_exam,
@@ -432,6 +692,150 @@ def binding_from_authorization_detail(
     if not binding.planned_resolution_type:
         binding.planned_resolution_type = resolution
     return binding
+
+
+_TERMS_BY_FINDING: Dict[str, Tuple[str, ...]] = {
+    "ground_glass_opacity": (
+        "\u78e8\u73bb\u7483\u5f71",
+        "\u78e8\u73bb\u7483\u5bc6\u5ea6\u5f71",
+        "ground glass",
+        "ground-glass",
+        "ggo",
+    ),
+    "pulmonary_consolidation": (
+        "\u5b9e\u53d8",
+        "\u80ba\u5b9e\u53d8",
+        "consolidation",
+    ),
+    "pulmonary_infiltrate": (
+        "\u6d78\u6da6\u5f71",
+        "\u7247\u72b6\u9634\u5f71",
+        "\u6591\u7247\u72b6\u5f71",
+        "\u80ba\u90e8\u6d78\u6da6",
+        "infiltrate",
+        "opacity",
+    ),
+    "pulmonary_volume_loss": (
+        "\u5bb9\u79ef\u51cf\u5c0f",
+        "\u80ba\u5bb9\u79ef\u51cf\u5c0f",
+        "\u4f53\u79ef\u7f29\u5c0f",
+        "volume loss",
+    ),
+    "pleural_effusion": (
+        "\u80f8\u8154\u79ef\u6db2",
+        "pleural effusion",
+    ),
+    "pulmonary_arterial_filling_defect": (
+        "\u5145\u76c8\u7f3a\u635f",
+        "filling defect",
+    ),
+    "mitral_regurgitant_jet": (
+        "\u4e8c\u5c16\u74e3\u53cd\u6d41\u675f",
+        "\u53cd\u6d41\u675f",
+        "regurgitant jet",
+    ),
+}
+
+_GENERIC_ATOMIC_RULES: Tuple[Tuple[str, Dict[str, Any]], ...] = (
+    (
+        "ground_glass_opacity",
+        {
+            "terms": _TERMS_BY_FINDING["ground_glass_opacity"],
+            "confidence": 0.9,
+            "information_value": 0.86,
+            "observation_type": "imaging_finding",
+            "anatomy": "lung",
+            "rule_id": "semantic_ground_glass_opacity",
+        },
+    ),
+    (
+        "pulmonary_consolidation",
+        {
+            "terms": _TERMS_BY_FINDING["pulmonary_consolidation"],
+            "confidence": 0.88,
+            "information_value": 0.82,
+            "observation_type": "imaging_finding",
+            "anatomy": "lung",
+            "rule_id": "semantic_pulmonary_consolidation",
+        },
+    ),
+    (
+        "pulmonary_infiltrate",
+        {
+            "terms": _TERMS_BY_FINDING["pulmonary_infiltrate"],
+            "confidence": 0.84,
+            "information_value": 0.74,
+            "observation_type": "imaging_finding",
+            "anatomy": "lung",
+            "rule_id": "semantic_pulmonary_infiltrate",
+        },
+    ),
+    (
+        "pulmonary_volume_loss",
+        {
+            "terms": _TERMS_BY_FINDING["pulmonary_volume_loss"],
+            "confidence": 0.86,
+            "information_value": 0.76,
+            "observation_type": "imaging_finding",
+            "anatomy": "lung",
+            "rule_id": "semantic_pulmonary_volume_loss",
+        },
+    ),
+    (
+        "pleural_effusion",
+        {
+            "terms": _TERMS_BY_FINDING["pleural_effusion"],
+            "confidence": 0.86,
+            "information_value": 0.72,
+            "observation_type": "imaging_finding",
+            "anatomy": "pleura",
+            "rule_id": "semantic_pleural_effusion",
+        },
+    ),
+    (
+        "pulmonary_arterial_filling_defect",
+        {
+            "terms": _TERMS_BY_FINDING["pulmonary_arterial_filling_defect"],
+            "confidence": 0.9,
+            "information_value": 0.88,
+            "observation_type": "imaging_finding",
+            "anatomy": "pulmonary_artery",
+            "rule_id": "semantic_pulmonary_arterial_filling_defect",
+        },
+    ),
+    (
+        "mitral_regurgitant_jet",
+        {
+            "terms": _TERMS_BY_FINDING["mitral_regurgitant_jet"],
+            "confidence": 0.92,
+            "information_value": 0.9,
+            "observation_type": "imaging_finding",
+            "anatomy": "mitral_valve",
+            "rule_id": "semantic_mitral_regurgitant_jet",
+        },
+    ),
+)
+
+_RADIATION_FIELD_WITHIN_TERMS: Tuple[str, ...] = (
+    "\u5c40\u9650\u4e8e\u65e2\u5f80\u653e\u7597\u7167\u5c04\u91ce\u5185",
+    "\u4f4d\u4e8e\u65e2\u5f80\u653e\u7597\u7167\u5c04\u91ce\u5185",
+    "\u7b26\u5408\u65e2\u5f80\u653e\u7597\u91ce\u5206\u5e03",
+    "\u653e\u7597\u91ce\u5185",
+    "\u7167\u5c04\u91ce\u5185",
+    "within prior radiation field",
+    "within the radiation field",
+)
+
+_RADIATION_FIELD_OUTSIDE_TERMS: Tuple[str, ...] = (
+    "\u8d85\u51fa\u65e2\u5f80\u7167\u5c04\u533a\u57df",
+    "\u8d85\u51fa\u539f\u7167\u5c04\u533a\u57df",
+    "\u660e\u663e\u8d85\u51fa\u653e\u7597\u91ce",
+    "\u4e0d\u7b26\u5408\u653e\u7597\u91ce\u5206\u5e03",
+    "\u5f25\u6f2b\u5206\u5e03\u4e8e\u53cc\u80ba",
+    "outside prior radiation field",
+    "beyond the radiation field",
+    "diffuse non-field distribution",
+)
 
 
 def _capability_for_exam(
@@ -509,6 +913,22 @@ def _support_span(text: str, marker: str) -> str:
     return text[start:end].strip()
 
 
+def _support_span_for_terms(text: str, terms: Iterable[str]) -> str:
+    if not text:
+        return ""
+    compact_text = _compact(text)
+    for term in terms or []:
+        compact_term = _compact(term)
+        if compact_term and compact_term in compact_text:
+            raw_term = str(term or "").strip()
+            if raw_term and raw_term in text:
+                start = max(0, text.find(raw_term) - 60)
+                end = min(len(text), text.find(raw_term) + len(raw_term) + 180)
+                return text[start:end].strip()
+            return text[:320]
+    return text[:320]
+
+
 def _dedupe_observations(values: Sequence[Observation]) -> List[Observation]:
     best: Dict[Tuple[str, str], Observation] = {}
     for item in values or []:
@@ -527,8 +947,92 @@ def _dedupe_observations(values: Sequence[Observation]) -> List[Observation]:
     return list(best.values())
 
 
+def _material_evidence_delta(
+    observations: Sequence[Observation],
+    claim_matches: Sequence[Dict[str, Any]],
+    gap_resolution_status: str,
+) -> Dict[str, Any]:
+    new_observations = [
+        item.finding
+        for item in observations or []
+        if item.polarity == "positive"
+    ]
+    changed_observations = [
+        item.finding
+        for item in observations or []
+        if item.polarity == "negative"
+    ]
+    relation_observations = [
+        item.finding
+        for item in observations or []
+        if item.evidence_level == "explicit_relation"
+    ]
+    claim_status_changes = [
+        {
+            "target_claim": item.get("target_claim"),
+            "claim_status": item.get("claim_status"),
+        }
+        for item in claim_matches or []
+        if item.get("claim_status") in {SUPPORTED, CONTRADICTED}
+    ]
+    gap_changed = gap_resolution_status in {
+        RESOLVED_SUPPORTED,
+        RESOLVED_CONTRADICTED,
+    }
+    return {
+        "new_observations": list(dict.fromkeys(new_observations)),
+        "changed_observations": list(dict.fromkeys(changed_observations)),
+        "new_relation_observations": list(dict.fromkeys(relation_observations)),
+        "claim_status_changes": claim_status_changes,
+        "gap_status_changes": [gap_resolution_status] if gap_changed else [],
+        "duplicate_observations": [],
+        "non_material_observations": [],
+        "material_evidence_changed": bool(
+            new_observations or changed_observations or claim_status_changes or gap_changed
+        ),
+    }
+
+
+def _matched_positive(text: str, terms: Iterable[str]) -> bool:
+    compact_text = _compact(text)
+    for term in terms or []:
+        compact_term = _compact(term)
+        if not compact_term or compact_term not in compact_text:
+            continue
+        if _term_is_negated(text, str(term)):
+            continue
+        return True
+    return False
+
+
+def _matched_negative(text: str, terms: Iterable[str]) -> bool:
+    compact_text = _compact(text)
+    for term in terms or []:
+        compact_term = _compact(term)
+        if compact_term and compact_term in compact_text and _term_is_negated(text, str(term)):
+            return True
+    return False
+
+
+def _term_is_negated(text: str, term: str) -> bool:
+    if not text or not term:
+        return False
+    index = text.find(term)
+    if index < 0:
+        compact_text = _compact(text)
+        compact_term = _compact(term)
+        compact_index = compact_text.find(compact_term)
+        if compact_index < 0:
+            return False
+        window = compact_text[max(0, compact_index - 12): compact_index + len(compact_term)]
+        return any(token in window for token in ("未见", "无", "否认", "没有", "no", "without"))
+    window = text[max(0, index - 16): index + len(term)]
+    return any(token in window.lower() for token in ("未见", "无", "否认", "没有", "no ", "without"))
+
+
 def _has_any(text: str, terms: Iterable[str]) -> bool:
-    return any(_compact(term) in text for term in terms if str(term or "").strip())
+    haystack = _compact(text)
+    return any(_compact(term) in haystack for term in terms if str(term or "").strip())
 
 
 def _compact(value: Any) -> str:
