@@ -8,7 +8,6 @@
         "lung_injury"
       ],
       "children": [
-        "pneumonia_infiltrate",
         "ground_glass_opacity",
         "pulmonary_inflammatory_change",
         "pulmonary_infiltrate",
@@ -21,10 +20,60 @@
         "objective_organ_injury"
       ]
     },
+    "pulmonary_infiltrate": {
+      "aliases": [
+        "lung_infiltrate",
+        "patchy_opacity",
+        "pulmonary_patchy_shadow"
+      ],
+      "children": [],
+      "role_hints": [
+        "objective_organ_injury"
+      ]
+    },
+    "pulmonary_consolidation": {
+      "aliases": [
+        "lung_consolidation"
+      ],
+      "children": [],
+      "role_hints": [
+        "objective_organ_injury"
+      ]
+    },
+    "ground_glass_opacity": {
+      "aliases": [
+        "ggo",
+        "ground_glass_change"
+      ],
+      "children": [],
+      "role_hints": [
+        "objective_organ_injury"
+      ]
+    },
+    "radiotherapy": {
+      "aliases": [
+        "radiation_therapy",
+        "history_of_radiotherapy"
+      ],
+      "children": [
+        "history_of_radiotherapy",
+        "thoracic_radiotherapy"
+      ],
+      "role_hints": []
+    },
+    "history_of_radiotherapy": {
+      "aliases": [
+        "radiotherapy_history"
+      ],
+      "children": [],
+      "role_hints": []
+    },
     "thoracic_radiotherapy": {
       "aliases": [
         "chest_radiotherapy",
         "lung_radiotherapy",
+        "mediastinal_radiotherapy",
+        "breast_radiotherapy",
         "history_of_thoracic_radiotherapy"
       ],
       "children": [],

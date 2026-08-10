@@ -54,6 +54,40 @@ def radiation_evidence() -> EvidenceBundle:
     )
 
 
+def typed_radiation_relation_evidence() -> EvidenceBundle:
+    return EvidenceBundle(
+        [
+            Observation(
+                "thoracic_radiotherapy",
+                "patient_reported_observation",
+                anatomy="thorax",
+                temporality="3\u4e2a\u6708\u524d",
+                observation_type="treatment_history",
+                semantic_level="fact",
+                confidence=0.94,
+                information_value=0.9,
+            ),
+            Observation(
+                "dyspnea",
+                "patient_reported_observation",
+                observation_type="symptom",
+                semantic_level="fact",
+                confidence=0.88,
+                information_value=0.62,
+            ),
+            Observation(
+                "pulmonary_infiltrate",
+                "imaging_result",
+                anatomy="lung",
+                observation_type="imaging_finding",
+                semantic_level="fact",
+                confidence=0.92,
+                information_value=0.92,
+            ),
+        ]
+    )
+
+
 def radiation_hypothesis():
     return {
         "pattern_hypothesis_id": "PH_RAD_001",
@@ -131,6 +165,191 @@ class PatternHypothesisTests(unittest.TestCase):
                 for item in context["pattern_recall_signals"]
             )
         )
+
+    def test_typed_radiation_relation_activates_without_temporal_observation(self):
+        evidence = typed_radiation_relation_evidence()
+        binding = EvidenceRelationBinder(evidence.observations, self.verifier.evidence_ontology).bind(
+            "exposure_temporal_organ_injury"
+        )
+        audit = binding["audit"]
+        self.assertEqual(audit["activation_status"], "activated")
+        self.assertEqual(audit["missing_slots"], [])
+        self.assertIn("exposure", audit["bound_slots"])
+        self.assertIn("organ_manifestation", audit["bound_slots"])
+        self.assertIn("imaging_or_objective_finding", audit["bound_slots"])
+        constraints = {
+            item["constraint_type"]: item["status"]
+            for item in audit["constraint_results"]
+        }
+        self.assertEqual(constraints["temporal_after"], "satisfied")
+        self.assertEqual(constraints["anatomical_consistency"], "satisfied")
+
+        context = self.engine.build_pattern_recall_context(
+            {},
+            evidence,
+            case_id="Patient_03674",
+            evidence_snapshot_id="ES_TYPED_RAD",
+        )
+        self.assertTrue(context["pattern_hypotheses"])
+        self.assertTrue(context["pattern_recall_signals"])
+        self.assertTrue(
+            any(
+                item["entity_id"] == "D100058"
+                for item in context["pattern_recall_signals"]
+            )
+        )
+
+    def test_generic_radiotherapy_history_is_partial_not_activated(self):
+        evidence = EvidenceBundle(
+            [
+                Observation(
+                    "history_of_radiotherapy",
+                    "patient_reported_observation",
+                    observation_type="treatment_history",
+                    semantic_level="fact",
+                    confidence=0.86,
+                ),
+                Observation(
+                    "dyspnea",
+                    "patient_reported_observation",
+                    observation_type="symptom",
+                    semantic_level="fact",
+                    confidence=0.88,
+                ),
+                Observation(
+                    "pulmonary_infiltrate",
+                    "imaging_result",
+                    anatomy="lung",
+                    observation_type="imaging_finding",
+                    semantic_level="fact",
+                    confidence=0.92,
+                ),
+            ]
+        )
+        audit = EvidenceRelationBinder(evidence.observations, self.verifier.evidence_ontology).bind(
+            "exposure_temporal_organ_injury"
+        )["audit"]
+        self.assertEqual(audit["activation_status"], "partial")
+        self.assertIn("exposure", audit["missing_slots"])
+
+    def test_objective_injury_prefers_canonical_imaging_over_field_finding(self):
+        evidence = EvidenceBundle(
+            [
+                Observation(
+                    "thoracic_radiotherapy",
+                    "patient_reported_observation",
+                    anatomy="thorax",
+                    temporality="3\u4e2a\u6708\u524d",
+                    observation_type="treatment_history",
+                    semantic_level="fact",
+                    confidence=0.94,
+                ),
+                Observation(
+                    "dyspnea",
+                    "patient_reported_observation",
+                    observation_type="symptom",
+                    semantic_level="fact",
+                    confidence=0.88,
+                ),
+                Observation(
+                    "field:0",
+                    "imaging_result",
+                    anatomy="lung",
+                    observation_type="imaging_finding",
+                    semantic_level="fact",
+                    confidence=0.95,
+                    information_value=0.08,
+                ),
+                Observation(
+                    "pulmonary_consolidation",
+                    "imaging_result",
+                    anatomy="lung",
+                    observation_type="imaging_finding",
+                    semantic_level="fact",
+                    confidence=0.9,
+                    information_value=0.9,
+                ),
+            ]
+        )
+        audit = EvidenceRelationBinder(evidence.observations, self.verifier.evidence_ontology).bind(
+            "exposure_temporal_organ_injury"
+        )["audit"]
+        objective = audit["supporting_evidence"]["imaging_or_objective_finding"]
+        self.assertEqual(objective["canonical_concept"], "pulmonary_consolidation")
+
+    def test_non_pulmonary_imaging_does_not_fill_pulmonary_objective_slot(self):
+        evidence = EvidenceBundle(
+            [
+                Observation(
+                    "thoracic_radiotherapy",
+                    "patient_reported_observation",
+                    anatomy="thorax",
+                    temporality="3\u4e2a\u6708\u524d",
+                    observation_type="treatment_history",
+                    semantic_level="fact",
+                    confidence=0.94,
+                ),
+                Observation(
+                    "dyspnea",
+                    "patient_reported_observation",
+                    observation_type="symptom",
+                    semantic_level="fact",
+                    confidence=0.88,
+                ),
+                Observation(
+                    "osteophyte",
+                    "imaging_result",
+                    anatomy="spine",
+                    observation_type="imaging_finding",
+                    semantic_level="fact",
+                    confidence=0.95,
+                    information_value=0.8,
+                ),
+            ]
+        )
+        audit = EvidenceRelationBinder(evidence.observations, self.verifier.evidence_ontology).bind(
+            "exposure_temporal_organ_injury"
+        )["audit"]
+        self.assertIn("imaging_or_objective_finding", audit["missing_slots"])
+
+    def test_pelvic_radiotherapy_does_not_activate_pulmonary_injury_relation(self):
+        evidence = EvidenceBundle(
+            [
+                Observation(
+                    "thoracic_radiotherapy",
+                    "patient_reported_observation",
+                    anatomy="pelvis",
+                    temporality="3\u4e2a\u6708\u524d",
+                    observation_type="treatment_history",
+                    semantic_level="fact",
+                    confidence=0.94,
+                ),
+                Observation(
+                    "dyspnea",
+                    "patient_reported_observation",
+                    observation_type="symptom",
+                    semantic_level="fact",
+                    confidence=0.88,
+                ),
+                Observation(
+                    "pulmonary_infiltrate",
+                    "imaging_result",
+                    anatomy="lung",
+                    observation_type="imaging_finding",
+                    semantic_level="fact",
+                    confidence=0.92,
+                ),
+            ]
+        )
+        audit = EvidenceRelationBinder(evidence.observations, self.verifier.evidence_ontology).bind(
+            "exposure_temporal_organ_injury"
+        )["audit"]
+        self.assertEqual(audit["activation_status"], "partial")
+        constraints = {
+            item["constraint_type"]: item["status"]
+            for item in audit["constraint_results"]
+        }
+        self.assertEqual(constraints["anatomical_consistency"], "unresolved")
 
     def test_reasoning_inference_source_is_rejected(self):
         evidence = radiation_evidence()

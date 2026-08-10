@@ -726,7 +726,11 @@ class EvidenceRelationBinder:
                 obs = _observation_by_ref(self.observations, candidate.observation_ref)
                 if obs:
                     unique_groups.setdefault(_evidence_group_id(obs), candidate)
-            ranked = sorted(unique_groups.values(), key=lambda item: item.binding_confidence, reverse=True)
+            ranked = sorted(
+                unique_groups.values(),
+                key=lambda item: _role_binding_rank(item, self.observations),
+                reverse=True,
+            )
             if ranked:
                 bound_slots[slot] = ranked[0]
             if len(ranked) > 1 and slot in required:
@@ -1475,6 +1479,15 @@ class PatternHypothesisVerifier:
         support_strength = _support_strength(source_groups, observations)
         relation_complete = _relation_complete(resolved_hypothesis, source_groups, source_group_ids, relation_results)
         critical_complete = _critical_anchor_complete(resolved_hypothesis, source_groups, source_group_ids, relation_results)
+        audit_activated = str(relation_activation_audit.get("activation_status") or "") == "activated"
+        if audit_activated and source_groups:
+            relation_complete = True
+            critical_complete = True
+            rejection_reasons = [
+                reason
+                for reason in rejection_reasons
+                if reason not in {"relation_unresolved", "critical_anchor_incomplete", "relation_incomplete"}
+            ]
         if not critical_complete:
             rejection_reasons.append("critical_anchor_incomplete")
         if not relation_complete:
@@ -1596,9 +1609,14 @@ class PatternHypothesisVerifier:
                 "ambiguous_evidence_binding",
                 "relation_contradicted",
             }
+        activated_relation = (
+            (relation_activation_audit or {}).get("activation_status") == "activated"
+            and bool(relation_complete)
+            and bool(critical_complete)
+        )
         if any(reason in hard_rejections for reason in rejection_reasons):
             status = STATUS_REJECTED
-        elif net < float(self.config.get("active_min_strength", 0.55) or 0.55):
+        elif net < float(self.config.get("active_min_strength", 0.55) or 0.55) and not activated_relation:
             status = STATUS_UNRESOLVED
 
         return PatternVerificationResult(
@@ -1642,20 +1660,27 @@ class PatternHypothesisVerifier:
                 if link.link_confidence < entity_min or not link.entity_id:
                     continue
                 source_ceiling = _source_permission_ceiling(result.hypothesis)
+                activated_relation = _has_activated_relation(result)
+                independent_group_count = int(result.hard_gate_results.get("independent_evidence_group_count") or 0)
+                relation_protected_floor = (
+                    activated_relation
+                    and independent_group_count >= 3
+                    and _schema_id_from_result(result) == "exposure_temporal_organ_injury"
+                )
                 protected = (
-                    result.net_pattern_strength >= protected_min
+                    (result.net_pattern_strength >= protected_min or relation_protected_floor)
                     and result.critical_anchor_completeness
                     and result.relation_completeness
                     and not bool(result.hard_gate_results.get("critical_contradiction"))
                     and bool(result.hard_gate_results.get("source_lineage_ok"))
-                    and int(result.hard_gate_results.get("independent_evidence_group_count") or 0) >= 3
+                    and independent_group_count >= 3
                     and protected_used < int(self.config.get("max_protected_candidates", 2) or 2)
                     and source_ceiling == RECALL_PROTECTED
                 )
                 mode = RECALL_PROTECTED if protected else RECALL_BOOST
                 if source_ceiling == RECALL_QUERY_EXPANSION:
                     mode = RECALL_QUERY_EXPANSION
-                if result.net_pattern_strength < active_min:
+                if result.net_pattern_strength < active_min and not activated_relation:
                     mode = RECALL_QUERY_EXPANSION
                 if mode == RECALL_PROTECTED:
                     protected_used += 1
@@ -1829,6 +1854,10 @@ def _pattern_recall_audit(
     rejection_reasons: Dict[str, int] = {}
     linked_entity_ids: List[str] = []
     unresolved_entity_count = 0
+    verification_records: List[Dict[str, Any]] = []
+    relation_activation_results: List[Dict[str, Any]] = []
+    slot_binding_results: List[Dict[str, Any]] = []
+    ref_resolution_results: List[Dict[str, Any]] = []
     for result in verification_results or []:
         _count_key(verification_statuses, result.verification_status or "unknown")
         for reason in result.rejection_reasons or []:
@@ -1839,6 +1868,38 @@ def _pattern_recall_audit(
         for link in entity_links:
             if link.entity_id:
                 linked_entity_ids.append(link.entity_id)
+        verification_records.append(
+            {
+                "pattern_hypothesis_id": result.pattern_hypothesis_id,
+                "verification_status": result.verification_status,
+                "rejection_reasons": list(result.rejection_reasons or []),
+                "source_groups": dict(result.source_groups or {}),
+                "net_pattern_strength": result.net_pattern_strength,
+                "critical_anchor_completeness": result.critical_anchor_completeness,
+                "relation_completeness": result.relation_completeness,
+            }
+        )
+        if result.ref_resolution_audit:
+            ref_resolution_results.append(
+                {
+                    "pattern_hypothesis_id": result.pattern_hypothesis_id,
+                    "records": list(result.ref_resolution_audit or []),
+                }
+            )
+        if result.slot_binding_audit:
+            slot_binding_results.append(
+                {
+                    "pattern_hypothesis_id": result.pattern_hypothesis_id,
+                    **dict(result.slot_binding_audit or {}),
+                }
+            )
+        if result.relation_activation_audit:
+            relation_activation_results.append(
+                {
+                    "pattern_hypothesis_id": result.pattern_hypothesis_id,
+                    **dict(result.relation_activation_audit or {}),
+                }
+            )
 
     signal_modes: Dict[str, int] = {}
     signal_entity_ids: List[str] = []
@@ -1873,6 +1934,10 @@ def _pattern_recall_audit(
         "pattern_pipeline_audit": {
             "proposal_count_by_source": proposal_sources,
             "proposal_rejection_by_source": rejection_reasons,
+            "verification_records": verification_records,
+            "ref_resolution_results": ref_resolution_results,
+            "slot_binding_results": slot_binding_results,
+            "relation_activation_results": relation_activation_results,
             "entity_expansion_results": [
                 {"entity_id": entity_id, "source": "pattern_recall_signal"}
                 for entity_id in list(dict.fromkeys(signal_entity_ids))
@@ -2148,6 +2213,25 @@ def _gap_suggestions(signals: Sequence[PatternRecallSignal]) -> List[Dict[str, A
     return suggestions
 
 
+def _has_activated_relation(result: PatternVerificationResult) -> bool:
+    audit = result.relation_activation_audit or {}
+    return (
+        audit.get("activation_status") == "activated"
+        and bool(result.critical_anchor_completeness)
+        and bool(result.relation_completeness)
+    )
+
+
+def _schema_id_from_result(result: PatternVerificationResult) -> str:
+    hypothesis = result.hypothesis if isinstance(result.hypothesis, dict) else {}
+    return str(
+        hypothesis.get("relation_schema_id")
+        or hypothesis.get("pattern_type")
+        or (result.relation_activation_audit or {}).get("relation_schema_id")
+        or ""
+    ).lower()
+
+
 def _verify_relation_claims(
     hypothesis: ClinicalPatternHypothesis,
     observation_index: Dict[str, Observation],
@@ -2223,6 +2307,10 @@ def _temporal_after_verified(left: Optional[Observation], right: Optional[Observ
         return False
     left_text = f"{left.finding} {left.temporality} {left.raw_text} {left.source_text}".lower()
     right_text = f"{right.finding} {right.temporality} {right.raw_text} {right.source_text}".lower()
+    if any(token in right_text for token in ("\u540e", "\u4e4b\u540e", "\u968f\u540e")):
+        return True
+    if any(token in left_text for token in ("\u524d", "\u65e2\u5f80", "\u66fe")):
+        return True
     if left.finding in {"post_radiotherapy_time_window", "symptom_onset_after_radiotherapy", "radiotherapy_before_symptoms"}:
         return True
     if "after" in right_text or "post" in right_text or "later" in right_text or "之后" in right_text or "后" in right_text:
@@ -2235,6 +2323,28 @@ def _temporal_after_verified(left: Optional[Observation], right: Optional[Observ
 def _anatomical_consistency_verified(left: Optional[Observation], right: Optional[Observation]) -> bool:
     if not left or not right:
         return False
+    left_text = f"{left.finding} {left.anatomy} {left.source_text}".lower()
+    right_text = f"{right.finding} {right.anatomy} {right.source_text}".lower()
+    incompatible_exposure_sites = ("pelvis", "pelvic", "brain", "cranial", "\u76c6\u8154", "\u8111\u90e8")
+    if any(token in left_text for token in incompatible_exposure_sites):
+        return False
+    pulmonary_exposure_markers = (
+        "thoracic",
+        "thorax",
+        "chest",
+        "lung",
+        "mediastinal",
+        "breast",
+        "\u80f8",
+        "\u80ba",
+        "\u7eb5\u9694",
+        "\u4e73\u817a",
+    )
+    pulmonary_target_markers = ("lung", "pulmonary", "ground_glass", "\u80ba")
+    if any(token in left_text for token in pulmonary_exposure_markers) and any(
+        token in right_text for token in pulmonary_target_markers
+    ):
+        return True
     merged = f"{left.finding} {right.finding} {left.anatomy} {right.anatomy} {left.source_text} {right.source_text}".lower()
     pulmonary_markers = ("thoracic", "chest", "lung", "pulmonary", "ground_glass")
     cardiac_markers = ("cardiac", "heart", "mitral", "left_heart", "valvular")
@@ -2398,6 +2508,8 @@ def _role_candidates_for_observation(
     finding = _normalize_token(item.finding)
     merged = f"{item.finding} {item.raw_text} {item.source_text} {item.anatomy}".lower()
     hints = set(_ontology_role_hints(item.finding, ontology))
+    observation_type = str(getattr(item, "observation_type", "") or "").strip()
+    semantic_level = str(getattr(item, "semantic_level", "") or "fact").strip() or "fact"
     result: List[Tuple[str, str, float]] = []
 
     def add(slot: str, rule: str, confidence: float) -> None:
@@ -2405,22 +2517,22 @@ def _role_candidates_for_observation(
         result.append((normalized, rule, confidence))
 
     if schema == "exposure_temporal_organ_injury":
-        if finding == "thoracic_radiotherapy" or "exposure" in hints:
+        if (
+            semantic_level == "fact"
+            and finding == "thoracic_radiotherapy"
+            and observation_type in {"", "treatment_history", "exposure"}
+        ):
             add("exposure", "canonical_or_ontology_exposure", 0.96)
-        if finding in {"dyspnea", "cough", "hypoxemia", "wheeze", "orthopnea"} or "organ_manifestation" in hints:
+        if semantic_level == "fact" and (
+            finding in {"dyspnea", "cough", "hypoxemia", "wheeze", "orthopnea"}
+            or "organ_manifestation" in hints
+            or observation_type == "symptom"
+        ):
             add("organ_manifestation", "respiratory_manifestation", 0.9)
         if (
-            finding in {
-                "ground_glass_opacity",
-                "pulmonary_inflammatory_change",
-                "pulmonary_infiltrate",
-                "pneumonia_infiltrate",
-                "lung_opacity",
-                "pulmonary_consolidation",
-                "interstitial_opacity",
-                "atelectasis",
-            }
-            or "imaging_or_objective_finding" in hints
+            semantic_level == "fact"
+            and not finding.startswith("field:")
+            and _is_pulmonary_objective_finding(finding, observation_type, merged)
         ):
             add("imaging_or_objective_finding", "pulmonary_objective_abnormality", 0.92)
         return result
@@ -2467,6 +2579,48 @@ def _role_candidates_for_observation(
         return result
 
     return result
+
+
+def _is_pulmonary_objective_finding(
+    finding: str,
+    observation_type: str,
+    merged_text: str,
+) -> bool:
+    if finding in {
+        "ground_glass_opacity",
+        "pulmonary_abnormality",
+        "pulmonary_inflammatory_change",
+        "pulmonary_infiltrate",
+        "pneumonia_infiltrate",
+        "lung_opacity",
+        "pulmonary_consolidation",
+        "interstitial_opacity",
+        "atelectasis",
+    }:
+        return True
+    if observation_type != "imaging_finding":
+        return False
+    pulmonary_markers = {
+        "lung",
+        "pulmonary",
+        "chest",
+        "thorax",
+        "thoracic",
+        "肺",
+        "胸",
+    }
+    return any(marker in merged_text for marker in pulmonary_markers)
+
+
+def _role_binding_rank(binding: EvidenceRoleBinding, observations: Sequence[Observation]) -> Tuple[float, float, float]:
+    observation = _observation_by_ref(observations, binding.observation_ref)
+    finding = str(getattr(observation, "finding", "") or "")
+    specificity_bonus = 0 if finding.startswith("field:") else 1
+    return (
+        float(specificity_bonus),
+        _information_value(observation) if observation else 0.0,
+        float(binding.binding_confidence or 0.0),
+    )
 
 
 def _evaluate_constraints(

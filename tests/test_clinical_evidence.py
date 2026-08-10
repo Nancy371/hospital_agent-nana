@@ -231,8 +231,42 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
             },
         )
         findings = bundle.findings("positive")
-        self.assertIn("pneumonia_infiltrate", findings)
+        self.assertIn("pulmonary_consolidation", findings)
+        self.assertNotIn("pneumonia_infiltrate", findings)
         self.assertIn("bronchopneumonia", findings)
+
+    def test_radiotherapy_history_creates_typed_thoracic_treatment_fact(self):
+        bundle = self.normalizer.normalize(
+            {
+                "history": "\u60a3\u80053\u4e2a\u6708\u524d\u56e0\u80ba\u764c\u63a5\u53d7\u80f8\u90e8\u653e\u7597\uff0c\u968f\u540e\u51fa\u73b0\u54b3\u55fd\u6c14\u4fc3"
+            },
+            {},
+        )
+        observations = {item.finding: item for item in bundle.observations}
+        self.assertIn("history_of_radiotherapy", observations)
+        self.assertIn("thoracic_radiotherapy", observations)
+        radiotherapy = observations["thoracic_radiotherapy"]
+        self.assertEqual(radiotherapy.observation_type, "treatment_history")
+        self.assertEqual(radiotherapy.semantic_level, "fact")
+        self.assertEqual(radiotherapy.anatomy, "thorax")
+        self.assertIn("3", radiotherapy.temporality)
+
+    def test_generic_or_invalid_radiotherapy_history_does_not_create_thoracic_exposure(self):
+        generic = self.normalizer.normalize({"history": "\u65e2\u5f80\u63a5\u53d7\u8fc7\u653e\u7597"}, {})
+        generic_findings = generic.findings("positive")
+        self.assertIn("history_of_radiotherapy", generic_findings)
+        self.assertNotIn("thoracic_radiotherapy", generic_findings)
+
+        planned = self.normalizer.normalize({"history": "\u5efa\u8bae\u4e0b\u5468\u5f00\u59cb\u80f8\u90e8\u653e\u7597"}, {})
+        self.assertNotIn("history_of_radiotherapy", planned.findings("positive"))
+        self.assertNotIn("thoracic_radiotherapy", planned.findings("positive"))
+
+        family = self.normalizer.normalize({"history": "\u6bcd\u4eb2\u65e2\u5f80\u63a5\u53d7\u8fc7\u80f8\u90e8\u653e\u7597"}, {})
+        self.assertNotIn("history_of_radiotherapy", family.findings("positive"))
+        self.assertNotIn("thoracic_radiotherapy", family.findings("positive"))
+
+        negative = self.normalizer.normalize({"history": "\u5426\u8ba4\u63a5\u53d7\u8fc7\u653e\u7597"}, {})
+        self.assertNotIn("history_of_radiotherapy", negative.findings("positive"))
 
     def test_ugt1a1_gene_result_becomes_standard_finding(self):
         bundle = self.normalizer.normalize(

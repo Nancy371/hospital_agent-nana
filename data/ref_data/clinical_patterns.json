@@ -162,11 +162,10 @@
     "exposure_temporal_organ_injury": {
       "required_relation_slots": [
         "exposure",
-        "temporal_relation",
         "organ_manifestation",
         "imaging_or_objective_finding"
       ],
-      "minimum_independent_evidence_groups": 4,
+      "minimum_independent_evidence_groups": 3,
       "objective_evidence_requirement": true,
       "maximum_verification_level": "protected_recall",
       "temporal_constraints": {

@@ -887,6 +887,152 @@ _RAW_CASE_FIELD_KEYS = {
     "original_case",
 }
 
+_OBSERVATION_TYPE_BY_FINDING = {
+    "radiotherapy": "treatment_history",
+    "history_of_radiotherapy": "treatment_history",
+    "thoracic_radiotherapy": "treatment_history",
+    "pulmonary_infiltrate": "imaging_finding",
+    "ground_glass_opacity": "imaging_finding",
+    "pulmonary_consolidation": "imaging_finding",
+    "pulmonary_abnormality": "imaging_finding",
+    "pneumonia_infiltrate": "imaging_finding",
+    "bronchopneumonia_suspected": "imaging_finding",
+}
+
+_SEMANTIC_LEVEL_BY_FINDING = {
+    "bronchopneumonia_suspected": "clinical_impression",
+}
+
+_SYMPTOM_FINDINGS = {
+    "cough",
+    "dyspnea",
+    "wheeze",
+    "hypoxemia",
+    "orthopnea",
+    "fever",
+    "hemoptysis",
+    "weakness",
+    "dizziness",
+    "palpitation",
+}
+
+_SIGN_FINDINGS = {
+    "cyanosis",
+    "cardiac_murmur",
+    "bradycardia",
+    "petechiae",
+    "purpura",
+    "ecchymosis",
+}
+
+_LAB_FINDING_SUFFIXES = ("_low", "_high", "_positive", "_elevated")
+
+_RADIOTHERAPY_TERMS = (
+    "\u653e\u7597",
+    "\u653e\u5c04\u6cbb\u7597",
+    "\u653e\u5c04\u6027\u6cbb\u7597",
+    "radiotherapy",
+    "radiation therapy",
+)
+
+_THORACIC_RADIOTHERAPY_SITE_TERMS = {
+    "thorax": (
+        "\u80f8\u90e8",
+        "\u80f8\u5ed3",
+        "\u80f8\u58c1",
+        "\u7eb5\u9694",
+        "\u80ba\u90e8",
+        "\u80ba",
+        "\u4e73\u817a",
+        "\u4e73\u623f",
+        "thoracic",
+        "chest",
+        "lung",
+        "mediastinal",
+        "breast",
+    ),
+    "pelvis": ("\u76c6\u8154", "\u76c6\u9aa8", "\u5bab\u9888", "\u524d\u5217\u817a", "pelvic"),
+    "brain": ("\u5934\u9885", "\u8111\u90e8", "\u9885\u8111", "brain", "cranial"),
+}
+
+_RADIOTHERAPY_NEGATION_TERMS = (
+    "\u5426\u8ba4",
+    "\u672a\u63a5\u53d7",
+    "\u6ca1\u6709\u63a5\u53d7",
+    "\u65e0\u653e\u7597",
+    "\u4ece\u672a",
+    "denies",
+    "no radiotherapy",
+)
+
+_RADIOTHERAPY_UNCERTAIN_TERMS = (
+    "\u53ef\u80fd",
+    "\u7591\u4f3c",
+    "\u4e0d\u8be6",
+    "\u8bb0\u4e0d\u6e05",
+    "\u4e0d\u786e\u5b9a",
+    "possible",
+    "unclear",
+)
+
+_RADIOTHERAPY_PLANNED_TERMS = (
+    "\u8ba1\u5212",
+    "\u5efa\u8bae",
+    "\u62df",
+    "\u4e0b\u5468",
+    "\u5373\u5c06",
+    "\u51c6\u5907",
+    "planned",
+    "recommend",
+)
+
+_FAMILY_HISTORY_TERMS = (
+    "\u6bcd\u4eb2",
+    "\u7236\u4eb2",
+    "\u7236\u6bcd",
+    "\u5144\u5f1f",
+    "\u59d0\u59b9",
+    "\u5bb6\u65cf",
+    "mother",
+    "father",
+    "family",
+)
+
+_PULMONARY_INFILTRATE_TERMS = (
+    "\u80ba\u90e8\u6d78\u6da6",
+    "\u80ba\u6d78\u6da6",
+    "\u7247\u72b6\u9634\u5f71",
+    "\u6591\u7247\u72b6\u9634\u5f71",
+    "\u80ba\u90e8\u9634\u5f71",
+    "\u80ba\u91ce\u9634\u5f71",
+    "pulmonary infiltrate",
+    "lung opacity",
+)
+
+_GROUND_GLASS_TERMS = (
+    "\u78e8\u73bb\u7483\u5f71",
+    "\u78e8\u73bb\u7483\u5bc6\u5ea6\u5f71",
+    "\u78e8\u73bb\u7483\u6837\u6539\u53d8",
+    "ground glass",
+    "ground-glass",
+)
+
+_PULMONARY_CONSOLIDATION_TERMS = (
+    "\u80ba\u5b9e\u53d8",
+    "\u5b9e\u53d8",
+    "\u80ba\u90e8\u5b9e\u53d8",
+    "consolidation",
+)
+
+_PNEUMONIA_IMPRESSION_TERMS = (
+    "\u8003\u8651\u652f\u6c14\u7ba1\u80ba\u708e",
+    "\u63d0\u793a\u652f\u6c14\u7ba1\u80ba\u708e",
+    "\u652f\u6c14\u7ba1\u80ba\u708e\u6837",
+    "\u8003\u8651\u80ba\u708e",
+    "\u63d0\u793a\u80ba\u708e",
+    "\u80ba\u708e\u5f71\u50cf",
+)
+
 
 @dataclass
 class Observation:
@@ -917,6 +1063,10 @@ class Observation:
     verification_method: str = ""
     parser_profile: str = ""
     gap_closure_assessment: str = ""
+    observation_type: str = ""
+    semantic_level: str = ""
+    source_refs: List[str] = field(default_factory=list)
+    source_texts: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -1557,6 +1707,8 @@ class ClinicalEvidenceNormalizer:
             )
         ]
         observations.extend(self._phrase_observations(source, text, path))
+        observations.extend(self._history_exposure_observations(source, text, path))
+        observations.extend(self._neutral_imaging_observations(source, text, path))
         observations.extend(self._diagnosis_mentions(source, text, path))
         observations.extend(self._semantic_lab_observations(source, path, text))
         observations.extend(
@@ -1566,11 +1718,87 @@ class ClinicalEvidenceNormalizer:
         )
         return observations
 
+    def _history_exposure_observations(self, source: str, text: str, path: str) -> List[Observation]:
+        if not _contains_any(text, _RADIOTHERAPY_TERMS):
+            return []
+        status = _radiotherapy_status(text)
+        if status in {"future_or_recommendation", "family_history"}:
+            return []
+        site = _radiotherapy_site(text)
+        findings = ["history_of_radiotherapy"]
+        if site == "thorax" and status != "future_or_recommendation":
+            findings.append("thoracic_radiotherapy")
+        observations: List[Observation] = []
+        for finding in findings:
+            observations.append(
+                Observation(
+                    finding=finding,
+                    source=source,
+                    polarity=status,
+                    anatomy=site if site else "",
+                    temporality=_extract_temporality(text) or _extract_relative_time(text),
+                    confidence=0.92 if status == "positive" else 0.78,
+                    raw_text=text,
+                    source_text=text,
+                    field_path=path,
+                    observation_type="treatment_history",
+                    semantic_level="fact",
+                )
+            )
+        return observations
+
+    def _neutral_imaging_observations(self, source: str, text: str, path: str) -> List[Observation]:
+        findings: List[str] = []
+        if _contains_any(text, _PULMONARY_INFILTRATE_TERMS):
+            findings.append("pulmonary_infiltrate")
+        if _contains_any(text, _GROUND_GLASS_TERMS):
+            findings.append("ground_glass_opacity")
+        if _contains_any(text, _PULMONARY_CONSOLIDATION_TERMS):
+            findings.append("pulmonary_consolidation")
+        if not findings:
+            return []
+        polarity, confidence = self._polarity(text)
+        observations = [
+            Observation(
+                finding=finding,
+                source=source,
+                polarity=polarity,
+                anatomy=_extract_anatomy(text) or "lung",
+                temporality=_extract_temporality(text) or _extract_relative_time(text),
+                confidence=max(confidence, 0.88),
+                raw_text=text,
+                source_text=text,
+                field_path=path,
+                observation_type="imaging_finding",
+                semantic_level="fact",
+            )
+            for finding in findings
+        ]
+        if _pneumonia_impression_present(text):
+            observations.append(
+                Observation(
+                    finding="bronchopneumonia_suspected",
+                    source=source,
+                    polarity=polarity,
+                    anatomy=_extract_anatomy(text) or "lung",
+                    temporality=_extract_temporality(text) or _extract_relative_time(text),
+                    confidence=max(confidence, 0.82),
+                    raw_text=text,
+                    source_text=text,
+                    field_path=path,
+                    observation_type="imaging_finding",
+                    semantic_level="clinical_impression",
+                )
+            )
+        return observations
+
     def _phrase_observations(self, source: str, text: str, path: str) -> List[Observation]:
         observations: List[Observation] = []
         for finding, terms in _PHRASE_FINDINGS.items():
             term = next((item for item in terms if item.lower() in text.lower()), None)
             if not term:
+                continue
+            if finding == "pneumonia_infiltrate" and not _pneumonia_impression_present(text):
                 continue
             if _is_reference_only_mention(text, term):
                 continue
@@ -1590,6 +1818,8 @@ class ClinicalEvidenceNormalizer:
                     confidence=confidence,
                     raw_text=text,
                     field_path=path,
+                    observation_type=_infer_observation_type(finding, source, path),
+                    semantic_level=_infer_semantic_level(finding),
                 )
             )
         return observations
@@ -1622,6 +1852,8 @@ class ClinicalEvidenceNormalizer:
                     confidence=0.98 if polarity == "positive" else max(0.9, confidence),
                     raw_text=text,
                     field_path=path,
+                    observation_type="disease_history",
+                    semantic_level="clinical_impression",
                 )
             )
         return result
@@ -2189,11 +2421,56 @@ class ClinicalEvidenceNormalizer:
                 best[key] = item
         return list(best.values())
 
+    @staticmethod
+    def _merge_fact_duplicates(items: Sequence[Observation]) -> List[Observation]:
+        merged: Dict[Tuple[str, str, str, str, str, str], Observation] = {}
+        result: List[Observation] = []
+        merge_types = {"treatment_history", "exposure", "imaging_finding"}
+        for item in items:
+            semantic = item.semantic_level or _infer_semantic_level(item.finding)
+            obs_type = item.observation_type or _infer_observation_type(item.finding, item.source, item.field_path)
+            if semantic != "fact" or obs_type not in merge_types:
+                result.append(item)
+                continue
+            key = (
+                item.finding,
+                obs_type,
+                item.anatomy or "",
+                item.polarity or "positive",
+                _observation_time_bucket(item.temporality),
+                semantic,
+            )
+            current = merged.get(key)
+            if current is None:
+                item.source_refs = item.source_refs or [item.field_path or item.source]
+                item.source_texts = item.source_texts or ([item.source_text or item.raw_text] if (item.source_text or item.raw_text) else [])
+                merged[key] = item
+                result.append(item)
+                continue
+            current.source_refs = sorted(
+                set((current.source_refs or []) + [item.field_path or item.source])
+            )
+            if item.source_text or item.raw_text:
+                current.source_texts = sorted(
+                    set((current.source_texts or []) + [item.source_text or item.raw_text])
+                )
+            if item.confidence > current.confidence:
+                current.confidence = item.confidence
+                current.source = item.source
+                current.field_path = item.field_path
+                current.raw_text = item.raw_text
+                current.source_text = item.source_text
+        return result
+
     def _finalize_observations(self, items: Sequence[Observation]) -> List[Observation]:
-        observations = self._dedupe(items)
+        observations = self._merge_fact_duplicates(self._dedupe(items))
         for item in observations:
             if not item.source_text:
                 item.source_text = item.raw_text
+            if not item.observation_type:
+                item.observation_type = _infer_observation_type(item.finding, item.source, item.field_path)
+            if not item.semantic_level:
+                item.semantic_level = _infer_semantic_level(item.finding)
             metadata = _finding_metadata(item.finding)
             if not item.evidence_level:
                 item.evidence_level = metadata["evidence_level"]
@@ -2984,6 +3261,100 @@ def _extract_temporality(text: str) -> str:
         (term for term in ("急性", "亚急性", "慢性", "反复", "进行性", "突发") if term in target),
         "",
     )
+
+
+def _contains_any(text: str, terms: Sequence[str]) -> bool:
+    lowered = str(text or "").lower()
+    return any(str(term or "").lower() in lowered for term in terms)
+
+
+def _context_before(text: str, term: str, width: int = 14) -> str:
+    target = str(text or "")
+    index = target.lower().find(str(term or "").lower())
+    if index < 0:
+        return ""
+    return target[max(0, index - width):index]
+
+
+def _first_present_term(text: str, terms: Sequence[str]) -> str:
+    lowered = str(text or "").lower()
+    return next((str(term) for term in terms if str(term or "").lower() in lowered), "")
+
+
+def _radiotherapy_status(text: str) -> str:
+    term = _first_present_term(text, _RADIOTHERAPY_TERMS)
+    prefix = _context_before(text, term) if term else str(text or "")
+    merged = f"{prefix} {text}"
+    if _contains_any(merged, _FAMILY_HISTORY_TERMS):
+        return "family_history"
+    if _contains_any(merged, _RADIOTHERAPY_PLANNED_TERMS):
+        return "future_or_recommendation"
+    if _contains_any(merged, _RADIOTHERAPY_NEGATION_TERMS):
+        return "negative"
+    if _contains_any(merged, _RADIOTHERAPY_UNCERTAIN_TERMS):
+        return "uncertain"
+    return "positive"
+
+
+def _radiotherapy_site(text: str) -> str:
+    target = str(text or "")
+    for site, terms in _THORACIC_RADIOTHERAPY_SITE_TERMS.items():
+        if _contains_any(target, terms):
+            return site
+    return ""
+
+
+def _extract_relative_time(text: str) -> str:
+    target = str(text or "")
+    match = re.search(
+        r"\d+(?:\.\d+)?\s*(?:\u4e2a)?(?:\u5c0f\u65f6|\u5929|\u65e5|\u5468|\u6708|\u5e74)\s*(?:\u524d|\u540e)",
+        target,
+    )
+    if match:
+        return match.group(0).strip()
+    match = re.search(r"\d+(?:\.\d+)?\s*(?:hour|day|week|month|year)s?\s*(?:ago|after|later)", target, re.I)
+    if match:
+        return match.group(0).strip()
+    return ""
+
+
+def _pneumonia_impression_present(text: str) -> bool:
+    return _contains_any(text, _PNEUMONIA_IMPRESSION_TERMS)
+
+
+def _infer_semantic_level(finding: str) -> str:
+    if str(finding or "").startswith("diagnosis:"):
+        return "clinical_impression"
+    return _SEMANTIC_LEVEL_BY_FINDING.get(str(finding or ""), "fact")
+
+
+def _infer_observation_type(finding: str, source: str = "", path: str = "") -> str:
+    finding = str(finding or "")
+    if finding in _OBSERVATION_TYPE_BY_FINDING:
+        return _OBSERVATION_TYPE_BY_FINDING[finding]
+    if finding in _SYMPTOM_FINDINGS or finding.startswith("symptom:"):
+        return "symptom"
+    if finding in _SIGN_FINDINGS:
+        return "sign"
+    if finding.startswith("diagnosis:"):
+        return "disease_history"
+    if finding.endswith(_LAB_FINDING_SUFFIXES) or _is_lab_source(source):
+        return "laboratory_finding"
+    if _is_imaging_source(source):
+        return "imaging_finding"
+    if _is_history_path(path):
+        return "disease_history"
+    return ""
+
+
+def _observation_time_bucket(text: str) -> str:
+    target = str(text or "").strip().lower()
+    if not target:
+        return ""
+    match = re.search(r"\d+(?:\.\d+)?\s*(?:hour|day|week|month|year|ago)", target)
+    if match:
+        return match.group(0)
+    return target[:24]
 
 
 def _is_history_path(path: str) -> bool:
