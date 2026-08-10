@@ -594,6 +594,236 @@ class DiagnosisJudgeTests(unittest.TestCase):
             "protected_recall",
         )
 
+    def test_anchor_primary_unlocks_when_high_value_residual_favors_protected_contender(self):
+        primary = candidate(
+            FRACTURE,
+            0.86,
+            required=True,
+            matched=["osteophyte", "activity_related_joint_pain"],
+            coverage=0.28,
+            residual=0.72,
+            residual_core=4,
+        )
+        primary.entity_id = "D100031"
+        primary.body_system = "musculoskeletal"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+        primary.residual_evidence = [
+            "thoracic_radiotherapy",
+            "ground_glass_opacity",
+            "pulmonary_consolidation",
+            "lesion_within_prior_radiation_field",
+        ]
+
+        radiation = candidate(
+            "\u653e\u5c04\u6027\u80ba\u708e",
+            0.35,
+            required=False,
+            matched=[
+                "thoracic_radiotherapy",
+                "ground_glass_opacity",
+                "pulmonary_consolidation",
+                "lesion_within_prior_radiation_field",
+            ],
+            gaps=["radiation_field_lung_consistency"],
+            coverage=0.80,
+            residual=0.16,
+            core_coverage=0.82,
+            residual_core=0,
+        )
+        radiation.entity_id = "D100058"
+        radiation.body_system = "respiratory"
+        radiation.eligibility_status = "Deferred"
+        radiation.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        radiation.candidate_sources = [
+            {
+                "source": "llm_pattern_hypothesis",
+                "entity_id": "D100058",
+                "metadata": {
+                    "body_system": "respiratory",
+                    "recall_mode": "protected_recall",
+                    "protected_pool_slot": True,
+                    "pattern_hypothesis_id": "PH_DET_radiation",
+                    "pattern_recall_only": True,
+                    "judge_evidence_weight": 0.0,
+                    "eligibility_evidence_weight": 0.0,
+                },
+            }
+        ]
+
+        result = self.engine.judge._primary_arbitration(
+            primary,
+            [primary, radiation],
+            [{"left": FRACTURE, "right": "\u653e\u5c04\u6027\u80ba\u708e"}],
+        )
+
+        self.assertIs(result["selected_candidate"], radiation)
+        self.assertEqual(result["decision"]["action"], UNLOCK_AND_DEFER)
+        reasons = set(result["decision"]["reason_codes"])
+        self.assertIn("INCUMBENT_PRIMARY_PROTECTION_LOST", reasons)
+        self.assertIn("NEW_MATERIAL_EVIDENCE_UNEXPLAINED", reasons)
+        self.assertIn("PRIMARY_UNLOCKED_CONTENDER_DEFERRED", reasons)
+        comparison = result["comparisons"][0]["clinical_explanatory_comparison"]
+        incumbent = comparison["incumbent_profile"]
+        self.assertEqual(incumbent["primary_protection_status"], "LOST")
+        self.assertTrue(incumbent["primary_explanatory_mismatch"])
+        self.assertEqual(primary.eligibility_anchor_status, "AnchorSatisfied")
+
+    def test_comorbid_background_residual_does_not_challenge_good_primary(self):
+        primary = candidate(
+            PNEUMONIA,
+            0.82,
+            required=True,
+            matched=["dyspnea", "ground_glass_opacity", "pulmonary_consolidation"],
+            coverage=0.82,
+            residual=0.12,
+            core_coverage=0.86,
+        )
+        primary.body_system = "respiratory"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+        primary.residual_evidence = ["hypertension"]
+
+        contender = candidate(
+            HEART_FAILURE,
+            0.48,
+            required=False,
+            matched=["dyspnea"],
+            coverage=0.30,
+            residual=0.66,
+            core_coverage=0.25,
+        )
+        contender.body_system = "cardiovascular"
+        contender.eligibility_status = "Deferred"
+        contender.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        contender.candidate_sources = [
+            {
+                "source": "llm_pattern_hypothesis",
+                "metadata": {
+                    "recall_mode": "protected_recall",
+                    "protected_pool_slot": True,
+                    "pattern_hypothesis_id": "PH_background_control",
+                },
+            }
+        ]
+
+        result = self.engine.judge._primary_arbitration(
+            primary,
+            [primary, contender],
+            [{"left": PNEUMONIA, "right": HEART_FAILURE}],
+        )
+
+        self.assertIs(result["selected_candidate"], primary)
+        self.assertNotEqual(result["decision"]["action"], UNLOCK_AND_DEFER)
+        incumbent = result["comparisons"][0]["clinical_explanatory_comparison"][
+            "incumbent_profile"
+        ]
+        self.assertEqual(incumbent["primary_protection_status"], "PROTECTED")
+        self.assertFalse(incumbent["high_value_residuals"])
+
+    def test_cross_system_primary_not_downgraded_when_it_explains_core_case(self):
+        primary = candidate(
+            MPA,
+            0.79,
+            required=True,
+            matched=[
+                "dyspnea",
+                "hematuria",
+                "pulmonary_infiltrate",
+                "renal_involvement",
+            ],
+            coverage=0.78,
+            residual=0.18,
+            core_coverage=0.80,
+        )
+        primary.body_system = "systemic_vasculitis"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        contender = candidate(
+            PNEUMONIA,
+            0.58,
+            required=False,
+            matched=["dyspnea", "pulmonary_infiltrate"],
+            coverage=0.45,
+            residual=0.42,
+            core_coverage=0.44,
+        )
+        contender.body_system = "respiratory"
+        contender.eligibility_status = "Deferred"
+        contender.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        contender.candidate_sources = [
+            {
+                "source": "llm_pattern_hypothesis",
+                "metadata": {
+                    "recall_mode": "protected_recall",
+                    "protected_pool_slot": True,
+                    "pattern_hypothesis_id": "PH_cross_system_control",
+                },
+            }
+        ]
+
+        result = self.engine.judge._primary_arbitration(
+            primary,
+            [primary, contender],
+            [{"left": MPA, "right": PNEUMONIA}],
+        )
+
+        self.assertIs(result["selected_candidate"], primary)
+        incumbent = result["comparisons"][0]["clinical_explanatory_comparison"][
+            "incumbent_profile"
+        ]
+        self.assertEqual(incumbent["primary_protection_status"], "PROTECTED")
+        self.assertNotIn(
+            "PRIMARY_EXPLANATORY_MISMATCH",
+            incumbent["profile_reason_codes"],
+        )
+
+    def test_protected_recall_signal_does_not_count_as_core_coverage(self):
+        primary = candidate(
+            PNEUMONIA,
+            0.80,
+            required=True,
+            matched=["dyspnea", "pulmonary_infiltrate"],
+            coverage=0.72,
+            residual=0.20,
+            core_coverage=0.75,
+        )
+        primary.body_system = "respiratory"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        contender = candidate(
+            "\u653e\u5c04\u6027\u80ba\u708e",
+            0.34,
+            required=False,
+            matched=[],
+            coverage=0.0,
+            residual=0.80,
+            core_coverage=0.0,
+        )
+        contender.entity_id = "D100058"
+        contender.eligibility_status = "Deferred"
+        contender.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        contender.candidate_sources = [
+            {
+                "source": "llm_pattern_hypothesis",
+                "metadata": {
+                    "recall_mode": "protected_recall",
+                    "protected_pool_slot": True,
+                    "pattern_hypothesis_id": "PH_DET_only_pattern",
+                },
+            }
+        ]
+
+        record = self.engine.judge.clinical_comparator.compare(primary, contender)
+
+        contender_profile = record["clinical_explanatory_comparison"][
+            "contender_profile"
+        ]
+        self.assertEqual(contender_profile["core_case_coverage"], 0.0)
+        self.assertEqual(record["recommended_action"], "KEEP_CURRENT_AND_DEFER_CONTENDER")
+
     def test_primary_arbitration_switches_when_score_primary_has_no_anchor(self):
         zoster = candidate(
             ZOSTER,

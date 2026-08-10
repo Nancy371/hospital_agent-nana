@@ -47,6 +47,130 @@ _BROAD_EVIDENCE = {
     "weakness",
 }
 
+_BACKGROUND_EVIDENCE = {
+    "diabetes",
+    "diabetes_mellitus",
+    "hypertension",
+    "hyperlipidemia",
+    "smoking_history",
+}
+
+_CRITICAL_EVIDENCE_TOKENS = (
+    "target_claim",
+    "radiation_field",
+    "within_prior_radiation_field",
+    "lesion_within",
+    "filling_defect",
+    "regurgitant_jet",
+    "shunt",
+)
+
+_HIGH_EVIDENCE_TOKENS = (
+    "ground_glass",
+    "consolidation",
+    "infiltrate",
+    "opacity",
+    "hypoxemia",
+    "thoracic_radiotherapy",
+    "radiotherapy",
+    "pulmonary",
+    "ct_",
+    "imaging",
+)
+
+_MODERATE_EVIDENCE_TOKENS = (
+    "dyspnea",
+    "cough",
+    "wheeze",
+    "orthopnea",
+    "murmur",
+    "edema",
+    "pain",
+)
+
+_SYSTEM_HINTS = {
+    "respiratory": (
+        "pulmonary",
+        "lung",
+        "dyspnea",
+        "cough",
+        "wheeze",
+        "ground_glass",
+        "consolidation",
+        "atelectasis",
+        "infiltrate",
+        "opacity",
+        "pleural",
+        "hypox",
+        "radiation_field",
+    ),
+    "treatment_exposure": (
+        "radiotherapy",
+        "chemotherapy",
+        "immunotherapy",
+        "drug_exposure",
+        "medication",
+        "exposure",
+    ),
+    "musculoskeletal": (
+        "arthralgia",
+        "arthritis",
+        "joint",
+        "bone",
+        "fracture",
+        "osteophyte",
+        "trauma",
+        "musculoskeletal",
+    ),
+    "cardiovascular": (
+        "heart",
+        "cardiac",
+        "mitral",
+        "aortic",
+        "valve",
+        "murmur",
+        "left_atrium",
+        "pulmonary_edema",
+    ),
+    "renal": ("renal", "kidney", "creatinine", "proteinuria", "hematuria"),
+    "genitourinary": ("dysuria", "urethral", "urinary", "genitourinary"),
+}
+
+
+@dataclass
+class ClinicalExplanatoryProfile:
+    core_case_coverage: float = 0.0
+    chief_complaint_alignment: str = "UNKNOWN"
+    material_objective_alignment: str = "UNKNOWN"
+    high_value_residuals: List[Dict[str, Any]] = field(default_factory=list)
+    high_value_residual_burden: float = 0.0
+    high_value_residual_burden_band: str = "LOW"
+    new_material_evidence_alignment: str = "NOT_APPLICABLE"
+    encounter_systems: List[str] = field(default_factory=list)
+    candidate_systems: List[str] = field(default_factory=list)
+    primary_explanatory_mismatch: bool = False
+    primary_protection_status: str = "PROTECTED"
+    profile_reason_codes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "core_case_coverage": round(float(self.core_case_coverage or 0.0), 4),
+            "chief_complaint_alignment": self.chief_complaint_alignment,
+            "material_objective_alignment": self.material_objective_alignment,
+            "high_value_residuals": [dict(item) for item in self.high_value_residuals],
+            "high_value_residual_burden": round(
+                float(self.high_value_residual_burden or 0.0),
+                4,
+            ),
+            "high_value_residual_burden_band": self.high_value_residual_burden_band,
+            "new_material_evidence_alignment": self.new_material_evidence_alignment,
+            "encounter_systems": list(self.encounter_systems),
+            "candidate_systems": list(self.candidate_systems),
+            "primary_explanatory_mismatch": bool(self.primary_explanatory_mismatch),
+            "primary_protection_status": self.primary_protection_status,
+            "profile_reason_codes": list(dict.fromkeys(self.profile_reason_codes)),
+        }
+
 
 @dataclass
 class CandidateClinicalAnalysis:
@@ -63,6 +187,9 @@ class CandidateClinicalAnalysis:
     actionable_gaps: List[str] = field(default_factory=list)
     judge_score: float = 0.0
     candidate_score: float = 0.0
+    explanatory_profile: ClinicalExplanatoryProfile = field(
+        default_factory=ClinicalExplanatoryProfile
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -79,6 +206,7 @@ class CandidateClinicalAnalysis:
             "actionable_gaps": list(self.actionable_gaps),
             "judge_score": round(float(self.judge_score or 0.0), 4),
             "candidate_score": round(float(self.candidate_score or 0.0), 4),
+            "explanatory_profile": self.explanatory_profile.to_dict(),
         }
 
 
@@ -127,6 +255,10 @@ class ClinicalReasoningComparator:
         contender_explained = len(contender_analysis.explained_high_value_evidence)
         primary_residual = len(primary_analysis.unexplained_high_value_evidence)
         contender_residual = len(contender_analysis.unexplained_high_value_evidence)
+        comparison = self._explanatory_comparison(
+            primary_analysis,
+            contender_analysis,
+        )
         contender_has_syndrome = bool(
             contender_analysis.matched_bridge_patterns
             or contender_analysis.matched_diagnostic_patterns
@@ -159,6 +291,68 @@ class ClinicalReasoningComparator:
                     + ["CONTENDER_REQUIRES_CONFIRMATORY_GAP"],
                 )
 
+        if primary_analysis.anchor_status == ANCHOR_SATISFIED:
+            reason_codes.append("INCUMBENT_ANCHOR_SATISFIED")
+            challenge_reasons = list(comparison.get("incumbent_challenge_reasons") or [])
+            protection_reason = self._primary_protection_decision_reason(
+                primary_analysis
+            )
+            if challenge_reasons:
+                reason_codes.extend(challenge_reasons)
+            if (
+                comparison.get("contender_explanatory_gain") == "HIGH"
+                and contender_has_syndrome
+                and contender_residual <= primary_residual
+            ):
+                reason_codes.extend(
+                    [
+                        "CONTENDER_EXPLANATORY_GAIN_HIGH",
+                        "CONTENDER_REDUCES_HIGH_VALUE_RESIDUAL",
+                        "SCORE_USED_AS_TIE_BREAKER_ONLY",
+                    ]
+                )
+                if contender_analysis.anchor_status == ANCHOR_SATISFIED:
+                    return self._record(
+                        current_primary,
+                        contender,
+                        primary_analysis,
+                        contender_analysis,
+                        preferred=contender,
+                        action=SWITCH_PRIMARY,
+                        reason_codes=reason_codes + ["SWITCH_PRIMARY_AUTHORIZED"],
+                        explanatory_comparison=comparison,
+                    )
+                if contender_analysis.anchor_status == PATTERN_SUPPORTED_BUT_UNCONFIRMED:
+                    return self._record(
+                        current_primary,
+                        contender,
+                        primary_analysis,
+                        contender_analysis,
+                        preferred=contender,
+                        action=UNLOCK_AND_DEFER,
+                        reason_codes=reason_codes
+                        + [
+                            "CONTENDER_STILL_UNCONFIRMED",
+                            protection_reason,
+                            "PRIMARY_UNLOCKED_CONTENDER_DEFERRED",
+                        ],
+                        explanatory_comparison=comparison,
+                    )
+                return self._record(
+                    current_primary,
+                    contender,
+                    primary_analysis,
+                    contender_analysis,
+                    preferred=current_primary,
+                    action=UNLOCK_AND_DEFER,
+                    reason_codes=reason_codes
+                    + [
+                        protection_reason,
+                        "NO_SAFE_PRIMARY_REPLACEMENT",
+                    ],
+                    explanatory_comparison=comparison,
+                )
+
         if (
             contender_has_syndrome
             and contender_explained >= primary_explained + 2
@@ -180,6 +374,7 @@ class ClinicalReasoningComparator:
                     preferred=contender,
                     action=SWITCH_PRIMARY,
                     reason_codes=reason_codes,
+                    explanatory_comparison=comparison,
                 )
             return self._record(
                 current_primary,
@@ -189,6 +384,7 @@ class ClinicalReasoningComparator:
                 preferred=contender,
                 action=UNLOCK_AND_DEFER,
                 reason_codes=reason_codes + ["CONTENDER_REQUIRES_CONFIRMATORY_GAP"],
+                explanatory_comparison=comparison,
             )
 
         if primary_analysis.anchor_status == ANCHOR_SATISFIED and contender_has_syndrome:
@@ -200,6 +396,7 @@ class ClinicalReasoningComparator:
                 preferred=current_primary,
                 action=KEEP_CURRENT_AND_DEFER_CONTENDER,
                 reason_codes=["CURRENT_PRIMARY_HAS_VALID_ANCHOR"],
+                explanatory_comparison=comparison,
             )
 
         return self._record(
@@ -210,6 +407,7 @@ class ClinicalReasoningComparator:
             preferred=current_primary,
             action=NO_MATERIAL_DIFFERENCE,
             reason_codes=["SCORE_ONLY_TIE_BREAKER_NOT_INVOKED"],
+            explanatory_comparison=comparison,
         )
 
     def analyze(
@@ -229,6 +427,12 @@ class ClinicalReasoningComparator:
         explained_high = sorted(explained & high_value)
         residual = self._residual_findings(candidate)
         residual_high = sorted(residual & high_value)
+        profile = self._explanatory_profile(
+            candidate,
+            explained=explained,
+            residual=residual,
+            high_value=high_value,
+        )
         if matched_bridge:
             explained_high.extend(item for item in matched_bridge if item not in explained_high)
         if matched_diagnostic:
@@ -247,6 +451,7 @@ class ClinicalReasoningComparator:
             actionable_gaps=self._actionable_gaps(candidate)[:12],
             judge_score=judge_score,
             candidate_score=float(getattr(candidate, "score", 0.0) or 0.0),
+            explanatory_profile=profile,
         )
 
     def anchor_status(self, candidate: Any) -> str:
@@ -304,6 +509,7 @@ class ClinicalReasoningComparator:
         preferred: Any,
         action: str,
         reason_codes: Sequence[str],
+        explanatory_comparison: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         return {
             "comparison_id": (
@@ -319,7 +525,297 @@ class ClinicalReasoningComparator:
             "preferred_candidate": str(getattr(preferred, "diagnosis", "") or ""),
             "recommended_action": action,
             "decision_reason_codes": list(dict.fromkeys(reason_codes)),
+            "clinical_explanatory_comparison": dict(explanatory_comparison or {}),
         }
+
+    def _explanatory_comparison(
+        self,
+        incumbent: CandidateClinicalAnalysis,
+        contender: CandidateClinicalAnalysis,
+    ) -> Dict[str, Any]:
+        incumbent_profile = incumbent.explanatory_profile
+        contender_profile = contender.explanatory_profile
+        coverage_delta = (
+            contender_profile.core_case_coverage
+            - incumbent_profile.core_case_coverage
+        )
+        residual_delta = (
+            incumbent_profile.high_value_residual_burden
+            - contender_profile.high_value_residual_burden
+        )
+        material_delta = self._alignment_value(
+            contender_profile.material_objective_alignment
+        ) - self._alignment_value(incumbent_profile.material_objective_alignment)
+        challenge_reasons = [
+            code
+            for code in incumbent_profile.profile_reason_codes
+            if code
+            in {
+                "INCUMBENT_CORE_COVERAGE_LOW",
+                "INCUMBENT_HIGH_VALUE_RESIDUAL_HIGH",
+                "CHIEF_COMPLAINT_SYSTEM_MISMATCH",
+                "MATERIAL_EVIDENCE_SYSTEM_MISMATCH",
+                "NEW_MATERIAL_EVIDENCE_UNEXPLAINED",
+                "PRIMARY_EXPLANATORY_MISMATCH",
+            }
+        ]
+        gain_reasons: List[str] = []
+        if coverage_delta >= 0.30:
+            gain_reasons.append("CONTENDER_CORE_COVERAGE_HIGHER")
+        if residual_delta >= 0.80:
+            gain_reasons.append("CONTENDER_REDUCES_HIGH_VALUE_RESIDUAL")
+        if material_delta >= 0.35:
+            gain_reasons.append("CONTENDER_MATERIAL_ALIGNMENT_HIGHER")
+        if contender_profile.core_case_coverage >= 0.65:
+            gain_reasons.append("CONTENDER_CORE_COVERAGE_HIGH")
+        gain = "HIGH" if challenge_reasons and len(gain_reasons) >= 2 else "LOW"
+        if gain == "LOW" and challenge_reasons and coverage_delta >= 0.45:
+            gain = "HIGH"
+        return {
+            "incumbent_profile": incumbent_profile.to_dict(),
+            "contender_profile": contender_profile.to_dict(),
+            "core_case_coverage_delta": round(float(coverage_delta), 4),
+            "residual_burden_delta": round(float(residual_delta), 4),
+            "material_alignment_delta": round(float(material_delta), 4),
+            "contender_explanatory_gain": gain,
+            "incumbent_challenge_reasons": list(dict.fromkeys(challenge_reasons)),
+            "pairwise_findings": list(dict.fromkeys(gain_reasons)),
+            "contender_readiness": contender.anchor_status,
+        }
+
+    def _explanatory_profile(
+        self,
+        candidate: Any,
+        *,
+        explained: Set[str],
+        residual: Set[str],
+        high_value: Set[str],
+    ) -> ClinicalExplanatoryProfile:
+        core_terms = {
+            item
+            for item in high_value
+            if self._is_core_case_evidence(item)
+            and not self._is_pattern_token(item)
+            and item not in _BACKGROUND_EVIDENCE
+        }
+        if not core_terms:
+            core_terms = {
+                item
+                for item in explained | residual
+                if self._is_core_case_evidence(item)
+                and not self._is_pattern_token(item)
+                and item not in _BACKGROUND_EVIDENCE
+            }
+        weighted_total = sum(self._evidence_weight(item) for item in core_terms)
+        weighted_explained = sum(
+            self._evidence_weight(item) for item in core_terms if item in explained
+        )
+        coverage = weighted_explained / weighted_total if weighted_total > 0 else 0.0
+        residual_terms = [item for item in core_terms if item in residual]
+        residual_entries = [
+            {
+                "evidence": item,
+                "value_band": self._evidence_value_band(item),
+                "weight": self._evidence_weight(item),
+                "systems": sorted(self._systems_for_text(item)),
+            }
+            for item in sorted(residual_terms)
+        ]
+        burden = sum(float(item["weight"]) for item in residual_entries)
+        burden_band = self._burden_band(burden)
+        system_weights: Dict[str, float] = {}
+        for item in core_terms:
+            for system in self._systems_for_text(item):
+                system_weights[system] = system_weights.get(system, 0.0) + self._evidence_weight(item)
+        max_system_weight = max(system_weights.values(), default=0.0)
+        dominant_cutoff = max(0.8, max_system_weight * 0.50)
+        encounter_systems = sorted(
+            system
+            for system, weight in system_weights.items()
+            if weight >= dominant_cutoff
+        )
+        candidate_systems = sorted(self._candidate_systems(candidate, explained))
+        system_intersection = set(encounter_systems) & set(candidate_systems)
+        if not encounter_systems or not candidate_systems:
+            chief_alignment = "UNKNOWN"
+        elif system_intersection or coverage >= 0.65:
+            chief_alignment = "STRONG"
+        elif coverage >= 0.35:
+            chief_alignment = "PARTIAL"
+        else:
+            chief_alignment = "POOR"
+        objective_terms = [
+            item
+            for item in core_terms
+            if self._evidence_value_band(item) in {"HIGH", "CRITICAL"}
+        ]
+        objective_explained = [item for item in objective_terms if item in explained]
+        if not objective_terms:
+            material_alignment = "UNKNOWN"
+        elif len(objective_explained) == len(objective_terms):
+            material_alignment = "STRONG"
+        elif objective_explained:
+            material_alignment = "PARTIAL"
+        else:
+            material_alignment = "POOR"
+        material_terms = [
+            item
+            for item in core_terms
+            if self._is_new_material_evidence(item)
+        ]
+        material_explained = [item for item in material_terms if item in explained]
+        if not material_terms:
+            new_material_alignment = "NOT_APPLICABLE"
+        elif len(material_explained) == len(material_terms):
+            new_material_alignment = "STRONG"
+        elif material_explained:
+            new_material_alignment = "PARTIAL"
+        else:
+            new_material_alignment = "POOR"
+        reason_codes: List[str] = []
+        if coverage < 0.35 and core_terms:
+            reason_codes.append("INCUMBENT_CORE_COVERAGE_LOW")
+        if burden_band in {"HIGH", "VERY_HIGH"}:
+            reason_codes.append("INCUMBENT_HIGH_VALUE_RESIDUAL_HIGH")
+        if chief_alignment == "POOR":
+            reason_codes.append("CHIEF_COMPLAINT_SYSTEM_MISMATCH")
+        if material_alignment == "POOR":
+            reason_codes.append("MATERIAL_EVIDENCE_SYSTEM_MISMATCH")
+        if new_material_alignment == "POOR":
+            reason_codes.append("NEW_MATERIAL_EVIDENCE_UNEXPLAINED")
+        mismatch = bool(
+            chief_alignment == "POOR"
+            and coverage < 0.35
+            and burden_band in {"HIGH", "VERY_HIGH"}
+        )
+        protection = "PROTECTED"
+        if mismatch:
+            protection = "LOST"
+            reason_codes.append("PRIMARY_EXPLANATORY_MISMATCH")
+        elif (
+            coverage < 0.45
+            and burden_band in {"HIGH", "VERY_HIGH"}
+            and material_alignment == "POOR"
+        ):
+            protection = "CHALLENGED"
+        return ClinicalExplanatoryProfile(
+            core_case_coverage=coverage,
+            chief_complaint_alignment=chief_alignment,
+            material_objective_alignment=material_alignment,
+            high_value_residuals=residual_entries,
+            high_value_residual_burden=burden,
+            high_value_residual_burden_band=burden_band,
+            new_material_evidence_alignment=new_material_alignment,
+            encounter_systems=encounter_systems,
+            candidate_systems=candidate_systems,
+            primary_explanatory_mismatch=mismatch,
+            primary_protection_status=protection,
+            profile_reason_codes=reason_codes,
+        )
+
+    @staticmethod
+    def _alignment_value(value: str) -> float:
+        return {
+            "STRONG": 1.0,
+            "PARTIAL": 0.5,
+            "UNKNOWN": 0.25,
+            "NOT_APPLICABLE": 0.25,
+            "POOR": 0.0,
+        }.get(str(value or ""), 0.0)
+
+    @staticmethod
+    def _primary_protection_decision_reason(
+        analysis: CandidateClinicalAnalysis,
+    ) -> str:
+        status = str(
+            analysis.explanatory_profile.primary_protection_status or ""
+        ).upper()
+        if status == "LOST":
+            return "INCUMBENT_PRIMARY_PROTECTION_LOST"
+        return "INCUMBENT_PRIMARY_PROTECTION_CHALLENGED"
+
+    @staticmethod
+    def _burden_band(value: float) -> str:
+        if value >= 2.0:
+            return "VERY_HIGH"
+        if value >= 1.2:
+            return "HIGH"
+        if value >= 0.5:
+            return "MEDIUM"
+        return "LOW"
+
+    def _evidence_value_band(self, value: str) -> str:
+        text = str(value or "").lower()
+        if any(token in text for token in _CRITICAL_EVIDENCE_TOKENS):
+            return "CRITICAL"
+        if any(token in text for token in _HIGH_EVIDENCE_TOKENS):
+            return "HIGH"
+        if any(token in text for token in _MODERATE_EVIDENCE_TOKENS):
+            return "MEDIUM"
+        return "LOW"
+
+    def _evidence_weight(self, value: str) -> float:
+        return {
+            "CRITICAL": 1.0,
+            "HIGH": 0.8,
+            "MEDIUM": 0.4,
+            "LOW": 0.1,
+        }.get(self._evidence_value_band(value), 0.1)
+
+    def _is_core_case_evidence(self, value: str) -> bool:
+        text = str(value or "").strip().lower()
+        if not text or text in _BROAD_EVIDENCE or text in _BACKGROUND_EVIDENCE:
+            return False
+        if text.startswith(("reasoning:", "candidate:", "diagnosis:", "field:")):
+            return False
+        if self._evidence_value_band(text) in {"HIGH", "CRITICAL"}:
+            return True
+        if any(token in text for token in _MODERATE_EVIDENCE_TOKENS):
+            return True
+        return False
+
+    @staticmethod
+    def _is_pattern_token(value: str) -> bool:
+        text = str(value or "").lower()
+        return (
+            text.startswith(("ph_", "cpm-", "dpa-", "pattern:"))
+            or "pattern" in text
+            or "protected_recall" in text
+        )
+
+    @staticmethod
+    def _is_new_material_evidence(value: str) -> bool:
+        text = str(value or "").lower()
+        return any(token in text for token in _CRITICAL_EVIDENCE_TOKENS) or (
+            "ground_glass" in text
+            or "consolidation" in text
+            or "target_claim" in text
+        )
+
+    def _candidate_systems(self, candidate: Any, explained: Set[str]) -> Set[str]:
+        systems: Set[str] = set()
+        for key in ("body_system", "candidate_body_system"):
+            value = str(getattr(candidate, key, "") or "").strip()
+            if value:
+                systems.add(value)
+        for source in getattr(candidate, "candidate_sources", []) or []:
+            if not isinstance(source, dict):
+                continue
+            metadata = dict(source.get("metadata") or {})
+            for key in ("body_system", "family_id", "suggested_family_id"):
+                systems.update(self._systems_for_text(str(metadata.get(key) or "")))
+        for item in explained:
+            systems.update(self._systems_for_text(item))
+        return systems
+
+    @staticmethod
+    def _systems_for_text(value: str) -> Set[str]:
+        text = str(value or "").lower()
+        systems: Set[str] = set()
+        for system, hints in _SYSTEM_HINTS.items():
+            if any(token in text for token in hints):
+                systems.add(system)
+        return systems
 
     def _high_value_universe(self, left: Any, right: Any = None) -> Set[str]:
         values: Set[str] = set()
