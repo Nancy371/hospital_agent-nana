@@ -2172,9 +2172,8 @@ def _critical_anchor_complete(
                 objective_findings
                 & {
                     "ground_glass_opacity",
-                    "pulmonary_inflammatory_change",
+                    "pulmonary_infiltrative_opacity",
                     "pulmonary_infiltrate",
-                    "pneumonia_infiltrate",
                     "lung_opacity",
                     "pulmonary_consolidation",
                     "interstitial_opacity",
@@ -2586,12 +2585,13 @@ def _is_pulmonary_objective_finding(
     observation_type: str,
     merged_text: str,
 ) -> bool:
+    if finding in {"pneumonia_infiltrate", "pulmonary_inflammatory_change"}:
+        return False
     if finding in {
         "ground_glass_opacity",
         "pulmonary_abnormality",
-        "pulmonary_inflammatory_change",
+        "pulmonary_infiltrative_opacity",
         "pulmonary_infiltrate",
-        "pneumonia_infiltrate",
         "lung_opacity",
         "pulmonary_consolidation",
         "interstitial_opacity",

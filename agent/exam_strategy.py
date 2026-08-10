@@ -803,6 +803,21 @@ class ExamStrategyAgent:
                 "target_claims": list(
                     task_by_exam.get(item, {}).get("target_claims") or []
                 ),
+                "route_target_claims": list(
+                    task_by_exam.get(item, {}).get("route_target_claims") or []
+                ),
+                "expected_evidence_concepts": list(
+                    task_by_exam.get(item, {}).get("expected_evidence_concepts") or []
+                ),
+                "claim_requirements": list(
+                    task_by_exam.get(item, {}).get("claim_requirements") or []
+                ),
+                "closure_routes": list(
+                    task_by_exam.get(item, {}).get("closure_routes") or []
+                ),
+                "claim_closure_plan_version": str(
+                    task_by_exam.get(item, {}).get("claim_closure_plan_version") or ""
+                ),
                 "clinical_question": str(
                     task_by_exam.get(item, {}).get("clinical_question")
                     or task_by_exam.get(item, {}).get("target_question")
@@ -989,6 +1004,64 @@ class ExamStrategyAgent:
     ) -> Dict[str, Any]:
         """Attach decision-question claims for gaps whose result needs interpretation."""
         result = dict(task or {})
+        claim_requirements = [
+            item
+            for item in gap.get("claim_requirements", []) or []
+            if isinstance(item, dict) and str(item.get("claim_id") or "").strip()
+        ]
+        closure_routes = [
+            item
+            for item in gap.get("closure_routes", []) or []
+            if isinstance(item, dict)
+        ]
+        if claim_requirements:
+            all_claims = [
+                str(item.get("claim_id") or "").strip()
+                for item in claim_requirements
+                if str(item.get("claim_id") or "").strip()
+            ]
+            exam_text = str(result.get("exam") or result.get("requested_exam") or "")
+            exam_routes = [
+                route
+                for route in closure_routes
+                if str(route.get("route_type") or "") == "exam_result"
+                and (
+                    not route.get("exam")
+                    or str(route.get("exam") or "") == exam_text
+                    or str(route.get("exam") or "") in exam_text
+                    or exam_text in str(route.get("exam") or "")
+                )
+            ]
+            route_claims: List[str] = []
+            expected_evidence: List[str] = []
+            for route in exam_routes:
+                route_claims.extend(str(item or "") for item in route.get("target_claims", []) or [])
+                expected_evidence.extend(
+                    str(item or "")
+                    for item in route.get("expected_evidence_concepts", []) or []
+                )
+            result["target_claims"] = list(
+                dict.fromkeys(
+                    list(result.get("target_claims") or []) + all_claims
+                )
+            )
+            result["route_target_claims"] = list(
+                dict.fromkeys(item for item in route_claims if item)
+            )
+            result["expected_evidence_concepts"] = list(
+                dict.fromkeys(item for item in expected_evidence if item)
+            )
+            result["target_findings"] = list(
+                dict.fromkeys(
+                    list(result.get("target_findings") or [])
+                    + result["expected_evidence_concepts"]
+                )
+            )
+            result["claim_requirements"] = claim_requirements
+            result["closure_routes"] = closure_routes
+            result["claim_closure_plan_version"] = str(
+                gap.get("claim_closure_plan_version") or "claim_closure_plan_v1"
+            )
         candidate_text = " ".join(
             str(item or "")
             for item in list(result.get("target_candidates") or [])
@@ -1015,17 +1088,42 @@ class ExamStrategyAgent:
             return result
         claims = list(result.get("target_claims") or [])
         findings = list(result.get("target_findings") or [])
+        if not claims:
+            claims.extend(
+                [
+                    "pulmonary_morphology",
+                    "radiation_field_lung_consistency",
+                    "post_radiotherapy_time_window",
+                ]
+            )
+        if not result.get("route_target_claims"):
+            result["route_target_claims"] = [
+                "pulmonary_morphology",
+                "radiation_field_lung_consistency",
+            ]
         for claim in (
             "radiation_field_lung_consistency",
             "ground_glass_opacity",
             "pulmonary_consolidation",
         ):
-            if claim not in claims:
-                claims.append(claim)
             if claim not in findings:
                 findings.append(claim)
+        for claim in ("pulmonary_morphology", "radiation_field_lung_consistency"):
+            if claim not in claims:
+                claims.append(claim)
+        if "post_radiotherapy_time_window" not in claims:
+            claims.append("post_radiotherapy_time_window")
         result["target_claims"] = claims
         result["target_findings"] = findings
+        result.setdefault(
+            "expected_evidence_concepts",
+            [
+                "ground_glass_opacity",
+                "pulmonary_consolidation",
+                "patchy_pulmonary_opacity",
+                "lesion_within_prior_radiation_field",
+            ],
+        )
         result["target_question"] = (
             "Does the pulmonary imaging abnormality spatially match the prior "
             "radiation field?"

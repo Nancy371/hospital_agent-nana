@@ -23,7 +23,12 @@ class TargetedExamResultParserTests(unittest.TestCase):
             actual_result_exam="CT扫描（CT）",
             target_gap_ids=["G-D100058-03"],
             target_claims=[
-                "pulmonary_objective_abnormality",
+                "pulmonary_morphology",
+                "radiation_field_lung_consistency",
+                "post_radiotherapy_time_window",
+            ],
+            route_target_claims=[
+                "pulmonary_morphology",
                 "radiation_field_lung_consistency",
             ],
             target_candidate="放射性肺炎",
@@ -44,8 +49,8 @@ class TargetedExamResultParserTests(unittest.TestCase):
 
         findings = {item.finding for item in parsed.observations}
         self.assertEqual(parsed.status, "positive")
-        self.assertEqual(parsed.gap_closure_assessment, "positive_closed")
-        self.assertEqual(parsed.gap_resolution_status, "RESOLVED_SUPPORTED")
+        self.assertEqual(parsed.gap_closure_assessment, "partial")
+        self.assertEqual(parsed.gap_resolution_status, "PARTIALLY_CLOSED")
         self.assertIn("ground_glass_opacity", findings)
         self.assertIn("pulmonary_consolidation", findings)
         self.assertIn("pulmonary_volume_loss", findings)
@@ -56,6 +61,14 @@ class TargetedExamResultParserTests(unittest.TestCase):
         self.assertEqual(
             claim_by_id["radiation_field_lung_consistency"]["claim_status"],
             "SUPPORTED",
+        )
+        self.assertEqual(
+            claim_by_id["pulmonary_morphology"]["claim_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            claim_by_id["post_radiotherapy_time_window"]["claim_status"],
+            "NOT_ADDRESSED",
         )
         self.assertTrue(parsed.material_evidence_delta["material_evidence_changed"])
 
@@ -85,7 +98,7 @@ class TargetedExamResultParserTests(unittest.TestCase):
         findings = {item.finding for item in parsed.observations}
         self.assertEqual(parsed.status, "negative")
         self.assertEqual(parsed.gap_closure_assessment, "negative_closed")
-        self.assertEqual(parsed.gap_resolution_status, "RESOLVED_CONTRADICTED")
+        self.assertEqual(parsed.gap_resolution_status, "CONTRADICTED")
         self.assertIn("lesion_outside_prior_radiation_field", findings)
         claim = parsed.claim_matches[0]
         self.assertEqual(claim["target_claim"], "radiation_field_lung_consistency")
@@ -114,8 +127,41 @@ class TargetedExamResultParserTests(unittest.TestCase):
 
         self.assertEqual(parsed.status, "inconclusive")
         self.assertEqual(parsed.gap_resolution_status, "UNRESOLVED")
-        self.assertEqual(parsed.claim_matches[0]["claim_status"], "UNRESOLVED")
+        self.assertEqual(parsed.claim_matches[0]["claim_status"], "NOT_ADDRESSED")
         self.assertNotEqual(parsed.gap_closure_assessment, "negative_closed")
+
+    def test_ct_result_still_extracts_findings_when_route_claim_is_not_addressed(self):
+        parser = TargetedExamResultParser()
+        binding = ExamResultIntentBinding(
+            binding_id="B-RP-3B",
+            order_id="O-RP-3B",
+            requested_exam="chest CT",
+            resolved_exam="CT",
+            actual_result_exam="CT",
+            target_gap_ids=["G-D100058-03"],
+            target_claims=["post_radiotherapy_time_window"],
+            route_target_claims=["post_radiotherapy_time_window"],
+            target_candidate="radiation pneumonitis",
+            entity_id="D100058",
+        )
+        parsed = parser.parse(
+            {
+                "status": "abnormal",
+                "result": {
+                    "conclusion": (
+                        "Chest CT shows ground-glass opacity and consolidation; "
+                        "the radiotherapy timing window is not described."
+                    )
+                },
+            },
+            binding,
+        )
+
+        findings = {item.finding for item in parsed.observations}
+        self.assertIn("ground_glass_opacity", findings)
+        self.assertIn("pulmonary_consolidation", findings)
+        self.assertEqual(parsed.claim_matches[0]["claim_status"], "NOT_ADDRESSED")
+        self.assertNotEqual(parsed.observations, [])
 
     def test_gap_aware_ct_negation_does_not_create_positive_ground_glass(self):
         parser = TargetedExamResultParser()

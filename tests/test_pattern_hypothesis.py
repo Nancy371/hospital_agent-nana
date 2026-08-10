@@ -465,6 +465,33 @@ class PatternHypothesisTests(unittest.TestCase):
         self.assertEqual(resolved.binding_status, "ambiguous")
         self.assertEqual(resolved.failure_reason, "ambiguous_evidence_binding")
 
+    def test_legacy_pneumonia_infiltrate_does_not_fill_radiation_objective_slot(self):
+        observations = [
+            Observation(
+                "thoracic_radiotherapy",
+                "patient_reported_observation",
+                confidence=0.9,
+                observation_type="treatment_history",
+                semantic_level="fact",
+                anatomy="thorax",
+                temporality="3_months_ago",
+            ),
+            Observation("dyspnea", "patient_reported_observation", observation_type="symptom"),
+            Observation(
+                "pneumonia_infiltrate",
+                "imaging_result",
+                confidence=0.9,
+                observation_type="imaging_finding",
+                semantic_level="fact",
+                anatomy="lung",
+            ),
+        ]
+        binder = EvidenceRelationBinder(observations, {})
+        result = binder.bind("exposure_temporal_organ_injury")
+        audit = result["audit"]
+        self.assertNotIn("imaging_or_objective_finding", audit["bound_slots"])
+        self.assertIn("imaging_or_objective_finding", audit["missing_slots"])
+
     def test_observation_ref_is_stable_under_bundle_order(self):
         first = Observation("dyspnea", "patient_reported_observation", field_path="symptom[1]")
         second = Observation("cough", "patient_reported_observation", field_path="symptom[2]")

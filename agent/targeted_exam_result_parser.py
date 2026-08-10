@@ -26,11 +26,16 @@ UNSUPPORTED = "unsupported"
 SUPPORTED = "SUPPORTED"
 CONTRADICTED = "CONTRADICTED"
 CLAIM_UNRESOLVED = "UNRESOLVED"
+NOT_ADDRESSED = "NOT_ADDRESSED"
+CLAIM_INCONCLUSIVE = "INCONCLUSIVE"
 
 OPEN = "OPEN"
 RESOLVED_SUPPORTED = "RESOLVED_SUPPORTED"
 RESOLVED_CONTRADICTED = "RESOLVED_CONTRADICTED"
 GAP_UNRESOLVED = "UNRESOLVED"
+PARTIALLY_CLOSED = "PARTIALLY_CLOSED"
+FULLY_CLOSED = "FULLY_CLOSED"
+GAP_CONTRADICTED = "CONTRADICTED"
 
 
 @dataclass
@@ -45,6 +50,8 @@ class ExamResultIntentBinding:
     actual_result_exam: str = ""
     target_gap_ids: List[str] = field(default_factory=list)
     target_claims: List[str] = field(default_factory=list)
+    route_target_claims: List[str] = field(default_factory=list)
+    expected_evidence_concepts: List[str] = field(default_factory=list)
     target_candidate: str = ""
     entity_id: str = ""
     parser_profile: str = ""
@@ -88,6 +95,12 @@ class ExamResultIntentBinding:
                 value.get("target_claims")
                 or value.get("target_findings")
                 or value.get("target_evidence")
+                or []
+            ),
+            route_target_claims=_text_list(value.get("route_target_claims") or []),
+            expected_evidence_concepts=_text_list(
+                value.get("expected_evidence_concepts")
+                or value.get("expected_evidence")
                 or []
             ),
             target_candidate=str(value.get("target_candidate") or ""),
@@ -339,18 +352,33 @@ class TargetedExamResultParser:
             binding.target_claims,
             observations,
             relation_status_by_claim,
+            binding.route_target_claims,
         )
         supported = [item for item in claim_matches if item.get("claim_status") == SUPPORTED]
         contradicted = [item for item in claim_matches if item.get("claim_status") == CONTRADICTED]
-        if supported:
-            result.status = POSITIVE
-            result.gap_closure_assessment = "positive_closed"
-            result.gap_resolution_status = RESOLVED_SUPPORTED
-        elif contradicted:
+        addressed = [
+            item
+            for item in claim_matches
+            if item.get("claim_status") in {SUPPORTED, CONTRADICTED, CLAIM_INCONCLUSIVE}
+        ]
+        unresolved_required = [
+            item
+            for item in claim_matches
+            if item.get("claim_status") in {NOT_ADDRESSED, CLAIM_INCONCLUSIVE, CLAIM_UNRESOLVED}
+        ]
+        if contradicted:
             result.status = NEGATIVE
             result.gap_closure_assessment = "negative_closed"
-            result.gap_resolution_status = RESOLVED_CONTRADICTED
-        elif observations:
+            result.gap_resolution_status = GAP_CONTRADICTED
+        elif supported and not unresolved_required:
+            result.status = POSITIVE
+            result.gap_closure_assessment = "positive_closed"
+            result.gap_resolution_status = FULLY_CLOSED
+        elif supported:
+            result.status = POSITIVE
+            result.gap_closure_assessment = "partial"
+            result.gap_resolution_status = PARTIALLY_CLOSED
+        elif observations or addressed:
             result.status = INCONCLUSIVE
             result.gap_closure_assessment = "partial"
             result.gap_resolution_status = GAP_UNRESOLVED
@@ -386,20 +414,55 @@ class TargetedExamResultParser:
         target_claims: Sequence[str],
         observations: Sequence[Observation],
         relation_status_by_claim: Dict[str, str],
+        route_target_claims: Sequence[str] | None = None,
     ) -> List[Dict[str, Any]]:
         findings = {item.finding: item for item in observations or []}
+        route_claim_set = {
+            str(item or "").strip() for item in route_target_claims or [] if str(item or "").strip()
+        }
+        morphology_claims = {"pulmonary_morphology", "pulmonary_objective_abnormality"}
+        morphology_findings = {
+            "ground_glass_opacity",
+            "pulmonary_consolidation",
+            "patchy_pulmonary_opacity",
+            "pulmonary_opacity",
+            "pulmonary_infiltrative_opacity",
+            "pulmonary_infiltrate",
+            "pulmonary_volume_loss",
+            "lung_volume_loss",
+        }
         matches: List[Dict[str, Any]] = []
         for claim in target_claims or []:
             claim_id = str(claim or "").strip()
             if not claim_id:
                 continue
-            status = relation_status_by_claim.get(claim_id, CLAIM_UNRESOLVED)
+            route_targets_claim = not route_claim_set or claim_id in route_claim_set
+            status = relation_status_by_claim.get(claim_id, NOT_ADDRESSED)
             supporting: List[str] = []
             contradicting: List[str] = []
             if status == SUPPORTED:
                 supporting = ["lesion_within_prior_radiation_field"]
             elif status == CONTRADICTED:
                 contradicting = ["lesion_outside_prior_radiation_field"]
+            elif claim_id in morphology_claims:
+                positive = [
+                    finding
+                    for finding in morphology_findings
+                    if finding in findings and findings[finding].polarity != "negative"
+                ]
+                negative = [
+                    finding
+                    for finding in morphology_findings
+                    if finding in findings and findings[finding].polarity == "negative"
+                ]
+                if positive:
+                    status = SUPPORTED
+                    supporting = sorted(positive)
+                elif negative and route_targets_claim:
+                    status = CONTRADICTED
+                    contradicting = sorted(negative)
+                else:
+                    status = NOT_ADDRESSED if not route_targets_claim else CLAIM_INCONCLUSIVE
             elif claim_id in findings:
                 obs = findings[claim_id]
                 if obs.polarity == "negative":
@@ -408,13 +471,20 @@ class TargetedExamResultParser:
                 else:
                     status = SUPPORTED
                     supporting = [claim_id]
+            elif not route_targets_claim:
+                status = NOT_ADDRESSED
+            elif claim_id in {"post_radiotherapy_time_window", "radiotherapy_temporal_consistency"}:
+                status = NOT_ADDRESSED
             matches.append(
                 {
                     "target_claim": claim_id,
                     "claim_status": status,
                     "supporting_observations": supporting,
                     "contradicting_observations": contradicting,
-                    "matcher_version": "target_claim_matcher_v1",
+                    "source_type": "exam_result" if route_targets_claim else "not_addressed_by_route",
+                    "resolution_method": "target_claim_matcher_v2",
+                    "confidence": 0.9 if supporting or contradicting else 0.0,
+                    "matcher_version": "target_claim_matcher_v2",
                 }
             )
         return matches
@@ -674,6 +744,12 @@ def binding_from_authorization_detail(
         actual_result_exam=actual_result_exam,
         target_gap_ids=_text_list(detail.get("target_gaps") or []),
         target_claims=_text_list(detail.get("target_claims") or detail.get("target_findings") or []),
+        route_target_claims=_text_list(detail.get("route_target_claims") or []),
+        expected_evidence_concepts=_text_list(
+            detail.get("expected_evidence_concepts")
+            or detail.get("expected_evidence")
+            or []
+        ),
         target_candidate=candidate,
         entity_id=entity_id,
         planned_resolution_type=str(detail.get("resolution_type") or ""),
@@ -707,7 +783,7 @@ _TERMS_BY_FINDING: Dict[str, Tuple[str, ...]] = {
         "\u80ba\u5b9e\u53d8",
         "consolidation",
     ),
-    "pulmonary_infiltrate": (
+    "pulmonary_infiltrative_opacity": (
         "\u6d78\u6da6\u5f71",
         "\u7247\u72b6\u9634\u5f71",
         "\u6591\u7247\u72b6\u5f71",
@@ -760,14 +836,14 @@ _GENERIC_ATOMIC_RULES: Tuple[Tuple[str, Dict[str, Any]], ...] = (
         },
     ),
     (
-        "pulmonary_infiltrate",
+        "pulmonary_infiltrative_opacity",
         {
-            "terms": _TERMS_BY_FINDING["pulmonary_infiltrate"],
+            "terms": _TERMS_BY_FINDING["pulmonary_infiltrative_opacity"],
             "confidence": 0.84,
             "information_value": 0.74,
             "observation_type": "imaging_finding",
             "anatomy": "lung",
-            "rule_id": "semantic_pulmonary_infiltrate",
+            "rule_id": "semantic_pulmonary_infiltrative_opacity",
         },
     ),
     (
@@ -978,6 +1054,9 @@ def _material_evidence_delta(
     gap_changed = gap_resolution_status in {
         RESOLVED_SUPPORTED,
         RESOLVED_CONTRADICTED,
+        FULLY_CLOSED,
+        PARTIALLY_CLOSED,
+        GAP_CONTRADICTED,
     }
     return {
         "new_observations": list(dict.fromkeys(new_observations)),

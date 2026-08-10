@@ -142,8 +142,15 @@ class ExamInformationGainTests(unittest.TestCase):
 
         details = result["exam_authorization_details"]
         ct_detail = next(item for item in details if item["exam"] == chest_ct)
+        self.assertIn("pulmonary_morphology", ct_detail["target_claims"])
         self.assertIn("radiation_field_lung_consistency", ct_detail["target_claims"])
+        self.assertIn("post_radiotherapy_time_window", ct_detail["target_claims"])
+        self.assertNotIn("ground_glass_opacity", ct_detail["target_claims"])
+        self.assertIn("pulmonary_morphology", ct_detail["route_target_claims"])
+        self.assertIn("radiation_field_lung_consistency", ct_detail["route_target_claims"])
+        self.assertNotIn("post_radiotherapy_time_window", ct_detail["route_target_claims"])
         self.assertIn("ground_glass_opacity", ct_detail["target_findings"])
+        self.assertIn("ground_glass_opacity", ct_detail["expected_evidence_concepts"])
         self.assertEqual(ct_detail["exam_role"], "target_claim_resolution")
         self.assertIn("radiation field", ct_detail["target_question"])
         self.assertEqual(

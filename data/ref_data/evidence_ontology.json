@@ -9,7 +9,8 @@
       ],
       "children": [
         "ground_glass_opacity",
-        "pulmonary_inflammatory_change",
+        "pulmonary_infiltrative_opacity",
+        "pulmonary_opacity",
         "pulmonary_infiltrate",
         "lung_opacity",
         "pulmonary_consolidation",
@@ -30,6 +31,43 @@
       "role_hints": [
         "objective_organ_injury"
       ]
+    },
+    "pulmonary_infiltrative_opacity": {
+      "aliases": [
+        "lung_infiltrative_opacity",
+        "patchy_pulmonary_opacity",
+        "pulmonary_patchy_opacity"
+      ],
+      "children": [],
+      "role_hints": [
+        "objective_organ_injury"
+      ]
+    },
+    "pulmonary_opacity": {
+      "aliases": [
+        "lung_opacity",
+        "pulmonary_shadow"
+      ],
+      "children": [],
+      "role_hints": [
+        "objective_organ_injury"
+      ]
+    },
+    "pneumonia_infiltrate": {
+      "aliases": [],
+      "children": [],
+      "role_hints": [],
+      "legacy": true,
+      "deprecated_for_new_observation": true,
+      "canonical_objective_mapping": "pulmonary_infiltrative_opacity"
+    },
+    "pulmonary_inflammatory_change": {
+      "aliases": [],
+      "children": [],
+      "role_hints": [],
+      "legacy": true,
+      "deprecated_for_new_observation": true,
+      "canonical_objective_mapping": "pulmonary_infiltrative_opacity"
     },
     "pulmonary_consolidation": {
       "aliases": [

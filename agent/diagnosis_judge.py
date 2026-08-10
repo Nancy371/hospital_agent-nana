@@ -3478,23 +3478,29 @@ class DiagnosisJudge:
                     if str(item or "").strip()
                 )
             )
-            gaps.append(
-                {
-                    "gap_id": self._gap_id(candidate, gap_type, text, len(gaps) + 1),
-                    "candidate": diagnosis,
-                    "entity_id": entity_id,
-                    "target_evidence": text,
-                    "importance": importance,
-                    "gap_type": gap_type,
-                    "closure_exams": exams[:6],
-                    "source": source,
-                    "source_claims": list(source_claims or []),
-                    "expected_transition": {
-                        "positive": PRIMARY_ELIGIBLE,
-                        "negative": DIFFERENTIAL_ONLY,
-                    },
-                }
+            gap_payload = {
+                "gap_id": self._gap_id(candidate, gap_type, text, len(gaps) + 1),
+                "candidate": diagnosis,
+                "entity_id": entity_id,
+                "target_evidence": text,
+                "importance": importance,
+                "gap_type": gap_type,
+                "closure_exams": exams[:6],
+                "source": source,
+                "source_claims": list(source_claims or []),
+                "expected_transition": {
+                    "positive": PRIMARY_ELIGIBLE,
+                    "negative": DIFFERENTIAL_ONLY,
+                },
+            }
+            claim_plan = self._claim_closure_plan_for_gap(
+                candidate,
+                gap_payload,
+                base_exams=exams[:6],
             )
+            if claim_plan:
+                gap_payload.update(claim_plan)
+            gaps.append(gap_payload)
 
         for claim in getattr(candidate, "unresolved_critical_evidence_claims", []) or []:
             if not isinstance(claim, dict):
@@ -3546,6 +3552,138 @@ class DiagnosisJudge:
                 source="required_anchor",
             )
         return gaps
+
+    def _claim_closure_plan_for_gap(
+        self,
+        candidate: Any,
+        gap: Dict[str, Any],
+        *,
+        base_exams: Sequence[str],
+    ) -> Dict[str, Any]:
+        text = " ".join(
+            str(item or "")
+            for item in (
+                getattr(candidate, "entity_id", ""),
+                getattr(candidate, "diagnosis", ""),
+                gap.get("target_evidence"),
+                gap.get("gap_id"),
+            )
+        )
+        compact = "".join(text.lower().split())
+        is_radiation_lung = any(
+            marker in compact
+            for marker in (
+                "d100058",
+                "radiation",
+                "radiotherapy",
+                "post_radiotherapy",
+                "放射",
+                "放疗",
+            )
+        )
+        if not is_radiation_lung:
+            return {}
+        chest_ct = [
+            str(exam)
+            for exam in base_exams or []
+            if any(marker in str(exam).lower() for marker in ("ct", "胸部", "chest"))
+        ]
+        route_exam = chest_ct[0] if chest_ct else "胸部CT扫描（Chest CT）"
+        return {
+            "claim_closure_plan_version": "claim_closure_plan_v1",
+            "claim_requirements": [
+                {
+                    "claim_id": "pulmonary_morphology",
+                    "claim_type": "composite_observation",
+                    "fulfillment_rule": "ANY",
+                    "expected_evidence_concepts": [
+                        "ground_glass_opacity",
+                        "pulmonary_consolidation",
+                        "patchy_pulmonary_opacity",
+                        "pulmonary_opacity",
+                        "pulmonary_infiltrative_opacity",
+                    ],
+                    "allowed_source_types": ["imaging_result", "exam_result_observation"],
+                    "required_for_anchor": True,
+                    "route_ids": ["route_pulmonary_morphology_ct"],
+                },
+                {
+                    "claim_id": "radiation_field_lung_consistency",
+                    "claim_type": "spatial_relation",
+                    "fulfillment_rule": "SUPPORTED_RELATION",
+                    "expected_evidence_concepts": [
+                        "lesion_within_prior_radiation_field",
+                    ],
+                    "allowed_source_types": ["imaging_result", "explicit_relation"],
+                    "required_for_anchor": True,
+                    "route_ids": ["route_radiation_field_ct"],
+                },
+                {
+                    "claim_id": "post_radiotherapy_time_window",
+                    "claim_type": "temporal_relation",
+                    "fulfillment_rule": "DERIVED_TEMPORAL_RELATION",
+                    "expected_evidence_concepts": [
+                        "radiotherapy_end_date",
+                        "pulmonary_symptom_onset",
+                        "radiotherapy_before_pulmonary_onset",
+                    ],
+                    "allowed_source_types": [
+                        "patient_reported_observation",
+                        "treatment_history",
+                        "derived_relation",
+                    ],
+                    "required_for_anchor": True,
+                    "route_ids": [
+                        "route_radiotherapy_timing_history",
+                        "route_post_radiotherapy_temporal_relation",
+                    ],
+                },
+            ],
+            "closure_routes": [
+                {
+                    "route_id": "route_pulmonary_morphology_ct",
+                    "route_type": "exam_result",
+                    "exam": route_exam,
+                    "target_claims": ["pulmonary_morphology"],
+                    "expected_evidence_concepts": [
+                        "ground_glass_opacity",
+                        "pulmonary_consolidation",
+                        "patchy_pulmonary_opacity",
+                        "pulmonary_opacity",
+                        "pulmonary_infiltrative_opacity",
+                    ],
+                },
+                {
+                    "route_id": "route_radiation_field_ct",
+                    "route_type": "exam_result",
+                    "exam": route_exam,
+                    "target_claims": ["radiation_field_lung_consistency"],
+                    "expected_evidence_concepts": [
+                        "lesion_within_prior_radiation_field",
+                        "lesion_outside_prior_radiation_field",
+                    ],
+                },
+                {
+                    "route_id": "route_radiotherapy_timing_history",
+                    "route_type": "history_inquiry",
+                    "inquiry_targets": [
+                        "radiotherapy_end_date",
+                        "pulmonary_symptom_onset",
+                    ],
+                    "target_claims": ["post_radiotherapy_time_window"],
+                },
+                {
+                    "route_id": "route_post_radiotherapy_temporal_relation",
+                    "route_type": "temporal_relation",
+                    "inputs": [
+                        "radiotherapy_end_date",
+                        "pulmonary_symptom_onset",
+                    ],
+                    "target_claims": ["post_radiotherapy_time_window"],
+                },
+            ],
+            "claim_resolutions": [],
+        }
 
     @staticmethod
     def _gap_id(candidate: Any, gap_type: str, target: str, index: int) -> str:

@@ -235,6 +235,28 @@ class ClinicalEvidenceNormalizerTests(unittest.TestCase):
         self.assertNotIn("pneumonia_infiltrate", findings)
         self.assertIn("bronchopneumonia", findings)
 
+    def test_imaging_infiltrate_with_pneumonia_impression_is_deetiologized(self):
+        bundle = self.normalizer.normalize(
+            {},
+            {
+                "\u80f8\u90e8CT\u626b\u63cf\uff08Chest CT\uff09": {
+                    "status": "abnormal",
+                    "result": {
+                        "\u7ed3\u8bba": "\u53f3\u80ba\u7247\u72b6\u6d78\u6da6\u5f71\uff0c\u8003\u8651\u652f\u6c14\u7ba1\u80ba\u708e"
+                    },
+                },
+            },
+        )
+        observations = {item.finding: item for item in bundle.observations}
+        self.assertIn("pulmonary_infiltrative_opacity", observations)
+        self.assertEqual(observations["pulmonary_infiltrative_opacity"].semantic_level, "fact")
+        self.assertIn("bronchopneumonia_suspected", observations)
+        self.assertEqual(
+            observations["bronchopneumonia_suspected"].semantic_level,
+            "clinical_impression",
+        )
+        self.assertNotIn("pneumonia_infiltrate", observations)
+
     def test_radiotherapy_history_creates_typed_thoracic_treatment_fact(self):
         bundle = self.normalizer.normalize(
             {

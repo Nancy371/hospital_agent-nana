@@ -892,6 +892,9 @@ _OBSERVATION_TYPE_BY_FINDING = {
     "history_of_radiotherapy": "treatment_history",
     "thoracic_radiotherapy": "treatment_history",
     "pulmonary_infiltrate": "imaging_finding",
+    "pulmonary_infiltrative_opacity": "imaging_finding",
+    "patchy_pulmonary_opacity": "imaging_finding",
+    "pulmonary_opacity": "imaging_finding",
     "ground_glass_opacity": "imaging_finding",
     "pulmonary_consolidation": "imaging_finding",
     "pulmonary_abnormality": "imaging_finding",
@@ -1001,6 +1004,8 @@ _FAMILY_HISTORY_TERMS = (
 _PULMONARY_INFILTRATE_TERMS = (
     "\u80ba\u90e8\u6d78\u6da6",
     "\u80ba\u6d78\u6da6",
+    "\u7247\u72b6\u6d78\u6da6\u5f71",
+    "\u6591\u7247\u72b6\u6d78\u6da6\u5f71",
     "\u7247\u72b6\u9634\u5f71",
     "\u6591\u7247\u72b6\u9634\u5f71",
     "\u80ba\u90e8\u9634\u5f71",
@@ -1750,7 +1755,7 @@ class ClinicalEvidenceNormalizer:
     def _neutral_imaging_observations(self, source: str, text: str, path: str) -> List[Observation]:
         findings: List[str] = []
         if _contains_any(text, _PULMONARY_INFILTRATE_TERMS):
-            findings.append("pulmonary_infiltrate")
+            findings.append("pulmonary_infiltrative_opacity")
         if _contains_any(text, _GROUND_GLASS_TERMS):
             findings.append("ground_glass_opacity")
         if _contains_any(text, _PULMONARY_CONSOLIDATION_TERMS):
@@ -1807,9 +1812,16 @@ class ClinicalEvidenceNormalizer:
             polarity, confidence = self._polarity(text, term)
             if finding in _NEGATIVE_FACT_FINDINGS:
                 polarity, confidence = "positive", max(confidence, 0.9)
+            output_finding = finding
+            semantic_level = _infer_semantic_level(finding)
+            observation_type = _infer_observation_type(finding, source, path)
+            if finding == "pneumonia_infiltrate":
+                output_finding = "pulmonary_infiltrative_opacity"
+                semantic_level = "fact"
+                observation_type = "imaging_finding"
             observations.append(
                 Observation(
-                    finding=finding,
+                    finding=output_finding,
                     source=source,
                     polarity=polarity,
                     severity=next((item for item in _SEVERITY_TERMS if item in text), ""),
@@ -1818,10 +1830,26 @@ class ClinicalEvidenceNormalizer:
                     confidence=confidence,
                     raw_text=text,
                     field_path=path,
-                    observation_type=_infer_observation_type(finding, source, path),
-                    semantic_level=_infer_semantic_level(finding),
+                    observation_type=observation_type,
+                    semantic_level=semantic_level,
                 )
             )
+            if finding == "pneumonia_infiltrate":
+                observations.append(
+                    Observation(
+                        finding="pneumonia_suspected",
+                        source=source,
+                        polarity=polarity,
+                        severity=next((item for item in _SEVERITY_TERMS if item in text), ""),
+                        anatomy=_extract_anatomy(text),
+                        temporality=_extract_temporality(text),
+                        confidence=min(0.86, max(confidence, 0.78)),
+                        raw_text=text,
+                        field_path=path,
+                        observation_type="imaging_finding",
+                        semantic_level="clinical_impression",
+                    )
+                )
         return observations
 
     def _diagnosis_mentions(self, source: str, text: str, path: str) -> List[Observation]:
