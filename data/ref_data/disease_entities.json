@@ -10913,6 +10913,15 @@
           ],
           "no_anchor_disposition": "DifferentialOnly",
           "atypical_anchor_disposition": "DeferredNeedsConfirmatoryEvidence"
+        },
+        "submission_dependency_policy": {
+          "associated_entity_ids": [
+            "D100013"
+          ],
+          "associated_findings": [
+            "肺不张"
+          ],
+          "reason": "localized atelectatic or volume-loss findings may be downstream/overlapping manifestations of radiation-related lung injury and require independent anchor to submit separately"
         }
       },
       "metadata": {

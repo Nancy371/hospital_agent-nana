@@ -38,6 +38,10 @@ from .pattern_hypothesis import (
     PatternHypothesisVerifier,
 )
 from .root_cause_arbitration import RootCauseArbiter
+from .submission_authorization import (
+    AUTH_AUTHORIZED,
+    SubmissionAuthorizationLayer,
+)
 
 
 _SECONDARY_MANIFESTATION_DIAGNOSES = {
@@ -250,6 +254,9 @@ class CandidateScore:
     unresolved_high_value: bool = False
     exam_followup_authorized: bool = False
     submission_authorized: bool = False
+    submission_role: str = ""
+    submission_authorization: str = ""
+    submission_authorization_reasons: List[str] = field(default_factory=list)
     eligibility_substatus: str = ""
     evidence_gaps: List[Dict[str, Any]] = field(default_factory=list)
     gap_values: List[Dict[str, Any]] = field(default_factory=list)
@@ -299,6 +306,12 @@ class DiagnosisDecision:
     authorized_diagnoses: List[str] = field(default_factory=list)
     blocked_diagnoses: List[Dict[str, Any]] = field(default_factory=list)
     submission_override_count: int = 0
+    submission_authorization_records: List[Dict[str, Any]] = field(default_factory=list)
+    submission_dependency_edges: List[Dict[str, Any]] = field(default_factory=list)
+    submission_authorization_bypass_count: int = 0
+    associated_finding_block_count: int = 0
+    authorized_primary_count: int = 0
+    authorized_secondary_count: int = 0
     retriever_top1: str = ""
     judge_primary: str = ""
     submitter_final: List[str] = field(default_factory=list)
@@ -364,6 +377,18 @@ class DiagnosisDecision:
             "authorized_diagnoses": list(self.authorized_diagnoses),
             "blocked_diagnoses": list(self.blocked_diagnoses),
             "submission_override_count": int(self.submission_override_count),
+            "submission_authorization_records": list(
+                self.submission_authorization_records
+            ),
+            "submission_dependency_edges": list(self.submission_dependency_edges),
+            "submission_authorization_bypass_count": int(
+                self.submission_authorization_bypass_count or 0
+            ),
+            "associated_finding_block_count": int(
+                self.associated_finding_block_count or 0
+            ),
+            "authorized_primary_count": int(self.authorized_primary_count or 0),
+            "authorized_secondary_count": int(self.authorized_secondary_count or 0),
             "retriever_top1": self.retriever_top1,
             "judge_primary": self.judge_primary,
             "submitter_final": list(self.submitter_final),
@@ -864,6 +889,10 @@ class DiagnosticKnowledgeBase:
                 entry["claim_anchor_contract"] = dict(
                     evidence_profile.get("claim_anchor_contract") or {}
                 )
+            if evidence_profile.get("submission_dependency_policy"):
+                entry["submission_dependency_policy"] = dict(
+                    evidence_profile.get("submission_dependency_policy") or {}
+                )
             self.entity_id_by_name[name] = entity.entity_id
             self.aliases[name] = name
             for alias in [entity.canonical_name, entity.display_name] + list(entity.aliases or []):
@@ -1202,6 +1231,10 @@ class DiagnosisDecisionEngine:
         self.bridge_pattern_validator = BridgePatternValidator()
         self.judge = DiagnosisJudge(config=config, knowledge=self.knowledge)
         self.submitter = DiagnosisSubmitter(knowledge=self.knowledge)
+        self.submission_authorizer = SubmissionAuthorizationLayer(
+            self.knowledge,
+            max_final_diagnoses=self.max_final_diagnoses,
+        )
         self.conflict_arbiter = EvidenceConflictArbiter(self.knowledge)
         self.root_cause_arbiter = RootCauseArbiter(self.knowledge, ref_dir=ref_dir)
         self.eligibility_gate = DiagnosisEligibilityGate(self.knowledge)
@@ -2116,12 +2149,6 @@ class DiagnosisDecisionEngine:
             )
             return decision
 
-        score_by_name = {item.diagnosis: item for item in decision.candidates}
-        score_by_entity = {
-            item.entity_id: item
-            for item in decision.candidates
-            if getattr(item, "entity_id", "")
-        }
         existing_blocked = list(decision.blocked_diagnoses or [])
         pre_names = list(
             dict.fromkeys(
@@ -2137,34 +2164,36 @@ class DiagnosisDecisionEngine:
         if not pre_names:
             pre_names = list(decision.final_diagnoses or [])
 
-        eligible: List[CandidateScore] = []
-        blocked: List[Dict[str, Any]] = []
-        for name in pre_names:
-            entity_id = self.knowledge.entity_id_for(name)
-            candidate = (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(name)
-            reason = self._authorization_ineligible_reason(
-                candidate,
-                respect_differential_only=respect_differential_only,
-                decision=decision,
-            )
-            if reason:
-                if candidate:
-                    self._mark_differential_only(candidate, reason)
-                blocked.append(self._authorization_block_record(name, candidate, reason))
-                continue
-            if candidate and candidate not in eligible:
-                eligible.append(candidate)
-
-        if not eligible:
+        authorization = self.submission_authorizer.authorize(
+            decision,
+            pre_names,
+            policy=self,
+            respect_differential_only=respect_differential_only,
+        )
+        blocked = list(authorization.blocked_diagnoses or [])
+        if not authorization.authorized_candidates:
             if not blocked and not pre_names:
                 blocked = existing_blocked
             for candidate in decision.candidates or []:
                 candidate.submission_authorized = False
+                candidate.submission_role = ""
+                candidate.submission_authorization = ""
+                candidate.submission_authorization_reasons = []
                 if candidate.eligibility_status == DEFERRED or candidate.diagnosis in set(decision.deferred_anchor_candidates):
                     candidate.exam_followup_authorized = True
-            decision.pre_authorization_diagnoses = pre_names
+            decision.pre_authorization_diagnoses = list(authorization.pre_authorization_diagnoses)
             decision.authorized_diagnoses = []
             decision.blocked_diagnoses = blocked
+            decision.submission_authorization_records = authorization.record_dicts()
+            decision.submission_dependency_edges = authorization.edge_dicts()
+            decision.submission_authorization_bypass_count = int(
+                authorization.submission_authorization_bypass_count or 0
+            )
+            decision.associated_finding_block_count = int(
+                authorization.associated_finding_block_count or 0
+            )
+            decision.authorized_primary_count = 0
+            decision.authorized_secondary_count = 0
             decision.submission_override_count = len(pre_names)
             decision.final_diagnoses = []
             decision.trusted_diagnoses = []
@@ -2175,51 +2204,48 @@ class DiagnosisDecisionEngine:
             self._annotate_causal_relations(decision.candidates, [])
             return decision
 
-        primary = self._choose_authorized_primary(eligible, decision)
-        authorized: List[CandidateScore] = [primary]
-        for candidate in eligible:
-            if candidate.diagnosis == primary.diagnosis:
-                continue
-            reason = self._secondary_authorization_block_reason(
-                candidate,
-                primary,
-                authorized,
-            )
-            if reason:
-                self._mark_differential_only(candidate, reason)
-                blocked.append(
-                    self._authorization_block_record(
-                        candidate.diagnosis,
-                        candidate,
-                        reason,
-                    )
-                )
-                continue
-            authorized.append(candidate)
-            if len(authorized) >= self.max_final_diagnoses:
-                break
-
-        authorized_names = [item.diagnosis for item in authorized]
+        authorized: List[CandidateScore] = list(authorization.authorized_candidates)
+        authorized_names = list(authorization.authorized_diagnoses)
         for candidate in decision.candidates or []:
-            candidate.submission_authorized = candidate in authorized
+            candidate.submission_authorized = False
+            candidate.submission_role = ""
+            candidate.submission_authorization = ""
+            candidate.submission_authorization_reasons = []
             if candidate.eligibility_status == DEFERRED or candidate.diagnosis in set(decision.deferred_anchor_candidates):
                 candidate.exam_followup_authorized = True
+        records_by_name = {
+            str(item.get("diagnosis_name") or ""): item
+            for item in authorization.record_dicts()
+        }
+        for candidate in decision.candidates or []:
+            record = records_by_name.get(candidate.diagnosis)
+            if not record:
+                continue
+            candidate.submission_role = str(record.get("submission_role") or "")
+            candidate.submission_authorization = str(
+                record.get("submission_authorization") or ""
+            )
+            candidate.submission_authorization_reasons = list(
+                record.get("reason_codes") or []
+            )
+            candidate.submission_authorized = (
+                candidate.submission_authorization == AUTH_AUTHORIZED
+            )
         requested_set = set(pre_names)
         authorized_set = set(authorized_names)
-        for name in pre_names:
-            entity_id = self.knowledge.entity_id_for(name)
-            candidate = (score_by_entity.get(entity_id) if entity_id else None) or score_by_name.get(name)
-            if name in authorized_set or not candidate:
-                continue
-            if any(item.get("diagnosis") == name for item in blocked):
-                continue
-            reason = "not selected by final diagnosis authorization gate"
-            self._mark_differential_only(candidate, reason)
-            blocked.append(self._authorization_block_record(name, candidate, reason))
-
-        decision.pre_authorization_diagnoses = pre_names
+        decision.pre_authorization_diagnoses = list(authorization.pre_authorization_diagnoses)
         decision.authorized_diagnoses = authorized_names
         decision.blocked_diagnoses = blocked
+        decision.submission_authorization_records = authorization.record_dicts()
+        decision.submission_dependency_edges = authorization.edge_dicts()
+        decision.submission_authorization_bypass_count = int(
+            authorization.submission_authorization_bypass_count or 0
+        )
+        decision.associated_finding_block_count = int(
+            authorization.associated_finding_block_count or 0
+        )
+        decision.authorized_primary_count = int(authorization.authorized_primary_count or 0)
+        decision.authorized_secondary_count = int(authorization.authorized_secondary_count or 0)
         decision.submission_override_count = max(
             0,
             len(requested_set.symmetric_difference(authorized_set)),

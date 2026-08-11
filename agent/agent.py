@@ -4955,14 +4955,13 @@ class MyDoctorAgent(BaseDoctorAgent):
         if not filtered:
             return
         filtered_names = [item.diagnosis for item in filtered]
+        self.diagnosis_engine.authorize_final_diagnoses(
+            decision,
+            filtered_names,
+            respect_differential_only=True,
+        )
         if filtered_names == list(decision.final_diagnoses or []):
             return
-        decision.final_diagnoses = filtered_names
-        decision.trusted_diagnoses = [
-            item.diagnosis for item in filtered
-            if item.score >= self.diagnosis_engine.trusted_threshold
-        ]
-        decision.confidence = filtered[0].score
         decision.differential_only_diagnoses = self.diagnosis_engine.differential_only_details(
             decision.candidates
         )
