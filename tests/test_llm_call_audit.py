@@ -51,6 +51,21 @@ def make_agent():
 
 
 class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_planner_consumer_result_uses_agent_audit_callback(self):
+        agent = make_agent()
+        agent.llm = FakeLLM({"unexpected": "shape"})
+        planner = agent._get_planner()
+        planner.criticism_max_calls = 0
+
+        result = await planner.plan({}, {}, [])
+
+        self.assertIn("strategy", result)
+        record = agent._llm_call_audit[-1]
+        self.assertEqual(record["purpose"], "planning")
+        self.assertFalse(record["consumer_accepted"])
+        self.assertTrue(record["fallback_used"])
+        self.assertEqual(record["fallback_trigger"], "schema_missing_fields")
+
     async def test_budget_skip_creates_audit_record(self):
         agent = make_agent()
         agent.max_llm_calls_per_case = 1

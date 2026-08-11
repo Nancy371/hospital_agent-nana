@@ -120,7 +120,14 @@ class Planner:
          └── Reflection/Criticism ─┘
     """
 
-    def __init__(self, prompt: DoctorPrompt, llm_chat_json, llm_chat, memory: DoctorMemory):
+    def __init__(
+        self,
+        prompt: DoctorPrompt,
+        llm_chat_json,
+        llm_chat,
+        memory: DoctorMemory,
+        mark_llm_consumer_result=None,
+    ):
         """初始化规划器。
 
         Args:
@@ -133,6 +140,7 @@ class Planner:
         self._llm_chat_json = llm_chat_json
         self._llm_chat = llm_chat
         self.memory = memory
+        self._mark_llm_consumer_result = mark_llm_consumer_result
 
         # 规划状态
         self.current_phase = Phase.INITIAL
@@ -161,6 +169,23 @@ class Planner:
         self.policy_store = None  # type: ignore[assignment]
         # 当前 plan 命中的补丁 ID 列表（供反思阶段 record_outcome 使用）
         self._last_used_patch_ids: List[str] = []
+
+    def _mark_last_llm_consumer_result(
+        self,
+        purpose: str,
+        accepted: bool,
+        *,
+        fallback_used: bool = False,
+        fallback_trigger: str = "",
+    ) -> None:
+        if self._mark_llm_consumer_result is None:
+            return
+        self._mark_llm_consumer_result(
+            purpose,
+            accepted,
+            fallback_used=fallback_used,
+            fallback_trigger=fallback_trigger,
+        )
 
     def _record_action(self, action_type: str, target: str, result_summary: str) -> None:
         """记录已执行的操作到历史。"""
@@ -1164,6 +1189,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 llm_chat_json=self._llm_chat_json,
                 llm_chat=self._llm_chat,
                 memory=self.memory,
+                mark_llm_consumer_result=self._mark_last_llm_consumer_result,
             )
             self._planner.max_inquiry_rounds = self.max_ask_rounds
             self._planner.max_exam_rounds = self.max_exam_rounds
