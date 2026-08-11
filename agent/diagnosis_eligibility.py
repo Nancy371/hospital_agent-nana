@@ -421,6 +421,36 @@ class DiagnosisEligibilityGate:
                 self._apply_anchor_policy_audit(candidate, anchor_decision)
                 missing = []
                 return self._result(candidate, PRIMARY_ELIGIBLE, ANCHORS_SATISFIED, missing, satisfied, blockers)
+            if self._has_claim_anchor_contract(candidate):
+                anchor_decision = self._anchor_policy_decision(
+                    candidate,
+                    evidence=evidence,
+                    pattern_summary=pattern_summary,
+                )
+                self._apply_anchor_policy_audit(candidate, anchor_decision)
+                missing = list(
+                    dict.fromkeys(
+                        list(missing)
+                        + list(anchor_decision.get("missing_required_anchors") or [])
+                    )
+                )
+                blockers = list(
+                    dict.fromkeys(
+                        list(blockers)
+                        + list(anchor_decision.get("blockers") or [])
+                    )
+                )
+                if str(anchor_decision.get("anchor_status") or "") == ANCHOR_SATISFIED:
+                    return self._result(
+                        candidate,
+                        PRIMARY_ELIGIBLE,
+                        ANCHORS_SATISFIED,
+                        [],
+                        satisfied,
+                        blockers,
+                    )
+                if str(anchor_decision.get("anchor_status") or "") == PATTERN_SUPPORTED_BUT_UNCONFIRMED:
+                    return self._result(candidate, DEFERRED, NEEDS_ANCHOR, missing, satisfied, blockers)
             if pattern_summary.get("differential_matches"):
                 return self._result(
                     candidate,
@@ -435,6 +465,36 @@ class DiagnosisEligibilityGate:
                 if self._deferred_worth_followup(candidate):
                     return self._result(candidate, DEFERRED, NEEDS_ANCHOR, missing, satisfied, blockers)
                 return self._result(candidate, DIFFERENTIAL_ONLY, WEAK_DIFFERENTIAL_SIGNAL, missing, satisfied, blockers)
+        if self._has_claim_anchor_contract(candidate):
+            anchor_decision = self._anchor_policy_decision(
+                candidate,
+                evidence=evidence,
+                pattern_summary=pattern_summary,
+            )
+            self._apply_anchor_policy_audit(candidate, anchor_decision)
+            missing = list(
+                dict.fromkeys(
+                    list(missing)
+                    + list(anchor_decision.get("missing_required_anchors") or [])
+                )
+            )
+            blockers = list(
+                dict.fromkeys(
+                    list(blockers)
+                    + list(anchor_decision.get("blockers") or [])
+                )
+            )
+            if str(anchor_decision.get("anchor_status") or "") == ANCHOR_SATISFIED:
+                return self._result(
+                    candidate,
+                    PRIMARY_ELIGIBLE,
+                    ANCHORS_SATISFIED,
+                    [],
+                    satisfied,
+                    blockers,
+                )
+            if str(anchor_decision.get("anchor_status") or "") == PATTERN_SUPPORTED_BUT_UNCONFIRMED:
+                return self._result(candidate, DEFERRED, NEEDS_ANCHOR, missing, satisfied, blockers)
         claim_missing = self._claim_missing_anchors(candidate)
         if claim_missing:
             missing = list(dict.fromkeys(list(missing) + claim_missing))
@@ -604,6 +664,38 @@ class DiagnosisEligibilityGate:
                 matched_anchor_types.append("diagnostic_pattern")
             elif diagnostic_patterns:
                 missing_anchor_groups.append("diagnostic_pattern")
+        if "claim_resolution_contract" in accepted:
+            claim_anchor = dict(getattr(candidate, "claim_anchor_evaluation", {}) or {})
+            claim_anchor_status = str(claim_anchor.get("anchor_status_after") or "")
+            if claim_anchor_status == ANCHOR_SATISFIED:
+                matched_anchor_types.append("claim_resolution_contract")
+            elif claim_anchor:
+                if claim_anchor_status == PATTERN_SUPPORTED_BUT_UNCONFIRMED:
+                    partial_signal = True
+                missing_anchor_groups.extend(
+                    str(item)
+                    for item in claim_anchor.get("unresolved_claims", []) or []
+                    if str(item)
+                )
+                missing_anchor_groups.extend(
+                    str(item)
+                    for item in claim_anchor.get("contradicted_claims", []) or []
+                    if str(item)
+                )
+                missing_anchor_groups.extend(
+                    str(item)
+                    for item in claim_anchor.get("conflicted_claims", []) or []
+                    if str(item)
+                )
+            elif entry.get("claim_anchor_contract"):
+                missing_anchor_groups.extend(
+                    str(item)
+                    for item in (
+                        entry.get("claim_anchor_contract", {}).get("required_claims", [])
+                        or []
+                    )
+                    if str(item)
+                )
         if "disease_specific_anchor" in accepted:
             pattern_result = self._match_anchor_patterns(
                 candidate,
@@ -893,6 +985,16 @@ class DiagnosisEligibilityGate:
         if float(getattr(candidate, "evidence_specificity_score", 0.0) or 0.0) >= 0.65:
             return True
         return bool(getattr(candidate, "core_matched_evidence", None) or getattr(candidate, "diagnostic_matched_evidence", None))
+
+    def _has_claim_anchor_contract(self, candidate: Any) -> bool:
+        entry = self._entry(candidate)
+        policy = dict(entry.get("eligibility_anchor_policy") or {})
+        accepted = set(self._texts(policy.get("accepted_anchors") or []))
+        return bool(
+            "claim_resolution_contract" in accepted
+            and entry.get("claim_anchor_contract")
+            and getattr(candidate, "claim_anchor_evaluation", None)
+        )
 
     def _diagnosis_anchor_sanity_gap(self, candidate: Any) -> str:
         diagnosis = str(getattr(candidate, "diagnosis", "") or "")

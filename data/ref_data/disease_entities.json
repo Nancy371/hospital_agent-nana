@@ -10892,11 +10892,23 @@
             }
           }
         ],
+        "claim_anchor_contract": {
+          "contract_id": "claim_anchor_contract:D100058",
+          "contract_version": "claim_closure_plan_v1",
+          "mode": "ALL_REQUIRED",
+          "required_claims": [
+            "pulmonary_morphology",
+            "radiation_field_lung_consistency",
+            "post_radiotherapy_time_window"
+          ],
+          "optional_claims": []
+        },
         "eligibility_anchor_policy": {
           "mode": "any_of",
           "accepted_anchors": [
             "required_evidence_group",
             "diagnostic_pattern",
+            "claim_resolution_contract",
             "direct_diagnostic_evidence"
           ],
           "no_anchor_disposition": "DifferentialOnly",

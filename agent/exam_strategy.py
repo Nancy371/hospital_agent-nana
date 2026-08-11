@@ -927,6 +927,7 @@ class ExamStrategyAgent:
             if isinstance(gap, dict)
             and float(gap.get("gap_value") or 0.0) > 0.0
             and gap.get("closure_exams")
+            and self._gap_has_exam_closure_route(gap)
         ]
         active_gaps.sort(
             key=lambda gap: float(gap.get("gap_value") or 0.0),
@@ -945,6 +946,8 @@ class ExamStrategyAgent:
             for exam_rank, exam in enumerate(gap.get("closure_exams", []) or [], start=1):
                 exam_text = str(exam or "").strip()
                 if not exam_text:
+                    continue
+                if not self._exam_addresses_remaining_claims(gap, exam_text):
                     continue
                 resolution = self.exam_resolver.resolve(
                     exam_text,
@@ -1145,6 +1148,70 @@ class ExamStrategyAgent:
         }
         result["exam_role"] = "target_claim_resolution"
         return result
+
+    @staticmethod
+    def _remaining_claim_ids(gap: Dict[str, Any]) -> List[str]:
+        remaining = [
+            str(item or "").strip()
+            for item in gap.get("remaining_claims", []) or []
+            if str(item or "").strip()
+        ]
+        if remaining:
+            return remaining
+        resolved = {
+            str(item or "").strip()
+            for item in list(gap.get("resolved_claims", []) or [])
+            + list(gap.get("contradicted_claims", []) or [])
+            + list(gap.get("conflicted_claims", []) or [])
+            if str(item or "").strip()
+        }
+        return [
+            str(item.get("claim_id") or "").strip()
+            for item in gap.get("claim_requirements", []) or []
+            if isinstance(item, dict)
+            and str(item.get("claim_id") or "").strip()
+            and str(item.get("claim_id") or "").strip() not in resolved
+        ]
+
+    @classmethod
+    def _gap_has_exam_closure_route(cls, gap: Dict[str, Any]) -> bool:
+        if not gap.get("claim_requirements"):
+            return True
+        return any(
+            str(route.get("route_type") or "") == "exam_result"
+            and set(
+                str(item or "").strip()
+                for item in route.get("target_claims", []) or []
+                if str(item or "").strip()
+            )
+            & set(cls._remaining_claim_ids(gap))
+            for route in gap.get("closure_routes", []) or []
+            if isinstance(route, dict)
+        )
+
+    @classmethod
+    def _exam_addresses_remaining_claims(cls, gap: Dict[str, Any], exam_text: str) -> bool:
+        if not gap.get("claim_requirements"):
+            return True
+        remaining = set(cls._remaining_claim_ids(gap))
+        if not remaining:
+            return False
+        for route in gap.get("closure_routes", []) or []:
+            if not isinstance(route, dict) or str(route.get("route_type") or "") != "exam_result":
+                continue
+            route_exam = str(route.get("exam") or "")
+            if route_exam and not (
+                route_exam == exam_text or route_exam in exam_text or exam_text in route_exam
+            ):
+                continue
+            route_claims = {
+                str(item or "").strip()
+                for item in route.get("target_claims", []) or []
+                if str(item or "").strip()
+            }
+            if route_claims & remaining:
+                return True
+        return False
 
     def _exam_tasks_from_priority_overrides(
         self,

@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from .case_board import StaleJudgeDecisionError, judge_decision_is_stale
+from .claim_resolution import hydrate_gap_with_claim_state
 from .diagnosis_eligibility import (
     DEFERRED,
     DEFERRED_NEEDS_CONFIRMATORY_EXAM,
@@ -3500,6 +3501,9 @@ class DiagnosisJudge:
             )
             if claim_plan:
                 gap_payload.update(claim_plan)
+            ledger = getattr(candidate, "claim_resolution_ledger", None)
+            if ledger and gap_payload.get("claim_requirements"):
+                gap_payload = hydrate_gap_with_claim_state(gap_payload, ledger)
             gaps.append(gap_payload)
 
         for claim in getattr(candidate, "unresolved_critical_evidence_claims", []) or []:

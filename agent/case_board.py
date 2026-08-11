@@ -122,6 +122,9 @@ class CaseBoard:
     knowledge_profile_version: str = ""
     decision_policy_version: str = ""
     exam_catalog_version: str = ""
+    claim_resolution_ledger: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    claim_state_version: int = 0
+    diagnostic_state_version: int = 0
     events: List[CaseBoardEvent] = field(default_factory=list)
 
     @classmethod
@@ -223,6 +226,9 @@ class CaseBoard:
             "exam_proposals": [],
             "candidate_protections": [],
             "candidate_decisions": [],
+            "claim_resolution_ledger": dict(self.claim_resolution_ledger),
+            "claim_state_version": int(self.claim_state_version or 0),
+            "diagnostic_state_version": int(self.diagnostic_state_version or 0),
             "judge_decision": None,
             "audit_events": [],
         }
@@ -261,6 +267,14 @@ class CaseBoard:
                     view["candidate_decisions"].extend(payload["candidate_decisions"])
                 else:
                     view["candidate_decisions"].append(payload)
+            elif event.event_type == "claim_resolution_ledger":
+                ledger = payload.get("claim_resolution_ledger")
+                if isinstance(ledger, dict):
+                    view["claim_resolution_ledger"] = dict(ledger)
+                view["claim_state_version"] = int(payload.get("claim_state_version") or 0)
+                view["diagnostic_state_version"] = int(
+                    payload.get("diagnostic_state_version") or 0
+                )
             elif event.event_type == "judge_decision":
                 view["judge_decision"] = payload
             else:
@@ -275,6 +289,9 @@ class CaseBoard:
             "knowledge_profile_version": self.knowledge_profile_version,
             "decision_policy_version": self.decision_policy_version,
             "exam_catalog_version": self.exam_catalog_version,
+            "claim_resolution_ledger": dict(self.claim_resolution_ledger),
+            "claim_state_version": int(self.claim_state_version or 0),
+            "diagnostic_state_version": int(self.diagnostic_state_version or 0),
             "events": [event.to_dict() for event in self.events],
         }
         data.update(self.view())

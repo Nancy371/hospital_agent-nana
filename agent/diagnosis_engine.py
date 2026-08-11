@@ -29,6 +29,7 @@ from .diagnosis_judge import DiagnosisJudge, DiagnosisSubmitter
 from .diagnosis_resolver import DiagnosisResolution, OpenWorldDiagnosisResolver
 from .evidence_conflicts import EvidenceConflictArbiter
 from .mechanism_reasoner import MechanismReasoner
+from .claim_resolution import AnchorEvaluator, normalize_ledger
 from .pattern_hypothesis import (
     build_pattern_recall_context,
     coerce_pattern_recall_context,
@@ -855,6 +856,10 @@ class DiagnosticKnowledgeBase:
                 entry["eligibility_anchor_policy"] = dict(
                     evidence_profile.get("eligibility_anchor_policy") or {}
                 )
+            if evidence_profile.get("claim_anchor_contract"):
+                entry["claim_anchor_contract"] = dict(
+                    evidence_profile.get("claim_anchor_contract") or {}
+                )
             self.entity_id_by_name[name] = entity.entity_id
             self.aliases[name] = name
             for alias in [entity.canonical_name, entity.display_name] + list(entity.aliases or []):
@@ -1196,6 +1201,7 @@ class DiagnosisDecisionEngine:
         self.conflict_arbiter = EvidenceConflictArbiter(self.knowledge)
         self.root_cause_arbiter = RootCauseArbiter(self.knowledge, ref_dir=ref_dir)
         self.eligibility_gate = DiagnosisEligibilityGate(self.knowledge)
+        self.anchor_evaluator = AnchorEvaluator()
         self.consultation_pipeline = ConsultationEvidencePipeline()
         self.decision_policy_version = "judge_single_authority_v1"
         self.exam_catalog_version = "exam_resolver_v1"
@@ -1275,6 +1281,7 @@ class DiagnosisDecisionEngine:
             decision_policy_version=self.decision_policy_version,
             exam_catalog_version=self.exam_catalog_version,
         )
+        self._attach_claim_resolution_ledger(case_board, llm_result or {})
         priors = candidate_pool.priors()
         sources_by_name = candidate_pool.sources_by_name()
         mechanism_hypotheses = list(candidate_pool.mechanism_hypotheses)
@@ -1328,6 +1335,7 @@ class DiagnosisDecisionEngine:
                 )
             )
         self._apply_case_board_claims(scores, case_board)
+        self._apply_claim_resolution_ledger(scores, case_board)
         self._apply_competitive_specificity(scores)
         self._clear_submission_marks(scores)
         evidence_conflicts = self.conflict_arbiter.detect(
@@ -1535,6 +1543,66 @@ class DiagnosisDecisionEngine:
             targets = self._claim_target_candidates(scores, claim)
             for candidate in targets:
                 self._append_candidate_claim(candidate, claim)
+
+    @staticmethod
+    def _attach_claim_resolution_ledger(case_board: Any, llm_result: Dict[str, Any]) -> None:
+        if not case_board or not isinstance(llm_result, dict):
+            return
+        ledger = normalize_ledger(llm_result.get("_claim_resolution_ledger") or {})
+        if not ledger:
+            return
+        claim_state_version = int(llm_result.get("_claim_state_version") or 0)
+        diagnostic_state_version = int(llm_result.get("_diagnostic_state_version") or 0)
+        setattr(case_board, "claim_resolution_ledger", ledger)
+        setattr(case_board, "claim_state_version", claim_state_version)
+        setattr(case_board, "diagnostic_state_version", diagnostic_state_version)
+        try:
+            case_board.append_event(
+                "claim_resolution_ledger",
+                "case_board",
+                {
+                    "claim_resolution_ledger": ledger,
+                    "claim_state_version": claim_state_version,
+                    "diagnostic_state_version": diagnostic_state_version,
+                },
+                created_at_stage="claim_resolution_persistence",
+            )
+        except Exception:
+            # Ledger is already on the board; event emission is audit-only.
+            return
+
+    def _apply_claim_resolution_ledger(
+        self,
+        scores: Sequence[CandidateScore],
+        case_board: Any,
+    ) -> None:
+        if not scores or not case_board:
+            return
+        ledger = normalize_ledger(
+            getattr(case_board, "claim_resolution_ledger", None)
+            or (case_board.view().get("claim_resolution_ledger") if hasattr(case_board, "view") else {})
+            or {}
+        )
+        if not ledger:
+            return
+        for candidate in scores or []:
+            entity_id = str(getattr(candidate, "entity_id", "") or "").strip()
+            if not entity_id:
+                continue
+            entry = self.knowledge.get(str(getattr(candidate, "diagnosis", "") or ""))
+            contract = dict(entry.get("claim_anchor_contract") or {})
+            if not contract:
+                continue
+            evaluation = self.anchor_evaluator.evaluate(
+                entity_id=entity_id,
+                anchor_contract=contract,
+                ledger=ledger,
+                previous_status=str(getattr(candidate, "eligibility_anchor_status", "") or ""),
+            )
+            setattr(candidate, "claim_resolution_ledger", ledger)
+            setattr(candidate, "claim_anchor_contract", contract)
+            setattr(candidate, "claim_anchor_evaluation", evaluation)
+            setattr(candidate, "claim_resolution_status", evaluation.get("anchor_status_after"))
 
     def _claim_target_candidates(
         self,
