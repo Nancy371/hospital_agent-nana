@@ -67,6 +67,54 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     critic_issue_count = sum(1 for audit in audits if audit.get("critic_issues"))
     critic_llm_count = sum(1 for audit in audits if audit.get("critic_llm_used"))
+    llm_call_audits = [
+        record
+        for audit in audits
+        for record in (audit.get("llm_call_audit") or [])
+        if isinstance(record, dict)
+    ]
+
+    def llm_distribution(key: str) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for record in llm_call_audits:
+            value = record.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    text = str(item or "")
+                    if text:
+                        result[text] = result.get(text, 0) + 1
+            else:
+                text = str(value or "")
+                if text:
+                    result[text] = result.get(text, 0) + 1
+        return result
+
+    llm_failure_by_purpose: Dict[str, int] = {}
+    for record in llm_call_audits:
+        if not record.get("primary_failure_reason") and not record.get("fallback_used"):
+            continue
+        purpose = str(record.get("purpose") or "unclassified")
+        llm_failure_by_purpose[purpose] = llm_failure_by_purpose.get(purpose, 0) + 1
+
+    json_response_calls = [
+        record
+        for record in llm_call_audits
+        if record.get("json_expected")
+        and record.get("model_invoked")
+        and record.get("raw_response_present")
+    ]
+    schema_applicable_calls = [
+        record for record in llm_call_audits if record.get("schema_applicable")
+    ]
+    fallback_call_count = sum(1 for record in llm_call_audits if record.get("fallback_used"))
+    fallback_case_count = sum(
+        1
+        for audit in audits
+        if any(
+            isinstance(record, dict) and record.get("fallback_used")
+            for record in (audit.get("llm_call_audit") or [])
+        )
+    )
     total = len(results)
     return {
         "cases": total,
@@ -201,6 +249,76 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "evidence_information_value_mean": metric("evidence_information_value_mean"),
         "critic_issue_rate": round(critic_issue_count / total, 4) if total else 0.0,
         "critic_llm_rate": round(critic_llm_count / total, 4) if total else 0.0,
+        "llm_call_count": len(llm_call_audits),
+        "llm_call_count_by_purpose": llm_distribution("purpose"),
+        "llm_model_invocation_count": sum(
+            1 for record in llm_call_audits if record.get("model_invoked")
+        ),
+        "llm_failure_count_by_reason": llm_distribution("primary_failure_reason"),
+        "llm_failure_count_by_purpose": llm_failure_by_purpose,
+        "llm_parse_failure_rate": (
+            round(
+                sum(1 for record in json_response_calls if record.get("parse_success") is False)
+                / len(json_response_calls),
+                4,
+            )
+            if json_response_calls
+            else 0.0
+        ),
+        "llm_schema_failure_rate": (
+            round(
+                sum(
+                    1
+                    for record in schema_applicable_calls
+                    if record.get("schema_success") is False
+                )
+                / len(schema_applicable_calls),
+                4,
+            )
+            if schema_applicable_calls
+            else 0.0
+        ),
+        "llm_timeout_rate": (
+            round(
+                sum(
+                    1
+                    for record in llm_call_audits
+                    if "timeout" in (record.get("failure_flags") or [])
+                )
+                / len(llm_call_audits),
+                4,
+            )
+            if llm_call_audits
+            else 0.0
+        ),
+        "llm_truncation_rate": (
+            round(
+                sum(
+                    1
+                    for record in llm_call_audits
+                    if "generation_truncated" in (record.get("failure_flags") or [])
+                )
+                / len(llm_call_audits),
+                4,
+            )
+            if llm_call_audits
+            else 0.0
+        ),
+        "llm_consumer_rejection_rate": (
+            round(
+                sum(1 for record in llm_call_audits if record.get("consumer_accepted") is False)
+                / len(llm_call_audits),
+                4,
+            )
+            if llm_call_audits
+            else 0.0
+        ),
+        "llm_fallback_call_rate": (
+            round(fallback_call_count / len(llm_call_audits), 4)
+            if llm_call_audits
+            else 0.0
+        ),
+        "llm_fallback_case_rate": round(fallback_case_count / total, 4) if total else 0.0,
         "average_elapsed_seconds": _mean_training_value(
             [audit.get("elapsed_seconds") for audit in audits]
         ),

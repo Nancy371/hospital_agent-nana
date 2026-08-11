@@ -273,11 +273,23 @@ class Planner:
             {"role": "user", "content": "请制定诊疗策略规划。"},
         ]
 
-        plan_result = await self._llm_chat_json(messages, temperature=0.3)
+        plan_result = await self._llm_chat_json(
+            messages,
+            temperature=0.3,
+            purpose="planning",
+        )
 
         if not plan_result or "strategy" not in plan_result:
+            self._mark_last_llm_consumer_result(
+                "planning",
+                False,
+                fallback_used=True,
+                fallback_trigger="schema_missing_fields",
+            )
             logger.warning("[规划] LLM 规划失败，使用回退策略")
             plan_result = self._fallback_plan(collected_info, exam_results)
+        else:
+            self._mark_last_llm_consumer_result("planning", True)
 
         # 2. Reflection/Criticism：自我批判审查（限流：仅前 N 次 plan 触发，节省成本）
         self._plan_call_count += 1
@@ -362,9 +374,14 @@ class Planner:
             {"role": "user", "content": "请对当前诊疗策略进行批判性审查。"},
         ]
 
-        result = await self._llm_chat_json(messages, temperature=0.4)
+        result = await self._llm_chat_json(
+            messages,
+            temperature=0.4,
+            purpose="planning_criticism",
+        )
 
         if result and "criticisms" in result:
+            self._mark_last_llm_consumer_result("planning_criticism", True)
             high_severity = [c for c in result.get("criticisms", []) if c.get("severity") == "high"]
             assessment = result.get("overall_assessment", "on_track")
             confidence = result.get("confidence_in_plan", 0.5)
@@ -375,6 +392,12 @@ class Planner:
             return result
 
         logger.info("[批判] 批判未产出有效结果，继续当前计划")
+        self._mark_last_llm_consumer_result(
+            "planning_criticism",
+            False,
+            fallback_used=True,
+            fallback_trigger="consumer_rejected",
+        )
         return None
 
     def _apply_criticism_to_plan(
@@ -735,11 +758,22 @@ class MyDoctorAgent(BaseDoctorAgent):
             diagnostic_knowledge=self.diagnosis_engine.knowledge,
         )
         self.treatment_safety = TreatmentSafetyGate(self.diagnosis_engine.knowledge)
+        async def _diagnosis_critic_llm_chat_json(
+            messages: List[Dict[str, str]],
+            temperature: float = None,
+            **kwargs: Any,
+        ) -> Dict[str, Any]:
+            return await self._llm_chat_json(
+                messages,
+                temperature=temperature,
+                purpose="diagnosis_critic",
+            )
+
         self.diagnosis_critic = DiagnosisCritic(
             config=config,
             knowledge=self.diagnosis_engine.knowledge,
             resolver=self.diagnosis_engine.resolver,
-            llm_chat_json=self._llm_chat_json,
+            llm_chat_json=_diagnosis_critic_llm_chat_json,
         )
         self.structural_agent = StructuralDiagnosisAgent()
         self.evidence_engine = EvidenceDiagnosisEngine(ref_dir=ref_dir)
@@ -775,6 +809,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         # LLM 成本可观测：调用次数统计
         self._llm_call_count = 0
         self._llm_call_by_kind: Dict[str, int] = {}
+        self._llm_call_audit: List[Dict[str, Any]] = []
+        self._llm_logical_call_index = 0
 
         # 相关经验缓存：以 symptoms 元组为 key，避免每次 executor 重查
         self._exp_cache: Dict[tuple, List[Dict[str, Any]]] = {}
@@ -886,6 +922,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         """重置计数器（每个患者独立统计）。"""
         self._llm_call_count = 0
         self._llm_call_by_kind = {}
+        self._llm_call_audit = []
+        self._llm_logical_call_index = 0
         self._exp_cache = {}
 
     def _can_call_llm(self, kind: str) -> bool:
@@ -900,6 +938,223 @@ class MyDoctorAgent(BaseDoctorAgent):
             self.max_llm_calls_per_case,
         )
         return False
+
+    def _next_llm_logical_call_id(self) -> str:
+        self._llm_logical_call_index += 1
+        return f"L{self._llm_logical_call_index:04d}"
+
+    @staticmethod
+    def _llm_required_fields_for_purpose(purpose: str) -> List[str]:
+        mapping = {
+            "planning": ["strategy"],
+            "planning_criticism": ["criticisms"],
+            "thinking": ["differential_diagnosis"],
+            "diagnosis": ["diagnosis"],
+        }
+        return list(mapping.get(str(purpose or ""), []))
+
+    @staticmethod
+    def _llm_failure_priority(flags: List[str]) -> str:
+        priority = [
+            "llm_budget_exhausted",
+            "timeout",
+            "rate_limited",
+            "http_error",
+            "connection_error",
+            "raw_response_empty",
+            "generation_truncated",
+            "json_parse_failed",
+            "unexpected_json_type",
+            "schema_missing_fields",
+            "schema_type_mismatch",
+            "consumer_rejected",
+            "unknown_exception",
+        ]
+        for item in priority:
+            if item in flags:
+                return item
+        return ""
+
+    @staticmethod
+    def _parsed_type_name(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, dict):
+            return "dict"
+        if isinstance(value, list):
+            return "list"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, (int, float)):
+            return "number"
+        return type(value).__name__
+
+    def _classify_llm_audit_record(self, record: Dict[str, Any]) -> None:
+        flags = list(dict.fromkeys(record.get("failure_flags") or []))
+        status = record.get("http_status")
+        exception_type = str(record.get("exception_type") or "")
+        if record.get("model_invoked") is False and not record.get("call_started"):
+            flags.append("llm_budget_exhausted")
+        if exception_type:
+            if "Timeout" in exception_type:
+                flags.append("timeout")
+            elif status == 429:
+                flags.append("rate_limited")
+            elif status:
+                flags.append("http_error")
+            elif "Connect" in exception_type or "Request" in exception_type:
+                flags.append("connection_error")
+            else:
+                flags.append("unknown_exception")
+        if status == 429:
+            flags.append("rate_limited")
+        elif isinstance(status, int) and status >= 400:
+            flags.append("http_error")
+        if str(record.get("finish_reason") or "").lower() == "length":
+            flags.append("generation_truncated")
+        if record.get("model_invoked") and record.get("http_status") and not record.get("raw_response_present"):
+            flags.append("raw_response_empty")
+        if record.get("json_expected"):
+            if record.get("parse_success") is False:
+                flags.append("json_parse_failed")
+            elif record.get("required_fields") and record.get("parsed_type") not in ("dict", ""):
+                flags.append("unexpected_json_type")
+        if record.get("schema_success") is False:
+            if record.get("missing_fields"):
+                flags.append("schema_missing_fields")
+            else:
+                flags.append("schema_type_mismatch")
+        if record.get("consumer_accepted") is False:
+            flags.append("consumer_rejected")
+        flags = list(dict.fromkeys(flags))
+        record["failure_flags"] = flags
+        primary = self._llm_failure_priority(flags)
+        record["primary_failure_reason"] = primary
+        if record.get("fallback_used") and not record.get("fallback_trigger"):
+            record["fallback_trigger"] = primary
+
+    def _append_llm_audit(
+        self,
+        *,
+        kind: str,
+        purpose: str,
+        stage: str = "",
+        json_expected: bool,
+        metadata: Optional[Dict[str, Any]] = None,
+        parsed_value: Any = None,
+        exception: Optional[BaseException] = None,
+        model_invoked: bool = True,
+        fallback_used: bool = False,
+    ) -> Dict[str, Any]:
+        metadata = dict(metadata or {})
+        logical_id = self._next_llm_logical_call_id()
+        now = round(time.time(), 3)
+        parsed_type = self._parsed_type_name(parsed_value) if json_expected else ""
+        parse_success: Optional[bool]
+        if json_expected:
+            parse_success = (
+                parsed_value is not None
+                and not (
+                    isinstance(parsed_value, dict)
+                    and set(parsed_value.keys()) == {"raw_response"}
+                    and isinstance(parsed_value.get("raw_response"), str)
+                )
+            )
+        else:
+            parse_success = None
+        required_fields = self._llm_required_fields_for_purpose(purpose)
+        schema_applicable = bool(required_fields) and json_expected and parse_success is True
+        missing_fields = [
+            field
+            for field in required_fields
+            if not (isinstance(parsed_value, dict) and field in parsed_value)
+        ]
+        schema_success: Optional[bool] = None
+        if schema_applicable:
+            schema_success = not missing_fields
+        record: Dict[str, Any] = {
+            "call_id": f"{logical_id}-A1",
+            "logical_call_id": logical_id,
+            "attempt_index": int(metadata.get("attempt_index") or 1),
+            "purpose": purpose or "unclassified",
+            "stage": stage or purpose or "unclassified",
+            "model": metadata.get("model") or getattr(self.llm, "model_name", ""),
+            "call_started": now if model_invoked else None,
+            "call_completed": now,
+            "model_invoked": bool(model_invoked),
+            "http_status": metadata.get("http_status"),
+            "latency_ms": metadata.get("latency_ms"),
+            "input_tokens": metadata.get("input_tokens"),
+            "output_tokens": metadata.get("output_tokens"),
+            "total_tokens": metadata.get("total_tokens"),
+            "finish_reason": metadata.get("finish_reason"),
+            "raw_response_present": bool(metadata.get("raw_response_present")),
+            "response_chars": int(metadata.get("response_chars") or 0),
+            "json_expected": bool(json_expected),
+            "parse_success": parse_success,
+            "parsed_type": parsed_type,
+            "schema_applicable": bool(schema_applicable),
+            "schema_success": schema_success,
+            "required_fields": required_fields,
+            "missing_fields": missing_fields if schema_applicable else [],
+            "consumer_accepted": (
+                None
+                if json_expected
+                else (False if fallback_used else True)
+            ),
+            "failure_flags": [],
+            "primary_failure_reason": "",
+            "fallback_trigger": "",
+            "fallback_used": bool(fallback_used),
+            "exception_type": type(exception).__name__ if exception else metadata.get("exception_type", ""),
+        }
+        self._classify_llm_audit_record(record)
+        self._llm_call_audit.append(record)
+        return record
+
+    def _mark_last_llm_consumer_result(
+        self,
+        purpose: str,
+        accepted: bool,
+        *,
+        fallback_used: bool = False,
+        fallback_trigger: str = "",
+    ) -> None:
+        for record in reversed(self._llm_call_audit):
+            if record.get("purpose") == purpose and record.get("consumer_accepted") is None:
+                record["consumer_accepted"] = bool(accepted)
+                if fallback_used:
+                    record["fallback_used"] = True
+                if fallback_trigger:
+                    record["fallback_trigger"] = fallback_trigger
+                self._classify_llm_audit_record(record)
+                return
+
+    @staticmethod
+    def _llm_contract_summary_from_audit(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        by_purpose: Dict[str, int] = {}
+        failures: Dict[str, int] = {}
+        fallback_purposes: List[str] = []
+        fallback_calls = 0
+        for record in records or []:
+            purpose = str(record.get("purpose") or "unclassified")
+            by_purpose[purpose] = by_purpose.get(purpose, 0) + 1
+            reason = str(record.get("primary_failure_reason") or "")
+            if reason:
+                failures[reason] = failures.get(reason, 0) + 1
+            if record.get("fallback_used"):
+                fallback_calls += 1
+                if purpose not in fallback_purposes:
+                    fallback_purposes.append(purpose)
+        return {
+            "total_calls": len(records or []),
+            "fallback_calls": fallback_calls,
+            "fallback_purposes": fallback_purposes,
+            "call_count_by_purpose": by_purpose,
+            "primary_failure_reasons": failures,
+        }
 
     def _get_planner(self) -> Planner:
         """获取或初始化规划器。"""
@@ -1479,7 +1734,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             },
         ]
 
-        question = await self._llm_chat(messages, temperature=0.5)
+        question = await self._llm_chat(
+            messages,
+            temperature=0.5,
+            purpose="inquiry_question",
+        )
         if not question or question.strip() == "":
             logger.info("[问诊] LLM 判断无需追问")
             return None
@@ -3494,6 +3753,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "critic_llm_used": bool(critic.get("llm_used", False)),
                 "llm_calls": self._llm_call_count,
                 "llm_calls_by_kind": dict(self._llm_call_by_kind),
+                "llm_call_audit": list(self._llm_call_audit),
+                "llm_contract_summary": self._llm_contract_summary_from_audit(
+                    list(self._llm_call_audit)
+                ),
                 "exam_authorization": exam_authorization_records,
                 "exam_authorization_mode": exam_authorization_mode,
                 "exam_result_intent_bindings": targeted_bindings,
@@ -3764,7 +4027,10 @@ class MyDoctorAgent(BaseDoctorAgent):
         ]
 
         # 使用 LLM 生成初始问题
-        question = await self._llm_chat(messages)
+        question = await self._llm_chat(
+            messages,
+            purpose="inquiry_question",
+        )
         if not question:
             question = "请描述这次最主要的不适、开始时间和伴随症状。"
 
@@ -3862,7 +4128,11 @@ class MyDoctorAgent(BaseDoctorAgent):
             ]
 
             # 使用 LLM 生成追问问题
-            question = await self._llm_chat(messages, temperature=0.5)
+            question = await self._llm_chat(
+                messages,
+                temperature=0.5,
+                purpose="inquiry_question",
+            )
 
             if not question or question.strip() == "":
                 logger.info(f"[问诊] LLM 判断无需追问，结束问诊")
@@ -4397,6 +4667,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "claim_resolution_update_audit": list(self._claim_resolution_update_audit),
                 "claim_state_version": int(self._claim_state_version or 0),
                 "diagnostic_state_version": int(self._diagnostic_state_version or 0),
+                "llm_call_audit": list(self._llm_call_audit),
+                "llm_contract_summary": self._llm_contract_summary_from_audit(
+                    list(self._llm_call_audit)
+                ),
             }
         else:
             diagnosis_prompt = self.prompt.build_diagnosis_prompt(
@@ -6092,7 +6366,11 @@ class MyDoctorAgent(BaseDoctorAgent):
         ]
 
         # 使用 LLM 生成反思总结
-        reflection = await self._llm_chat(messages, temperature=0.5)
+        reflection = await self._llm_chat(
+            messages,
+            temperature=0.5,
+            purpose="reflection",
+        )
 
         if not reflection:
             # 回退到简单反思
@@ -6320,9 +6598,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             {"role": "user", "content": "请进行临床推理分析。"},
         ]
 
-        result = await self._llm_chat_json(messages, temperature=0.3)
+        result = await self._llm_chat_json(
+            messages,
+            temperature=0.3,
+            purpose="thinking",
+        )
 
         if result and "differential_diagnosis" in result:
+            self._mark_last_llm_consumer_result("thinking", True)
             self._record_thinking_snapshot(
                 result,
                 collected_info=collected_info,
@@ -6343,7 +6626,10 @@ class MyDoctorAgent(BaseDoctorAgent):
     # ============ LLM 辅助方法 ============
 
     async def _llm_chat(
-        self, messages: List[Dict[str, str]], temperature: float = None
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = None,
+        purpose: str = "unclassified",
     ) -> str:
         """调用 LLM 进行对话。
 
@@ -6355,6 +6641,13 @@ class MyDoctorAgent(BaseDoctorAgent):
             LLM 响应文本
         """
         if not self._can_call_llm("chat"):
+            self._append_llm_audit(
+                kind="chat",
+                purpose=purpose,
+                json_expected=False,
+                model_invoked=False,
+                fallback_used=True,
+            )
             return ""
         try:
             if self.log_llm_prompts:
@@ -6362,6 +6655,13 @@ class MyDoctorAgent(BaseDoctorAgent):
 
             response = await self.llm.chat(messages, temperature=temperature)
             self._bump_llm_counter("chat")
+            self._append_llm_audit(
+                kind="chat",
+                purpose=purpose,
+                json_expected=False,
+                metadata=getattr(self.llm, "last_call_metadata", {}) or {},
+                fallback_used=not bool(response.strip()),
+            )
 
             if self.log_llm_prompts:
                 logger.debug(f"[LLM] Response: {response[:500]}...")
@@ -6369,11 +6669,22 @@ class MyDoctorAgent(BaseDoctorAgent):
             return response.strip()
 
         except Exception as e:
+            self._append_llm_audit(
+                kind="chat",
+                purpose=purpose,
+                json_expected=False,
+                metadata=getattr(self.llm, "last_call_metadata", {}) or {},
+                exception=e,
+                fallback_used=True,
+            )
             logger.error(f"[LLM] 调用失败: {e}")
             return ""
 
     async def _llm_chat_json(
-        self, messages: List[Dict[str, str]], temperature: float = None
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = None,
+        purpose: str = "unclassified",
     ) -> Dict[str, Any]:
         """调用 LLM 并解析 JSON 响应。
 
@@ -6385,12 +6696,40 @@ class MyDoctorAgent(BaseDoctorAgent):
             解析后的 JSON 字典
         """
         if not self._can_call_llm("json"):
+            self._append_llm_audit(
+                kind="json",
+                purpose=purpose,
+                json_expected=True,
+                model_invoked=False,
+                fallback_used=True,
+            )
             return {}
         try:
             result = await self.llm.chat_json(messages, temperature=temperature)
             self._bump_llm_counter("json")
+            parse_failed = (
+                isinstance(result, dict)
+                and set(result.keys()) == {"raw_response"}
+                and isinstance(result.get("raw_response"), str)
+            )
+            self._append_llm_audit(
+                kind="json",
+                purpose=purpose,
+                json_expected=True,
+                metadata=getattr(self.llm, "last_call_metadata", {}) or {},
+                parsed_value=result,
+                fallback_used=parse_failed,
+            )
             return result
         except Exception as e:
+            self._append_llm_audit(
+                kind="json",
+                purpose=purpose,
+                json_expected=True,
+                metadata=getattr(self.llm, "last_call_metadata", {}) or {},
+                exception=e,
+                fallback_used=True,
+            )
             logger.error(f"[LLM] JSON 调用失败: {e}")
             return {}
 
@@ -6417,12 +6756,23 @@ class MyDoctorAgent(BaseDoctorAgent):
         ]
 
         # 调用 LLM 提取信息
-        extracted = await self._llm_chat_json(messages, temperature=0.3)
+        extracted = await self._llm_chat_json(
+            messages,
+            temperature=0.3,
+            purpose="info_extraction",
+        )
 
         if not extracted or "raw_response" in extracted:
+            self._mark_last_llm_consumer_result(
+                "info_extraction",
+                False,
+                fallback_used=True,
+                fallback_trigger="consumer_rejected",
+            )
             # LLM 提取失败，回退到关键词提取
             logger.warning("[信息提取] LLM 提取失败，回退到关键词提取")
             return self._fallback_parse_patient_response(patient_response, existing_info)
+        self._mark_last_llm_consumer_result("info_extraction", True)
 
         # 合并提取结果到已有信息
         info = existing_info.copy()
@@ -6524,9 +6874,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             {"role": "user", "content": "请判断信息是否足够。"},
         ]
 
-        result = await self._llm_chat_json(messages, temperature=0.3)
+        result = await self._llm_chat_json(
+            messages,
+            temperature=0.3,
+            purpose="sufficiency_check",
+        )
 
         if result and "is_sufficient" in result:
+            self._mark_last_llm_consumer_result("sufficiency_check", True)
             is_sufficient = result["is_sufficient"]
             missing = result.get("missing_aspects", [])
             if missing:
@@ -6534,6 +6889,12 @@ class MyDoctorAgent(BaseDoctorAgent):
             return bool(is_sufficient)
 
         # 回退：简单判断
+        self._mark_last_llm_consumer_result(
+            "sufficiency_check",
+            False,
+            fallback_used=True,
+            fallback_trigger="consumer_rejected",
+        )
         return len(collected_info.get("symptoms", [])) >= 3
 
     async def _check_exam_sufficient(
@@ -6570,9 +6931,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             {"role": "user", "content": "请判断检查是否足够。"},
         ]
 
-        result = await self._llm_chat_json(messages, temperature=0.3)
+        result = await self._llm_chat_json(
+            messages,
+            temperature=0.3,
+            purpose="sufficiency_check",
+        )
 
         if result and "is_sufficient" in result:
+            self._mark_last_llm_consumer_result("sufficiency_check", True)
             is_sufficient = result["is_sufficient"]
             additional = result.get("additional_exams_needed", [])
             if additional:
@@ -6580,6 +6946,12 @@ class MyDoctorAgent(BaseDoctorAgent):
             return bool(is_sufficient)
 
         # 回退：至少有一项检查结果
+        self._mark_last_llm_consumer_result(
+            "sufficiency_check",
+            False,
+            fallback_used=True,
+            fallback_trigger="consumer_rejected",
+        )
         return len(exam_results) >= 1
 
     async def _llm_generate_examination_items(
@@ -6594,19 +6966,31 @@ class MyDoctorAgent(BaseDoctorAgent):
         Returns:
             检查项目列表
         """
-        result = await self._llm_chat_json(messages, temperature=0.3)
+        result = await self._llm_chat_json(
+            messages,
+            temperature=0.3,
+            purpose="exam_generation",
+        )
 
         if isinstance(result, list):
+            self._mark_last_llm_consumer_result("exam_generation", True)
             return [str(item) for item in result if item]
 
         if isinstance(result, dict):
             # 尝试从字典中提取列表
             for key in ["items", "examinations", "exams", "checks"]:
                 if key in result and isinstance(result[key], list):
+                    self._mark_last_llm_consumer_result("exam_generation", True)
                     return [str(item) for item in result[key] if item]
 
         # 回退到规则推荐
         logger.warning("[检查] LLM 生成检查项目失败，回退到规则推荐")
+        self._mark_last_llm_consumer_result(
+            "exam_generation",
+            False,
+            fallback_used=True,
+            fallback_trigger="consumer_rejected",
+        )
         return self._fallback_generate_examination_items(collected_info)
 
     def _fallback_generate_examination_items(
@@ -6648,13 +7032,24 @@ class MyDoctorAgent(BaseDoctorAgent):
         Returns:
             包含 diagnosis, treatment_plan, reasoning 的字典
         """
-        result = await self._llm_chat_json(messages, temperature=0.5)
+        result = await self._llm_chat_json(
+            messages,
+            temperature=0.5,
+            purpose="diagnosis",
+        )
 
         if result and "diagnosis" in result:
+            self._mark_last_llm_consumer_result("diagnosis", True)
             return result
 
         # 回退
         logger.warning("[诊断] LLM 生成诊断失败，返回标准目录内兜底诊断")
+        self._mark_last_llm_consumer_result(
+            "diagnosis",
+            False,
+            fallback_used=True,
+            fallback_trigger="schema_missing_fields",
+        )
         return {
             "diagnosis": ["上呼吸道感染"],
             "treatment_plan": "建议进一步完善检查，明确诊断后制定治疗方案。",

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -60,6 +61,7 @@ class LLMClient:
         self.request_timeout = float(llm_config.get("request_timeout", 120.0) or 120.0)
 
         self._client: Optional[httpx.AsyncClient] = None
+        self.last_call_metadata: Dict[str, Any] = {}
 
         if not self.api_key:
             logger.warning("[LLM] MODEL_API_KEY 未设置，LLM 调用将失败")
@@ -110,13 +112,39 @@ class LLMClient:
 
         last_error = None
         for attempt in range(self.max_retries):
+            started = time.monotonic()
+            metadata: Dict[str, Any] = {
+                "model": self.model_name,
+                "model_invoked": True,
+                "attempt_index": attempt + 1,
+                "max_retries": self.max_retries,
+                "http_status": None,
+                "latency_ms": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "total_tokens": None,
+                "finish_reason": None,
+                "raw_response_present": False,
+                "response_chars": 0,
+                "exception_type": "",
+            }
             try:
                 response = await client.post("/chat/completions", json=payload)
+                metadata["http_status"] = response.status_code
                 response.raise_for_status()
                 data = response.json()
 
-                content = data["choices"][0]["message"]["content"]
+                choice = (data.get("choices") or [{}])[0]
+                content = ((choice.get("message") or {}).get("content")) or ""
                 usage = data.get("usage", {})
+                metadata["finish_reason"] = choice.get("finish_reason")
+                metadata["input_tokens"] = usage.get("prompt_tokens")
+                metadata["output_tokens"] = usage.get("completion_tokens")
+                metadata["total_tokens"] = usage.get("total_tokens")
+                metadata["raw_response_present"] = bool(content)
+                metadata["response_chars"] = len(content)
+                metadata["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
+                self.last_call_metadata = metadata
                 logger.debug(
                     f"[LLM] 调用成功, tokens: prompt={usage.get('prompt_tokens', '?')}, "
                     f"completion={usage.get('completion_tokens', '?')}"
@@ -125,6 +153,10 @@ class LLMClient:
 
             except httpx.HTTPStatusError as e:
                 last_error = e
+                metadata["http_status"] = e.response.status_code
+                metadata["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
+                metadata["exception_type"] = type(e).__name__
+                self.last_call_metadata = metadata
                 logger.warning(
                     f"[LLM] HTTP 错误 (attempt {attempt + 1}/{self.max_retries}): "
                     f"{e.response.status_code} - {e.response.text[:200]}"
@@ -140,6 +172,9 @@ class LLMClient:
                     break
             except Exception as e:
                 last_error = e
+                metadata["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
+                metadata["exception_type"] = type(e).__name__
+                self.last_call_metadata = metadata
                 logger.warning(f"[LLM] 调用失败 (attempt {attempt + 1}/{self.max_retries}): {e}")
                 await asyncio.sleep(self.retry_base_delay)
 
