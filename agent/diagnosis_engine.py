@@ -339,6 +339,8 @@ class DiagnosisDecision:
     case_board: Dict[str, Any] = field(default_factory=dict)
     case_version: int = 0
     evidence_snapshot_hash: str = ""
+    claim_state_version: int = 0
+    diagnostic_state_version: int = 0
     knowledge_profile_version: str = ""
     decision_policy_version: str = ""
     exam_catalog_version: str = ""
@@ -404,6 +406,8 @@ class DiagnosisDecision:
             "case_board": dict(self.case_board),
             "case_version": int(self.case_version or 0),
             "evidence_snapshot_hash": self.evidence_snapshot_hash,
+            "claim_state_version": int(self.claim_state_version or 0),
+            "diagnostic_state_version": int(self.diagnostic_state_version or 0),
             "knowledge_profile_version": self.knowledge_profile_version,
             "decision_policy_version": self.decision_policy_version,
             "exam_catalog_version": self.exam_catalog_version,
@@ -1415,6 +1419,8 @@ class DiagnosisDecisionEngine:
             name_resolutions=list(candidate_pool.name_resolutions),
             unresolved_candidates=list(candidate_pool.unresolved_candidates),
             differential_only_diagnoses=differential_only,
+            claim_state_version=int(getattr(case_board, "claim_state_version", 0) or 0),
+            diagnostic_state_version=int(getattr(case_board, "diagnostic_state_version", 0) or 0),
             open_world_candidates=open_world_candidates,
             mechanism_hypotheses=mechanism_hypotheses,
             clinical_patterns=clinical_patterns,

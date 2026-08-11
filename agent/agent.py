@@ -1011,7 +1011,11 @@ class MyDoctorAgent(BaseDoctorAgent):
         fallback = self.quality_agent.default_final_result(reason)
         if self.diagnosis_chain_enabled:
             evidence = self._normalize_with_exam_recovery(collected_info, exam_results)
-            decision = self.diagnosis_engine.decide(fallback, [], evidence)
+            decision = self.diagnosis_engine.decide(
+                self._diagnosis_input_with_runtime_state(fallback),
+                [],
+                evidence,
+            )
             fallback = self.diagnosis_engine.apply_to_result(fallback, decision, evidence)
         else:
             fallback = self.evidence_engine.review(
@@ -1514,10 +1518,45 @@ class MyDoctorAgent(BaseDoctorAgent):
                 )
                 if isinstance(candidates, list):
                     llm_result["diagnosis_candidates"] = candidates
-            decision = self.diagnosis_engine.decide(llm_result, [], evidence)
+            decision = self.diagnosis_engine.decide(
+                self._diagnosis_input_with_runtime_state(llm_result),
+                [],
+                evidence,
+            )
             payload = dict(getattr(decision, "judge_decision", None) or {})
             if payload:
                 payload["stage"] = "pre_exam_judge"
+                payload["pre_exam_runtime_state_version"] = int(self._diagnostic_state_version or 0)
+                payload["pre_exam_engine_claim_state_version"] = int(
+                    getattr(decision, "claim_state_version", 0) or 0
+                )
+                payload["pre_exam_claim_ledger_size"] = len(
+                    normalize_ledger(self._claim_resolution_ledger)
+                )
+                active_gaps = [
+                    gap for gap in payload.get("active_evidence_gaps", []) or []
+                    if isinstance(gap, dict)
+                ]
+                payload["pre_exam_gap_count"] = len(active_gaps)
+                hydrated = [
+                    gap for gap in active_gaps
+                    if gap.get("claim_resolutions") or gap.get("remaining_claims")
+                ]
+                payload["pre_exam_hydrated_gap_count"] = len(hydrated)
+                payload["pre_exam_remaining_claims_by_gap"] = {
+                    str(gap.get("gap_id") or ""): list(gap.get("remaining_claims") or [])
+                    for gap in hydrated
+                    if str(gap.get("gap_id") or "")
+                }
+                payload["pre_exam_stale_claim_state_detected"] = bool(
+                    int(self._claim_state_version or 0) > 0
+                    and (
+                        int(getattr(decision, "claim_state_version", 0) or 0)
+                        < int(self._claim_state_version or 0)
+                        or len(normalize_ledger(self._claim_resolution_ledger)) > 0
+                        and not hydrated
+                    )
+                )
             return payload
         except Exception as exc:
             logger.debug("[Judge] pre-exam judge skipped: %s", exc)
@@ -1548,13 +1587,18 @@ class MyDoctorAgent(BaseDoctorAgent):
             for item in details
         )
         if not (strategy.get("differential_driven") or has_reserved_gap):
-            return self.exam_agent.prepare_order_items(
+            prepared = self.exam_agent.prepare_order_items(
                 items,
                 collected_info=collected_info,
                 candidate_diseases=candidate_diseases,
                 existing_results=existing_results,
                 max_items=max_items,
                 add_strong_verification=add_strong_verification,
+            )
+            return self._filter_repeat_unauthorized_exams(
+                prepared,
+                existing_results=existing_results,
+                strategy=strategy,
             )
 
         detail_by_exam = {
@@ -1569,7 +1613,22 @@ class MyDoctorAgent(BaseDoctorAgent):
         prepared: List[str] = []
         for item in items:
             exam = str(item or "").strip()
-            if not exam or exam in existing_set or exam in prepared:
+            if not exam or exam in prepared:
+                continue
+            detail = detail_by_exam.get(exam, {})
+            duplicate_reason = self._completed_exam_duplicate_reason(
+                exam,
+                existing_results,
+                authorization_detail=detail,
+            )
+            if duplicate_reason:
+                self._record_exam_repeat_audit(
+                    strategy,
+                    exam=exam,
+                    blocked=True,
+                    reason=duplicate_reason,
+                    detail=detail,
+                )
                 continue
             prepared.append(exam)
         if max_items is None or len(prepared) <= max_items:
@@ -1599,6 +1658,101 @@ class MyDoctorAgent(BaseDoctorAgent):
             if len(selected) >= limit:
                 break
         return selected
+
+    def _filter_repeat_unauthorized_exams(
+        self,
+        items: List[str],
+        *,
+        existing_results: Optional[Dict[str, Any]],
+        strategy: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        filtered: List[str] = []
+        for item in items or []:
+            exam = str(item or "").strip()
+            if not exam or exam in filtered:
+                continue
+            reason = self._completed_exam_duplicate_reason(exam, existing_results)
+            if reason:
+                self._record_exam_repeat_audit(
+                    strategy,
+                    exam=exam,
+                    blocked=True,
+                    reason=reason,
+                    detail={},
+                )
+                continue
+            filtered.append(exam)
+        return filtered
+
+    def _completed_exam_duplicate_reason(
+        self,
+        exam: Any,
+        existing_results: Optional[Dict[str, Any]],
+        *,
+        authorization_detail: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        text = str(exam or "").strip()
+        if not text or not existing_results:
+            return ""
+        detail = authorization_detail or {}
+        if bool(detail.get("repeat_authorized")):
+            return ""
+        if bool(detail.get("repeat_requested")) and str(detail.get("repeat_authorized")).lower() == "true":
+            return ""
+        normalized, _ = self.knowledge.normalize_examinations([text])
+        exam_names = set([text] + list(normalized or []))
+        existing_valid, _ = self.knowledge.normalize_examinations(
+            list((existing_results or {}).keys())
+        )
+        existing_names = set((existing_results or {}).keys()) | set(existing_valid)
+        if exam_names & existing_names:
+            return "COMPLETED_EXAM_DUPLICATE"
+        requested_family = self._exam_repeat_family(text)
+        if not requested_family:
+            return ""
+        for existing in existing_names:
+            if self._exam_repeat_family(existing) == requested_family:
+                return "GENERIC_WORKUP_DUPLICATE_BLOCKED"
+        return ""
+
+    @staticmethod
+    def _exam_repeat_family(exam: Any) -> str:
+        compact = "".join(ch for ch in str(exam or "").lower() if ch.isalnum())
+        if not compact:
+            return ""
+        if "cta" in compact:
+            return "cta"
+        if "ct" in compact:
+            return "ct"
+        if "cxr" in compact:
+            return "cxr"
+        if "xray" in compact or "x线" in compact:
+            return "xray"
+        return ""
+
+    @staticmethod
+    def _record_exam_repeat_audit(
+        strategy: Optional[Dict[str, Any]],
+        *,
+        exam: str,
+        blocked: bool,
+        reason: str,
+        detail: Dict[str, Any],
+    ) -> None:
+        if strategy is None:
+            return
+        audit = strategy.setdefault("exam_repeat_authorization_audit", [])
+        audit.append(
+            {
+                "exam": exam,
+                "blocked": bool(blocked),
+                "repeat_authorized": not blocked,
+                "reason_codes": [reason] if reason else [],
+                "exam_source": str(detail.get("exam_source") or "generic_workup"),
+                "target_gap_ids": list(detail.get("target_gaps") or []),
+                "target_claim_ids": list(detail.get("target_claims") or []),
+            }
+        )
 
     def _normalize_with_exam_recovery(
         self,
@@ -4063,7 +4217,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             if final_rag_chunks:
                 rag_chunks = final_rag_chunks
             decision = self.diagnosis_engine.decide(
-                self._diagnosis_input_with_claim_state(diagnosis_result),
+                self._diagnosis_input_with_runtime_state(diagnosis_result),
                 rag_chunks,
                 evidence,
                 pattern_recall_context=pattern_recall_context,
@@ -4149,7 +4303,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                     candidate_diseases=decision.final_diagnoses or None,
                 )
                 decision = self.diagnosis_engine.decide(
-                    self._diagnosis_input_with_claim_state(diagnosis_result),
+                    self._diagnosis_input_with_runtime_state(diagnosis_result),
                     rag_chunks,
                     evidence,
                     pattern_recall_context=pattern_recall_context,
@@ -4381,7 +4535,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             values = [values]
         return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
-    def _diagnosis_input_with_claim_state(self, result: Any) -> Dict[str, Any]:
+    def _diagnosis_input_with_runtime_state(self, result: Any) -> Dict[str, Any]:
         payload = dict(result or {}) if isinstance(result, dict) else {}
         payload["_claim_resolution_ledger"] = normalize_ledger(
             self._claim_resolution_ledger
@@ -4390,6 +4544,9 @@ class MyDoctorAgent(BaseDoctorAgent):
         payload["_claim_state_version"] = int(self._claim_state_version or 0)
         payload["_diagnostic_state_version"] = int(self._diagnostic_state_version or 0)
         return payload
+
+    def _diagnosis_input_with_claim_state(self, result: Any) -> Dict[str, Any]:
+        return self._diagnosis_input_with_runtime_state(result)
 
     def _augment_evidence_from_reasoning(
         self,

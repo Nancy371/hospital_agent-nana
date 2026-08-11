@@ -1,5 +1,6 @@
 import copy
 import unittest
+from types import SimpleNamespace
 
 import yaml
 
@@ -379,6 +380,82 @@ class AgentTargetedExamRecoveryTests(unittest.TestCase):
         self.assertIn(
             "pulmonary_av_fistula_pattern",
             set(evidence.findings("positive")),
+        )
+
+    def test_pre_exam_judge_payload_injects_runtime_claim_state(self):
+        agent = self.make_agent()
+        ledger = {
+            "D100058|pulmonary_morphology|claim_anchor_contract:D100058|claim_closure_plan_v1": {
+                "entity_id": "D100058",
+                "claim_id": "pulmonary_morphology",
+                "contract_id": "claim_anchor_contract:D100058",
+                "contract_version": "claim_closure_plan_v1",
+                "resolution_status": "SUPPORTED",
+            }
+        }
+        agent._claim_resolution_ledger = ledger
+        agent._claim_state_version = 1
+        agent._diagnostic_state_version = 1
+
+        class CapturingEngine:
+            def __init__(self):
+                self.seen_payload = {}
+
+            def decide(self, llm_result, rag_chunks, evidence):
+                self.seen_payload = dict(llm_result)
+                gap = {
+                    "gap_id": "G-D100058",
+                    "claim_resolutions": list(
+                        llm_result.get("_claim_resolution_ledger", {}).values()
+                    ),
+                    "remaining_claims": ["post_radiotherapy_time_window"],
+                }
+                return SimpleNamespace(
+                    judge_decision={"active_evidence_gaps": [gap]},
+                    claim_state_version=int(llm_result.get("_claim_state_version") or 0),
+                )
+
+        engine = CapturingEngine()
+        agent.diagnosis_engine = engine
+
+        payload = agent._pre_exam_judge_payload(
+            {"symptoms": ["dyspnea"]},
+            {"chest CT": {"status": "abnormal"}},
+            thinking={"differential_diagnosis": ["radiation pneumonitis"]},
+        )
+
+        self.assertEqual(engine.seen_payload["_claim_state_version"], 1)
+        self.assertIn("_claim_resolution_ledger", engine.seen_payload)
+        self.assertEqual(payload["pre_exam_engine_claim_state_version"], 1)
+        self.assertFalse(payload["pre_exam_stale_claim_state_detected"])
+        self.assertEqual(payload["pre_exam_hydrated_gap_count"], 1)
+
+    def test_strategy_order_items_blocks_generic_completed_ct_duplicate(self):
+        agent = self.make_agent()
+        strategy = {
+            "items": ["CT"],
+            "differential_driven": True,
+            "exam_authorization_details": [],
+        }
+
+        items = agent._strategy_order_items(
+            strategy,
+            collected_info={"symptoms": ["dyspnea"]},
+            candidate_diseases=["radiation pneumonitis"],
+            existing_results={"chest CT": {"status": "abnormal"}},
+            max_items=None,
+            add_strong_verification=False,
+        )
+
+        self.assertEqual(items, [])
+        audit = strategy.get("exam_repeat_authorization_audit") or []
+        self.assertTrue(audit)
+        self.assertTrue(
+            {
+                "COMPLETED_EXAM_DUPLICATE",
+                "GENERIC_WORKUP_DUPLICATE_BLOCKED",
+            }
+            & set(audit[0]["reason_codes"])
         )
 
 
