@@ -54,6 +54,8 @@ from .targeted_exam_result_parser import (
     binding_from_authorization_detail,
 )
 from .claim_resolution import ClaimResolutionUpdater, normalize_ledger
+from .context_compiler import StageContextCompiler
+from .llm_contract import LLMContractExecutor
 from .pattern_hypothesis import ThinkingSnapshot, evidence_snapshot_hash as pattern_evidence_snapshot_hash
 from .trace import ArtifactType, TraceCollector
 
@@ -127,6 +129,7 @@ class Planner:
         llm_chat,
         memory: DoctorMemory,
         mark_llm_consumer_result=None,
+        compile_llm_context=None,
     ):
         """初始化规划器。
 
@@ -141,6 +144,7 @@ class Planner:
         self._llm_chat = llm_chat
         self.memory = memory
         self._mark_llm_consumer_result = mark_llm_consumer_result
+        self._compile_llm_context = compile_llm_context
 
         # 规划状态
         self.current_phase = Phase.INITIAL
@@ -186,6 +190,11 @@ class Planner:
             fallback_used=fallback_used,
             fallback_trigger=fallback_trigger,
         )
+
+    def _compile_context(self, stage: str, **state: Any) -> Dict[str, Any]:
+        if self._compile_llm_context is None:
+            return dict(state)
+        return self._compile_llm_context(stage, **state)
 
     def _record_action(self, action_type: str, target: str, result_summary: str) -> None:
         """记录已执行的操作到历史。"""
@@ -250,13 +259,23 @@ class Planner:
             规划结果字典
         """
         # 1. 调用 LLM 生成策略规划
-        planning_prompt = self.prompt.build_planning_prompt(
+        planning_context = self._compile_context(
+            "planning",
             collected_info=collected_info,
             exam_results=exam_results,
             chat_history=chat_history,
-            phase=self.current_phase.value,
             relevant_experience=relevant_experience,
             previous_plan=self.current_plan,
+        )
+        planning_prompt = self.prompt.build_planning_prompt(
+            collected_info=planning_context.get("collected_info", collected_info),
+            exam_results=planning_context.get("exam_results", exam_results),
+            chat_history=planning_context.get("chat_history", chat_history),
+            phase=self.current_phase.value,
+            relevant_experience=planning_context.get(
+                "relevant_experience", relevant_experience
+            ),
+            previous_plan=planning_context.get("previous_plan", self.current_plan),
         )
 
         # 1.5 自迭代增强：拼接 (a) 教训种子 lessons  (b) 命中的策略补丁
@@ -387,12 +406,20 @@ class Planner:
                 "key_unknowns": self.current_plan.get("strategy", {}).get("info_gaps", []),
             }
 
-        criticism_prompt = self.prompt.build_reflection_criticism_prompt(
+        criticism_context = self._compile_context(
+            "planning_criticism",
             current_plan=current_plan,
             collected_info=collected_info,
             exam_results=exam_results,
             thinking_result=thinking_result,
             action_history=self.action_history,
+        )
+        criticism_prompt = self.prompt.build_reflection_criticism_prompt(
+            current_plan=criticism_context.get("current_plan", current_plan),
+            collected_info=criticism_context.get("collected_info", collected_info),
+            exam_results=criticism_context.get("exam_results", exam_results),
+            thinking_result=criticism_context.get("thinking_result", thinking_result),
+            action_history=criticism_context.get("action_history", self.action_history),
         )
         messages = [
             {"role": "system", "content": criticism_prompt},
@@ -738,6 +765,13 @@ class MyDoctorAgent(BaseDoctorAgent):
             "甲状腺功能",
         ]
         self.fast_max_exam_items = int(execution_config.get("fast_max_exam_items", 10) or 10)
+        contract_config = config.get("llm_contract", {}) or {}
+        self.llm_contract_executor = LLMContractExecutor(
+            enabled=bool(contract_config.get("enabled", True)),
+            repair_enabled=bool(contract_config.get("repair_enabled", True)),
+        )
+        self.context_compiler = StageContextCompiler(config.get("context_compiler", {}) or {})
+        self._llm_context_audit: List[Dict[str, Any]] = []
 
         learning_config = config.get("learning", {}) or {}
         self.freeze_active_learning = bool(
@@ -949,7 +983,19 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._llm_call_by_kind = {}
         self._llm_call_audit = []
         self._llm_logical_call_index = 0
+        self._llm_context_audit = []
         self._exp_cache = {}
+
+    def _compile_llm_context(self, stage: str, **state: Any) -> Dict[str, Any]:
+        compiled = self.context_compiler.compile(stage, **state)
+        audit = dict(compiled.get("audit") or {})
+        if audit:
+            audit["claim_state_version"] = int(getattr(self, "_claim_state_version", 0) or 0)
+            audit["diagnostic_state_version"] = int(
+                getattr(self, "_diagnostic_state_version", 0) or 0
+            )
+            self._llm_context_audit.append(audit)
+        return dict(compiled.get("context") or state)
 
     def _can_call_llm(self, kind: str) -> bool:
         """Return False when the per-case LLM budget has been exhausted."""
@@ -992,6 +1038,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             "unexpected_json_type",
             "schema_missing_fields",
             "schema_type_mismatch",
+            "semantic_validation_failed",
             "consumer_rejected",
             "unknown_exception",
         ]
@@ -1051,6 +1098,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 flags.append("schema_missing_fields")
             else:
                 flags.append("schema_type_mismatch")
+        contract_validation = record.get("contract_validation") or {}
+        if isinstance(contract_validation, dict):
+            if contract_validation.get("type_errors"):
+                flags.append("schema_type_mismatch")
+            if contract_validation.get("semantic_success") is False:
+                flags.append("semantic_validation_failed")
         if record.get("consumer_accepted") is False:
             flags.append("consumer_rejected")
         flags = list(dict.fromkeys(flags))
@@ -1074,7 +1127,10 @@ class MyDoctorAgent(BaseDoctorAgent):
         fallback_used: bool = False,
     ) -> Dict[str, Any]:
         metadata = dict(metadata or {})
-        logical_id = self._next_llm_logical_call_id()
+        logical_id = str(metadata.get("logical_call_id") or "")
+        if not logical_id:
+            logical_id = self._next_llm_logical_call_id()
+        attempt_index = int(metadata.get("attempt_index") or 1)
         now = round(time.time(), 3)
         parsed_type = self._parsed_type_name(parsed_value) if json_expected else ""
         parse_success: Optional[bool]
@@ -1100,9 +1156,10 @@ class MyDoctorAgent(BaseDoctorAgent):
         if schema_applicable:
             schema_success = not missing_fields
         record: Dict[str, Any] = {
-            "call_id": f"{logical_id}-A1",
+            "call_id": f"{logical_id}-A{attempt_index}",
             "logical_call_id": logical_id,
-            "attempt_index": int(metadata.get("attempt_index") or 1),
+            "attempt_index": attempt_index,
+            "attempt_type": metadata.get("attempt_type") or "generate",
             "purpose": purpose or "unclassified",
             "stage": stage or purpose or "unclassified",
             "model": metadata.get("model") or getattr(self.llm, "model_name", ""),
@@ -1133,6 +1190,9 @@ class MyDoctorAgent(BaseDoctorAgent):
             "primary_failure_reason": "",
             "fallback_trigger": "",
             "fallback_used": bool(fallback_used),
+            "contract_validation": dict(metadata.get("contract_validation") or {}),
+            "contract_repair_attempted": bool(metadata.get("contract_repair_attempted", False)),
+            "contract_repair_succeeded": metadata.get("contract_repair_succeeded"),
             "exception_type": type(exception).__name__ if exception else metadata.get("exception_type", ""),
         }
         self._classify_llm_audit_record(record)
@@ -1190,6 +1250,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 llm_chat=self._llm_chat,
                 memory=self.memory,
                 mark_llm_consumer_result=self._mark_last_llm_consumer_result,
+                compile_llm_context=self._compile_llm_context,
             )
             self._planner.max_inquiry_rounds = self.max_ask_rounds
             self._planner.max_exam_rounds = self.max_exam_rounds
@@ -1240,6 +1301,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._diagnostic_state_version = 0
         self._case_id_for_thinking = patient_id
         self._thinking_snapshots = []
+        self._llm_context_audit = []
         runner = (
             self._execute_fast_path(patient_id)
             if self.fast_mode
@@ -3786,6 +3848,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "llm_contract_summary": self._llm_contract_summary_from_audit(
                     list(self._llm_call_audit)
                 ),
+                "llm_context_audit": list(runtime_audit.get("llm_context_audit") or []),
                 "tool_call_audit": list(runtime_audit.get("tool_call_audit") or []),
                 "tool_contract_summary": dict(
                     runtime_audit.get("tool_contract_summary") or {}
@@ -4468,7 +4531,8 @@ class MyDoctorAgent(BaseDoctorAgent):
             rag_context = self.memory_manager.render_rag_chunks(rag_chunks)
             preview = self.diagnosis_engine.decide({}, rag_chunks, evidence)
             candidate_table = self.diagnosis_engine.render_candidate_table(preview)
-            diagnosis_prompt = self.prompt.build_diagnosis_prompt(
+            diagnosis_context = self._compile_llm_context(
+                "diagnosis",
                 collected_info=collected_info,
                 exam_results=exam_results,
                 chat_history=chat_history,
@@ -4477,6 +4541,22 @@ class MyDoctorAgent(BaseDoctorAgent):
                 rag_context=rag_context,
                 evidence_summary=evidence.render_summary(),
                 candidate_table=candidate_table,
+            )
+            diagnosis_prompt = self.prompt.build_diagnosis_prompt(
+                collected_info=diagnosis_context.get("collected_info", collected_info),
+                exam_results=diagnosis_context.get("exam_results", exam_results),
+                chat_history=diagnosis_context.get("chat_history", chat_history),
+                relevant_experience=diagnosis_context.get(
+                    "relevant_experience", relevant_experience
+                ),
+                standard_diseases=diagnosis_context.get(
+                    "standard_diseases", self.diagnosis_engine.knowledge.allowed_names
+                ),
+                rag_context=diagnosis_context.get("rag_context", rag_context),
+                evidence_summary=diagnosis_context.get(
+                    "evidence_summary", evidence.render_summary()
+                ),
+                candidate_table=diagnosis_context.get("candidate_table", candidate_table),
             )
             messages = [
                 {"role": "system", "content": diagnosis_prompt},
@@ -4704,6 +4784,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "llm_contract_summary": self._llm_contract_summary_from_audit(
                     list(self._llm_call_audit)
                 ),
+                "llm_context_audit": list(self._llm_context_audit),
                 "tool_call_audit": self.actions.snapshot_tool_audit()
                 if hasattr(self.actions, "snapshot_tool_audit")
                 else [],
@@ -4712,12 +4793,24 @@ class MyDoctorAgent(BaseDoctorAgent):
                 else {},
             }
         else:
-            diagnosis_prompt = self.prompt.build_diagnosis_prompt(
+            diagnosis_context = self._compile_llm_context(
+                "diagnosis",
                 collected_info=collected_info,
                 exam_results=exam_results,
                 chat_history=chat_history,
                 relevant_experience=relevant_experience,
                 standard_diseases=self.knowledge.get_disease_catalog_names(),
+            )
+            diagnosis_prompt = self.prompt.build_diagnosis_prompt(
+                collected_info=diagnosis_context.get("collected_info", collected_info),
+                exam_results=diagnosis_context.get("exam_results", exam_results),
+                chat_history=diagnosis_context.get("chat_history", chat_history),
+                relevant_experience=diagnosis_context.get(
+                    "relevant_experience", relevant_experience
+                ),
+                standard_diseases=diagnosis_context.get(
+                    "standard_diseases", self.knowledge.get_disease_catalog_names()
+                ),
             )
             messages = [
                 {"role": "system", "content": diagnosis_prompt},
@@ -6623,7 +6716,8 @@ class MyDoctorAgent(BaseDoctorAgent):
         except Exception as exc:
             logger.warning("[PatternRecall] failed to build thinking evidence catalog: %s", exc)
 
-        thinking_prompt = self.prompt.build_thinking_prompt(
+        thinking_context = self._compile_llm_context(
+            "thinking",
             collected_info=collected_info,
             exam_results=exam_results or {},
             chat_history=chat_history,
@@ -6631,6 +6725,17 @@ class MyDoctorAgent(BaseDoctorAgent):
             relevant_experience=relevant_experience,
             knowledge_context=knowledge_context,
             evidence_summary=evidence_summary,
+        )
+        thinking_prompt = self.prompt.build_thinking_prompt(
+            collected_info=thinking_context.get("collected_info", collected_info),
+            exam_results=thinking_context.get("exam_results", exam_results or {}),
+            chat_history=thinking_context.get("chat_history", chat_history),
+            phase=phase,
+            relevant_experience=thinking_context.get(
+                "relevant_experience", relevant_experience
+            ),
+            knowledge_context=thinking_context.get("knowledge_context", knowledge_context),
+            evidence_summary=thinking_context.get("evidence_summary", evidence_summary),
         )
         messages = [
             {"role": "system", "content": thinking_prompt},
@@ -6743,6 +6848,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 fallback_used=True,
             )
             return {}
+        logical_call_id = self._next_llm_logical_call_id()
         try:
             result = await self.llm.chat_json(messages, temperature=temperature)
             self._bump_llm_counter("json")
@@ -6751,26 +6857,139 @@ class MyDoctorAgent(BaseDoctorAgent):
                 and set(result.keys()) == {"raw_response"}
                 and isinstance(result.get("raw_response"), str)
             )
+            validation = self.llm_contract_executor.validate(result, purpose)
+            metadata = dict(getattr(self.llm, "last_call_metadata", {}) or {})
+            metadata.update(
+                {
+                    "logical_call_id": logical_call_id,
+                    "attempt_index": 1,
+                    "attempt_type": "generate",
+                    "contract_validation": validation.to_audit(),
+                }
+            )
             self._append_llm_audit(
                 kind="json",
                 purpose=purpose,
                 json_expected=True,
-                metadata=getattr(self.llm, "last_call_metadata", {}) or {},
+                metadata=metadata,
                 parsed_value=result,
                 fallback_used=parse_failed,
             )
+            if validation.accepted or not self.llm_contract_executor.should_repair(validation):
+                return result
+            repaired = await self._repair_llm_json_contract(
+                messages=messages,
+                previous_value=result,
+                validation=validation,
+                logical_call_id=logical_call_id,
+                purpose=purpose,
+            )
+            if repaired is not None:
+                return repaired
             return result
         except Exception as e:
+            metadata = dict(getattr(self.llm, "last_call_metadata", {}) or {})
+            metadata.update(
+                {
+                    "logical_call_id": logical_call_id,
+                    "attempt_index": 1,
+                    "attempt_type": "generate",
+                }
+            )
             self._append_llm_audit(
                 kind="json",
                 purpose=purpose,
                 json_expected=True,
-                metadata=getattr(self.llm, "last_call_metadata", {}) or {},
+                metadata=metadata,
                 exception=e,
                 fallback_used=True,
             )
             logger.error(f"[LLM] JSON 调用失败: {e}")
             return {}
+
+    async def _repair_llm_json_contract(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        previous_value: Any,
+        validation: Any,
+        logical_call_id: str,
+        purpose: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._can_call_llm("json_repair"):
+            self._append_llm_audit(
+                kind="json_repair",
+                purpose=purpose,
+                json_expected=True,
+                metadata={
+                    "logical_call_id": logical_call_id,
+                    "attempt_index": 2,
+                    "attempt_type": "repair",
+                    "contract_validation": validation.to_audit(),
+                    "contract_repair_attempted": True,
+                    "contract_repair_succeeded": False,
+                },
+                model_invoked=False,
+                fallback_used=True,
+            )
+            return None
+        try:
+            repair_messages = self.llm_contract_executor.build_repair_messages(
+                original_messages=messages,
+                previous_value=previous_value,
+                validation=validation,
+            )
+            repaired = await self.llm.chat_json(repair_messages, temperature=0.0)
+            self._bump_llm_counter("json_repair")
+            repair_validation = self.llm_contract_executor.validate(repaired, purpose)
+            parse_failed = (
+                isinstance(repaired, dict)
+                and set(repaired.keys()) == {"raw_response"}
+                and isinstance(repaired.get("raw_response"), str)
+            )
+            metadata = dict(getattr(self.llm, "last_call_metadata", {}) or {})
+            metadata.update(
+                {
+                    "logical_call_id": logical_call_id,
+                    "attempt_index": 2,
+                    "attempt_type": "repair",
+                    "contract_validation": repair_validation.to_audit(),
+                    "contract_repair_attempted": True,
+                    "contract_repair_succeeded": bool(repair_validation.accepted),
+                }
+            )
+            self._append_llm_audit(
+                kind="json_repair",
+                purpose=purpose,
+                json_expected=True,
+                metadata=metadata,
+                parsed_value=repaired,
+                fallback_used=parse_failed,
+            )
+            if repair_validation.accepted:
+                return repaired
+        except Exception as exc:
+            metadata = dict(getattr(self.llm, "last_call_metadata", {}) or {})
+            metadata.update(
+                {
+                    "logical_call_id": logical_call_id,
+                    "attempt_index": 2,
+                    "attempt_type": "repair",
+                    "contract_validation": validation.to_audit(),
+                    "contract_repair_attempted": True,
+                    "contract_repair_succeeded": False,
+                }
+            )
+            self._append_llm_audit(
+                kind="json_repair",
+                purpose=purpose,
+                json_expected=True,
+                metadata=metadata,
+                exception=exc,
+                fallback_used=True,
+            )
+            logger.warning("[LLMContract] repair failed for %s: %s", purpose, exc)
+        return None
 
     async def _extract_patient_info(
         self, patient_response: str, existing_info: Dict[str, Any]

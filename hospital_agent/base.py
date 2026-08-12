@@ -146,6 +146,12 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         for record in (audit.get("tool_call_audit") or [])
         if isinstance(record, dict)
     ]
+    llm_context_audits = [
+        record
+        for audit in audits
+        for record in (audit.get("llm_context_audit") or [])
+        if isinstance(record, dict)
+    ]
 
     def llm_distribution(key: str) -> Dict[str, int]:
         result: Dict[str, int] = {}
@@ -160,6 +166,14 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 text = str(value or "")
                 if text:
                     result[text] = result.get(text, 0) + 1
+        return result
+
+    def llm_context_distribution(key: str) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for record in llm_context_audits:
+            text = str(record.get(key) or "")
+            if text:
+                result[text] = result.get(text, 0) + 1
         return result
 
     llm_failure_by_purpose: Dict[str, int] = {}
@@ -452,6 +466,14 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             else 0.0
         ),
         "llm_fallback_case_rate": round(fallback_case_count / total, 4) if total else 0.0,
+        "llm_context_compile_count": len(llm_context_audits),
+        "llm_context_compile_count_by_stage": llm_context_distribution("stage"),
+        "average_llm_context_chars": _mean_training_value(
+            [record.get("context_chars") for record in llm_context_audits]
+        ),
+        "average_llm_context_estimated_input_tokens": _mean_training_value(
+            [record.get("estimated_input_tokens") for record in llm_context_audits]
+        ),
         "tool_logical_call_count": len(tool_logical_finals),
         "tool_attempt_count": len(tool_call_audits),
         "tool_logical_call_count_by_action": tool_logical_distribution("action"),
@@ -1620,6 +1642,7 @@ class BaseDoctorAgent(ABC):
         return {
             "llm_call_audit": llm_records,
             "llm_contract_summary": llm_summary,
+            "llm_context_audit": list(getattr(self, "_llm_context_audit", []) or []),
             "tool_call_audit": tool_records,
             "tool_contract_summary": tool_summary,
         }
