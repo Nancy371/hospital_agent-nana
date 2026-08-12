@@ -13,7 +13,7 @@ import random
 import time
 import uuid
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -30,6 +30,73 @@ def _mean_training_value(values: List[Any]) -> Optional[float]:
         except (TypeError, ValueError):
             continue
     return round(sum(numbers) / len(numbers), 4) if numbers else None
+
+
+def summarize_tool_call_audit(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate attempt-level tool audit records into logical-call metrics."""
+    attempts = [record for record in records or [] if isinstance(record, dict)]
+    logical: Dict[str, List[Dict[str, Any]]] = {}
+    for record in attempts:
+        logical_id = str(record.get("logical_call_id") or record.get("attempt_id") or "")
+        logical_id = f"{record.get('patient_id') or ''}|{logical_id}"
+        if not logical_id:
+            continue
+        logical.setdefault(logical_id, []).append(record)
+
+    def _dist_attempt(key: str) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for record in attempts:
+            value = record.get(key)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                text = str(item or "")
+                if text:
+                    result[text] = result.get(text, 0) + 1
+        return result
+
+    def _dist_logical(key: str, *, failed_only: bool = False) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for group in logical.values():
+            ordered = sorted(group, key=lambda item: int(item.get("attempt_index") or 0))
+            final = ordered[-1] if ordered else {}
+            if failed_only and final.get("success") is not False:
+                continue
+            value = final.get(key)
+            text = str(value or "")
+            if text:
+                result[text] = result.get(text, 0) + 1
+        return result
+
+    retried = 0
+    recovered = 0
+    exhausted = 0
+    terminal_failures = 0
+    for group in logical.values():
+        ordered = sorted(group, key=lambda item: int(item.get("attempt_index") or 0))
+        if len(ordered) > 1:
+            retried += 1
+        final = ordered[-1] if ordered else {}
+        if len(ordered) > 1 and final.get("success") is True:
+            recovered += 1
+        if final.get("retry_exhausted"):
+            exhausted += 1
+        if final.get("success") is False:
+            terminal_failures += 1
+
+    return {
+        "total_logical_calls": len(logical),
+        "total_attempts": len(attempts),
+        "retried_logical_calls": retried,
+        "retry_recovered_calls": recovered,
+        "retry_exhausted_calls": exhausted,
+        "terminal_failure_logical_calls": terminal_failures,
+        "failure_count_by_reason": _dist_logical(
+            "primary_failure_reason", failed_only=True
+        ),
+        "failure_count_by_action": _dist_logical("action", failed_only=True),
+        "failure_count_by_endpoint": _dist_logical("endpoint", failed_only=True),
+        "attempt_failure_count_by_reason": _dist_attempt("primary_failure_reason"),
+    }
 
 
 def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -71,6 +138,12 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         record
         for audit in audits
         for record in (audit.get("llm_call_audit") or [])
+        if isinstance(record, dict)
+    ]
+    tool_call_audits = [
+        record
+        for audit in audits
+        for record in (audit.get("tool_call_audit") or [])
         if isinstance(record, dict)
     ]
 
@@ -115,6 +188,66 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             for record in (audit.get("llm_call_audit") or [])
         )
     )
+    tool_logical_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for record in tool_call_audits:
+        logical_id = str(record.get("logical_call_id") or record.get("attempt_id") or "")
+        logical_id = f"{record.get('patient_id') or ''}|{logical_id}"
+        if logical_id:
+            tool_logical_groups.setdefault(logical_id, []).append(record)
+    tool_logical_finals = []
+    for group in tool_logical_groups.values():
+        ordered = sorted(group, key=lambda item: int(item.get("attempt_index") or 0))
+        if ordered:
+            tool_logical_finals.append(ordered[-1])
+
+    def tool_logical_distribution(key: str, *, failed_only: bool = False) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for record in tool_logical_finals:
+            if failed_only and record.get("success") is not False:
+                continue
+            text = str(record.get(key) or "")
+            if text:
+                result[text] = result.get(text, 0) + 1
+        return result
+
+    def tool_attempt_distribution(key: str) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for record in tool_call_audits:
+            value = record.get(key)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                text = str(item or "")
+                if text:
+                    result[text] = result.get(text, 0) + 1
+        return result
+
+    tool_failure_case_count = 0
+    for audit in audits:
+        case_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for record in (audit.get("tool_call_audit") or []):
+            if not isinstance(record, dict):
+                continue
+            logical_id = str(record.get("logical_call_id") or record.get("attempt_id") or "")
+            logical_id = f"{record.get('patient_id') or ''}|{logical_id}"
+            if logical_id:
+                case_groups.setdefault(logical_id, []).append(record)
+        if any(
+            sorted(group, key=lambda item: int(item.get("attempt_index") or 0))[-1].get(
+                "success"
+            )
+            is False
+            for group in case_groups.values()
+            if group
+        ):
+            tool_failure_case_count += 1
+    exam_result_calls = [
+        record
+        for record in tool_logical_finals
+        if str(record.get("endpoint") or "") == "/exam/results"
+    ]
+    exam_result_failed_calls = [
+        record for record in exam_result_calls if record.get("success") is False
+    ]
     total = len(results)
     return {
         "cases": total,
@@ -319,6 +452,45 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             else 0.0
         ),
         "llm_fallback_case_rate": round(fallback_case_count / total, 4) if total else 0.0,
+        "tool_logical_call_count": len(tool_logical_finals),
+        "tool_attempt_count": len(tool_call_audits),
+        "tool_logical_call_count_by_action": tool_logical_distribution("action"),
+        "tool_logical_call_count_by_endpoint": tool_logical_distribution("endpoint"),
+        "tool_attempt_failure_count_by_reason": tool_attempt_distribution(
+            "primary_failure_reason"
+        ),
+        "tool_logical_failure_count_by_reason": tool_logical_distribution(
+            "primary_failure_reason", failed_only=True
+        ),
+        "tool_retried_logical_call_count": sum(
+            1 for group in tool_logical_groups.values() if len(group) > 1
+        ),
+        "tool_retry_recovery_count": sum(
+            1
+            for group in tool_logical_groups.values()
+            if len(group) > 1
+            and sorted(group, key=lambda item: int(item.get("attempt_index") or 0))[-1].get(
+                "success"
+            )
+            is True
+        ),
+        "tool_retry_exhausted_count": sum(
+            1 for record in tool_logical_finals if record.get("retry_exhausted")
+        ),
+        "tool_failure_case_count": tool_failure_case_count,
+        "tool_failure_case_rate": round(tool_failure_case_count / total, 4)
+        if total
+        else 0.0,
+        "exam_results_logical_call_count": len(exam_result_calls),
+        "exam_results_logical_failure_count": len(exam_result_failed_calls),
+        "exam_results_failure_rate": (
+            round(len(exam_result_failed_calls) / len(exam_result_calls), 4)
+            if exam_result_calls
+            else 0.0
+        ),
+        "exam_results_retry_exhausted_count": sum(
+            1 for record in exam_result_failed_calls if record.get("retry_exhausted")
+        ),
         "average_elapsed_seconds": _mean_training_value(
             [audit.get("elapsed_seconds") for audit in audits]
         ),
@@ -377,6 +549,56 @@ class Actions:
         self._ordered_examinations: Dict[str, List[str]] = {}
         self._client: Optional[httpx.AsyncClient] = None
         self.trace_collector = None
+        self.tool_call_audit: List[Dict[str, Any]] = []
+        self._tool_logical_call_index = 0
+
+    def begin_case(self, patient_id: str) -> None:
+        """Reset per-case tool audit state."""
+        self.tool_call_audit = []
+        self._tool_logical_call_index = 0
+
+    def snapshot_tool_audit(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self.tool_call_audit]
+
+    def tool_contract_summary(self) -> Dict[str, Any]:
+        return summarize_tool_call_audit(self.snapshot_tool_audit())
+
+    def _next_tool_logical_call_id(self) -> str:
+        self._tool_logical_call_index += 1
+        return f"TC{self._tool_logical_call_index:04d}"
+
+    @staticmethod
+    def _response_shape(value: Any) -> str:
+        if isinstance(value, dict):
+            return "dict"
+        if isinstance(value, list):
+            return "list"
+        if value is None:
+            return "null"
+        return type(value).__name__
+
+    @staticmethod
+    def _classify_tool_exception(error: BaseException) -> Dict[str, Any]:
+        if isinstance(error, httpx.ReadTimeout):
+            return {"flags": ["timeout", "read_timeout"], "reason": "read_timeout"}
+        if isinstance(error, httpx.ConnectTimeout):
+            return {"flags": ["timeout", "connect_timeout"], "reason": "connect_timeout"}
+        if isinstance(error, httpx.ConnectError):
+            return {"flags": ["connect_error"], "reason": "connect_error"}
+        return {"flags": ["unknown_exception"], "reason": "unknown_exception"}
+
+    @staticmethod
+    def _classify_http_status(status_code: int) -> Dict[str, Any]:
+        if status_code == 429:
+            return {"flags": ["http_429"], "reason": "http_429", "retryable": True}
+        if 500 <= status_code:
+            return {"flags": ["http_5xx"], "reason": "http_5xx", "retryable": True}
+        if 400 <= status_code:
+            return {"flags": ["http_4xx"], "reason": "http_4xx", "retryable": False}
+        return {"flags": [], "reason": "", "retryable": False}
+
+    def _append_tool_attempt_record(self, record: Dict[str, Any]) -> None:
+        self.tool_call_audit.append(record)
 
     def _trace_tool_called(
         self,
@@ -533,7 +755,7 @@ class Actions:
             )
         return self._client
 
-    async def _request(self, method: str, path: str, **kwargs) -> Any:
+    async def _request_legacy(self, method: str, path: str, **kwargs) -> Any:
         """发送 HTTP 请求。
 
         Args:
@@ -608,11 +830,213 @@ class Actions:
             raise last_error
         raise RuntimeError(f"HTTP request failed before sending: {method} {path}")
 
+    async def _request(self, method: str, path: str, **kwargs) -> Any:
+        """Send an HTTP request and record attempt-level tool audit."""
+        audit_context = dict(kwargs.pop("_audit_context", {}) or {})
+        client = await self._get_client()
+        last_error: Optional[httpx.HTTPStatusError] = None
+        candidate_paths = self._candidate_paths(path)
+        tried_paths: List[str] = []
+        max_retries = 3
+        logical_call_id = self._next_tool_logical_call_id()
+        attempt_counter = 0
+        action = str(audit_context.get("action") or "http_request")
+        patient_id = str(audit_context.get("patient_id") or "")
+        items = audit_context.get("items") or []
+        if not isinstance(items, list):
+            items = [items]
+        item_names = [str(item) for item in items if str(item).strip()]
+
+        def _base_record(
+            candidate_path: str,
+            attempt_index: int,
+            started: float,
+            started_at: str,
+        ) -> Dict[str, Any]:
+            return {
+                "attempt_id": f"{logical_call_id}-A{attempt_index}",
+                "logical_call_id": logical_call_id,
+                "attempt_index": attempt_index,
+                "patient_id": patient_id,
+                "action": action,
+                "endpoint": candidate_path,
+                "method": method.upper(),
+                "items_count": len(item_names),
+                "item_names_preview": item_names[:10],
+                "started_at": started_at,
+                "latency_ms": round((time.monotonic() - started) * 1000, 2),
+                "http_status": None,
+                "response_present": False,
+                "response_chars": 0,
+                "content_type": "",
+                "json_decode_success": None,
+                "response_shape": "",
+                "success": False,
+                "failure_flags": [],
+                "primary_failure_reason": "",
+                "retryable": False,
+                "will_retry": False,
+                "retry_exhausted": False,
+                "exception_type": "",
+                "backend_request_id": "",
+            }
+
+        for candidate_path in candidate_paths:
+            tried_paths.append(candidate_path)
+            response = None
+            for attempt in range(max_retries):
+                attempt_counter += 1
+                started_at = (
+                    datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z")
+                )
+                started = time.monotonic()
+                try:
+                    response = await client.request(method, candidate_path, **kwargs)
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as net_err:
+                    classification = self._classify_tool_exception(net_err)
+                    will_retry = attempt < max_retries - 1
+                    record = _base_record(
+                        candidate_path, attempt_counter, started, started_at
+                    )
+                    record.update(
+                        {
+                            "failure_flags": list(classification["flags"])
+                            + ([] if will_retry else ["retry_exhausted"]),
+                            "primary_failure_reason": classification["reason"],
+                            "retryable": True,
+                            "will_retry": will_retry,
+                            "retry_exhausted": not will_retry,
+                            "exception_type": type(net_err).__name__,
+                        }
+                    )
+                    self._append_tool_attempt_record(record)
+                    if not will_retry:
+                        logger.error(
+                            "[Action] %s %s 网络错误(已重试 %d 次): %s",
+                            method, candidate_path, max_retries, net_err,
+                        )
+                        raise
+                    delay = 0.5 * (2 ** attempt)
+                    logger.warning(
+                        "[Action] %s %s 网络错误(第 %d 次): %s, %.1fs 后重试",
+                        method, candidate_path, attempt + 1, net_err, delay,
+                    )
+                    await asyncio.sleep(delay)
+            try:
+                response.raise_for_status()
+                try:
+                    payload = response.json()
+                except ValueError as json_err:
+                    response_text = response.text or ""
+                    if response_text:
+                        failure_reason = "invalid_json_response"
+                        failure_flags = ["invalid_json_response"]
+                    else:
+                        failure_reason = "empty_response"
+                        failure_flags = ["empty_response"]
+                    record = _base_record(
+                        candidate_path, attempt_counter, started, started_at
+                    )
+                    record.update(
+                        {
+                            "http_status": response.status_code,
+                            "response_present": True,
+                            "response_chars": len(response_text),
+                            "content_type": response.headers.get("content-type", ""),
+                            "json_decode_success": False,
+                            "failure_flags": failure_flags,
+                            "primary_failure_reason": failure_reason,
+                            "exception_type": type(json_err).__name__,
+                        }
+                    )
+                    self._append_tool_attempt_record(record)
+                    raise
+                record = _base_record(
+                    candidate_path, attempt_counter, started, started_at
+                )
+                record.update(
+                    {
+                        "http_status": response.status_code,
+                        "response_present": True,
+                        "response_chars": len(response.text or ""),
+                        "content_type": response.headers.get("content-type", ""),
+                        "json_decode_success": True,
+                        "response_shape": self._response_shape(payload),
+                        "success": True,
+                        "backend_request_id": str(payload.get("request_id") or "")
+                        if isinstance(payload, dict)
+                        else "",
+                    }
+                )
+                self._append_tool_attempt_record(record)
+                if candidate_path != path:
+                    logger.info(
+                        "[Action] endpoint fallback 命中: %s -> %s",
+                        path,
+                        candidate_path,
+                    )
+                return payload
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                response = e.response
+                status_code = response.status_code if response is not None else 0
+                classification = self._classify_http_status(status_code)
+                will_retry = status_code == 404 and candidate_path != candidate_paths[-1]
+                record = _base_record(
+                    candidate_path, attempt_counter, started, started_at
+                )
+                record.update(
+                    {
+                        "http_status": status_code or None,
+                        "response_present": response is not None,
+                        "response_chars": len(response.text or "")
+                        if response is not None
+                        else 0,
+                        "content_type": response.headers.get("content-type", "")
+                        if response is not None
+                        else "",
+                        "json_decode_success": False,
+                        "failure_flags": classification["flags"],
+                        "primary_failure_reason": classification["reason"],
+                        "retryable": bool(classification.get("retryable")),
+                        "will_retry": will_retry,
+                        "exception_type": type(e).__name__,
+                    }
+                )
+                self._append_tool_attempt_record(record)
+                if will_retry:
+                    logger.warning(
+                        "[Action] %s %s 返回 404，尝试下一个 endpoint 前缀",
+                        method,
+                        candidate_path,
+                    )
+                    continue
+                break
+
+        if last_error is not None:
+            response = last_error.response
+            detail = response.text[:300] if response is not None else ""
+            if response is not None and response.status_code == 404:
+                logger.error(
+                    "[Action] 404 Not Found: base_url=%s, tried_paths=%s, "
+                    "可能原因：病例 ID 在当前 token/team 下不可访问，或 SERVICE_BASE_URL/endpoint 前缀不匹配。"
+                    "response=%s",
+                    self.base_url,
+                    tried_paths,
+                    detail,
+                )
+            raise last_error
+        raise RuntimeError(f"HTTP request failed before sending: {method} {path}")
+
     async def _invoke_action(
         self,
         patient_id: str,
         action: str,
         input_data: Dict[str, Any],
+        audit_context: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Call the unified /invoke action endpoint used by the current service."""
         if not self.model_api_key:
@@ -626,7 +1050,13 @@ class Actions:
                 "input_data": input_data,
             },
         }
-        return await self._request("POST", self.invoke_path, json=payload)
+        return await self._request(
+            "POST",
+            self.invoke_path,
+            json=payload,
+            _audit_context=audit_context
+            or {"action": action, "patient_id": patient_id},
+        )
 
     async def _invoke_or_direct(
         self,
@@ -635,11 +1065,17 @@ class Actions:
         invoke_input: Dict[str, Any],
         direct_path: str,
         direct_payload: Dict[str, Any],
+        audit_context: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Prefer /invoke, with direct action endpoints as a compatibility fallback."""
         if self.use_invoke:
             try:
-                return await self._invoke_action(patient_id, action, invoke_input)
+                return await self._invoke_action(
+                    patient_id,
+                    action,
+                    invoke_input,
+                    audit_context=audit_context,
+                )
             except httpx.HTTPStatusError as e:
                 if e.response is None or e.response.status_code != 404:
                     raise
@@ -649,7 +1085,13 @@ class Actions:
                     self.invoke_path,
                     direct_path,
                 )
-        return await self._request("POST", direct_path, json=direct_payload)
+        return await self._request(
+            "POST",
+            direct_path,
+            json=direct_payload,
+            _audit_context=audit_context
+            or {"action": action, "patient_id": patient_id},
+        )
 
     def _remember_ordered_examinations(
         self,
@@ -717,6 +1159,10 @@ class Actions:
                     "input_data": input_data,
                     "team_id": self.team_id,
                 },
+                audit_context={
+                    "action": "ask_patient",
+                    "patient_id": patient_id,
+                },
             )
             answer = result.get("answer", result.get("response", ""))
             if isinstance(answer, dict):
@@ -764,6 +1210,11 @@ class Actions:
                     "items": items,
                     "reason": reason,
                     "team_id": self.team_id,
+                },
+                _audit_context={
+                    "action": "order_examination",
+                    "patient_id": patient_id,
+                    "items": items,
                 },
             )
             self._remember_ordered_examinations(patient_id, result, items)
@@ -864,6 +1315,10 @@ class Actions:
                     "final_result": final_result,
                     "team_id": self.team_id,
                 },
+                _audit_context={
+                    "action": "evaluation",
+                    "patient_id": patient_id,
+                },
             )
             self._trace_tool_returned("evaluation", call_id, result, result)
             return result
@@ -893,6 +1348,10 @@ class Actions:
                     "team_id": self.team_id,
                     "api_key": self.model_api_key,
                     "final_result": final_results,
+                },
+                _audit_context={
+                    "action": "batch_evaluation",
+                    "patient_id": "",
                 },
             )
             self._write_batch_evaluation_report(test_dir, result)
@@ -1141,6 +1600,30 @@ class BaseDoctorAgent(ABC):
         # 输出目录
         self.output_dir = config.get("output_dir", "outputs")
 
+    def _collect_runtime_audit(self) -> Dict[str, Any]:
+        """Collect lightweight runtime audit even when a case fails early."""
+        tool_records = []
+        tool_summary: Dict[str, Any] = {}
+        actions = getattr(self, "actions", None)
+        if actions is not None:
+            snapshot = getattr(actions, "snapshot_tool_audit", None)
+            summary = getattr(actions, "tool_contract_summary", None)
+            if callable(snapshot):
+                tool_records = snapshot()
+            if callable(summary):
+                tool_summary = summary()
+        llm_records = list(getattr(self, "_llm_call_audit", []) or [])
+        llm_summary: Dict[str, Any] = {}
+        llm_summary_builder = getattr(self, "_llm_contract_summary_from_audit", None)
+        if callable(llm_summary_builder):
+            llm_summary = llm_summary_builder(llm_records)
+        return {
+            "llm_call_audit": llm_records,
+            "llm_contract_summary": llm_summary,
+            "tool_call_audit": tool_records,
+            "tool_contract_summary": tool_summary,
+        }
+
     @abstractmethod
     async def train(self, patient_id: str) -> Optional[Dict[str, Any]]:
         """训练流程：对单个患者进行诊疗。
@@ -1322,13 +1805,15 @@ class BaseDoctorAgent(ABC):
         for i, patient_id in enumerate(patient_ids):
             logger.info(f"[run_train] 训练进度: {i + 1}/{len(patient_ids)}, patient_id={patient_id}")
             try:
+                if hasattr(self.actions, "begin_case"):
+                    self.actions.begin_case(patient_id)
                 case_result = await self.train(patient_id)
                 if not isinstance(case_result, dict):
                     case_result = {
                         "patient_id": patient_id,
                         "status": "completed",
                         "metrics": {},
-                        "audit": {},
+                        "audit": self._collect_runtime_audit(),
                     }
                 results.append(case_result)
                 success_count += 1
@@ -1340,7 +1825,7 @@ class BaseDoctorAgent(ABC):
                         "status": "failed",
                         "error": str(e),
                         "metrics": {},
-                        "audit": {},
+                        "audit": self._collect_runtime_audit(),
                     }
                 )
                 fail_count += 1

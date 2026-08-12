@@ -2439,6 +2439,8 @@ class MyDoctorAgent(BaseDoctorAgent):
             patient_id: 患者 ID
         """
         logger.info(f"[Train] 开始训练患者: {patient_id}")
+        if hasattr(self.actions, "begin_case"):
+            self.actions.begin_case(patient_id)
         trace = getattr(self, "trace_collector", None)
         case_span_id = None
         if trace and trace.enabled:
@@ -2785,6 +2787,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         reflection_error: str = "",
     ) -> Dict[str, Any]:
         """Build a compact, secret-free record for batch training reports."""
+        runtime_audit = self._collect_runtime_audit()
         detail = report.get("diagnosisDetail") or report.get("diagnosis_detail") or {}
         if not isinstance(detail, dict):
             detail = {}
@@ -3783,6 +3786,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "llm_contract_summary": self._llm_contract_summary_from_audit(
                     list(self._llm_call_audit)
                 ),
+                "tool_call_audit": list(runtime_audit.get("tool_call_audit") or []),
+                "tool_contract_summary": dict(
+                    runtime_audit.get("tool_contract_summary") or {}
+                ),
                 "exam_authorization": exam_authorization_records,
                 "exam_authorization_mode": exam_authorization_mode,
                 "exam_result_intent_bindings": targeted_bindings,
@@ -4697,6 +4704,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "llm_contract_summary": self._llm_contract_summary_from_audit(
                     list(self._llm_call_audit)
                 ),
+                "tool_call_audit": self.actions.snapshot_tool_audit()
+                if hasattr(self.actions, "snapshot_tool_audit")
+                else [],
+                "tool_contract_summary": self.actions.tool_contract_summary()
+                if hasattr(self.actions, "tool_contract_summary")
+                else {},
             }
         else:
             diagnosis_prompt = self.prompt.build_diagnosis_prompt(
