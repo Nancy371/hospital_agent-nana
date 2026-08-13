@@ -2122,6 +2122,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             for item in details
         )
         if not (strategy.get("differential_driven") or has_reserved_gap):
+            detail_by_exam = self._exam_authorization_detail_by_exam(details)
             prepared = self.exam_agent.prepare_order_items(
                 items,
                 collected_info=collected_info,
@@ -2134,13 +2135,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 prepared,
                 existing_results=existing_results,
                 strategy=strategy,
+                detail_by_exam=detail_by_exam,
             )
 
-        detail_by_exam = {
-            str(item.get("exam") or "").strip(): item
-            for item in details
-            if str(item.get("exam") or "").strip()
-        }
+        detail_by_exam = self._exam_authorization_detail_by_exam(details)
         existing_valid, _ = self.knowledge.normalize_examinations(
             list((existing_results or {}).keys())
         )
@@ -2151,20 +2149,28 @@ class MyDoctorAgent(BaseDoctorAgent):
             if not exam or exam in prepared:
                 continue
             detail = detail_by_exam.get(exam, {})
-            duplicate_reason = self._completed_exam_duplicate_reason(
+            authorization = self._authorize_exam_route(
                 exam,
                 existing_results,
                 authorization_detail=detail,
             )
-            if duplicate_reason:
+            if not authorization.get("authorized"):
                 self._record_exam_repeat_audit(
                     strategy,
                     exam=exam,
                     blocked=True,
-                    reason=duplicate_reason,
-                    detail=detail,
+                    reason=str((authorization.get("reason_codes") or [""])[0]),
+                    detail={**detail, **authorization},
                 )
                 continue
+            if detail:
+                self._record_exam_repeat_audit(
+                    strategy,
+                    exam=exam,
+                    blocked=False,
+                    reason=str((authorization.get("reason_codes") or ["EXAM_ROUTE_AUTHORIZED"])[0]),
+                    detail={**detail, **authorization},
+                )
             prepared.append(exam)
         if max_items is None or len(prepared) <= max_items:
             return prepared
@@ -2200,24 +2206,76 @@ class MyDoctorAgent(BaseDoctorAgent):
         *,
         existing_results: Optional[Dict[str, Any]],
         strategy: Optional[Dict[str, Any]] = None,
+        detail_by_exam: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[str]:
         filtered: List[str] = []
+        detail_by_exam = detail_by_exam or {}
         for item in items or []:
             exam = str(item or "").strip()
             if not exam or exam in filtered:
                 continue
-            reason = self._completed_exam_duplicate_reason(exam, existing_results)
-            if reason:
+            detail = self._authorization_detail_for_order_exam(exam, detail_by_exam)
+            authorization = self._authorize_exam_route(
+                exam,
+                existing_results,
+                authorization_detail=detail,
+            )
+            if not authorization.get("authorized"):
                 self._record_exam_repeat_audit(
                     strategy,
                     exam=exam,
                     blocked=True,
-                    reason=reason,
-                    detail={},
+                    reason=str((authorization.get("reason_codes") or [""])[0]),
+                    detail={**detail, **authorization},
                 )
                 continue
+            if detail:
+                self._record_exam_repeat_audit(
+                    strategy,
+                    exam=exam,
+                    blocked=False,
+                    reason=str((authorization.get("reason_codes") or ["EXAM_ROUTE_AUTHORIZED"])[0]),
+                    detail={**detail, **authorization},
+                )
             filtered.append(exam)
         return filtered
+
+    def _exam_authorization_detail_by_exam(
+        self,
+        details: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        result: Dict[str, Dict[str, Any]] = {}
+        for detail in details or []:
+            if not isinstance(detail, dict):
+                continue
+            keys = [
+                detail.get("exam"),
+                detail.get("requested_exam"),
+                detail.get("resolved_exam"),
+            ]
+            for key in keys:
+                text = str(key or "").strip()
+                if text and text not in result:
+                    result[text] = detail
+        return result
+
+    def _authorization_detail_for_order_exam(
+        self,
+        exam: str,
+        detail_by_exam: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if exam in detail_by_exam:
+            return detail_by_exam[exam]
+        normalized, _ = self.knowledge.normalize_examinations([exam])
+        for name in [exam] + list(normalized or []):
+            if name in detail_by_exam:
+                return detail_by_exam[name]
+        requested_family = self._exam_repeat_family(exam)
+        if requested_family:
+            for key, detail in detail_by_exam.items():
+                if self._exam_repeat_family(key) == requested_family:
+                    return detail
+        return {}
 
     def _completed_exam_duplicate_reason(
         self,
@@ -2226,14 +2284,58 @@ class MyDoctorAgent(BaseDoctorAgent):
         *,
         authorization_detail: Optional[Dict[str, Any]] = None,
     ) -> str:
+        authorization = self._authorize_exam_route(
+            exam,
+            existing_results,
+            authorization_detail=authorization_detail,
+        )
+        if authorization.get("authorized"):
+            return ""
+        reasons = list(authorization.get("reason_codes") or [])
+        return str(reasons[0]) if reasons else ""
+
+    def _authorize_exam_route(
+        self,
+        exam: Any,
+        existing_results: Optional[Dict[str, Any]],
+        *,
+        authorization_detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         text = str(exam or "").strip()
-        if not text or not existing_results:
-            return ""
         detail = authorization_detail or {}
-        if bool(detail.get("repeat_authorized")):
-            return ""
-        if bool(detail.get("repeat_requested")) and str(detail.get("repeat_authorized")).lower() == "true":
-            return ""
+        result: Dict[str, Any] = {
+            "exam": text,
+            "authorized": True,
+            "reason_codes": [],
+            "repeat_requested": bool(detail.get("repeat_requested")),
+            "repeat_authorized": bool(detail.get("repeat_authorized")),
+            "repeat_reason_codes": list(detail.get("repeat_reason_codes") or []),
+            "exam_source": str(detail.get("exam_source") or "generic_workup"),
+            "target_gap_ids": list(detail.get("target_gaps") or []),
+            "target_claim_ids": list(detail.get("target_claims") or []),
+            "route_target_claim_ids": list(detail.get("route_target_claims") or []),
+            "closure_route_ids": [
+                str(route.get("route_id") or route.get("id") or "")
+                for route in detail.get("closure_routes", []) or []
+                if isinstance(route, dict)
+            ],
+            "source_evidence_version": detail.get("source_evidence_version"),
+            "prior_result_state": "none",
+        }
+        if not text:
+            result["authorized"] = False
+            result["reason_codes"] = ["EMPTY_EXAM"]
+            return result
+        if not existing_results:
+            result["reason_codes"] = ["NO_PRIOR_RESULT"]
+            return result
+        if self._detail_has_valid_repeat_authorization(detail):
+            result["reason_codes"] = list(
+                dict.fromkeys(
+                    list(result["repeat_reason_codes"]) or ["EXPLICIT_REPEAT_AUTHORIZED"]
+                )
+            )
+            return result
         normalized, _ = self.knowledge.normalize_examinations([text])
         exam_names = set([text] + list(normalized or []))
         existing_valid, _ = self.knowledge.normalize_examinations(
@@ -2241,13 +2343,71 @@ class MyDoctorAgent(BaseDoctorAgent):
         )
         existing_names = set((existing_results or {}).keys()) | set(existing_valid)
         if exam_names & existing_names:
-            return "COMPLETED_EXAM_DUPLICATE"
+            result["authorized"] = False
+            result["prior_result_state"] = "completed_same_exam"
+            result["reason_codes"] = [
+                self._completed_route_reason(detail) or "COMPLETED_EXAM_DUPLICATE"
+            ]
+            return result
         requested_family = self._exam_repeat_family(text)
         if not requested_family:
-            return ""
+            result["reason_codes"] = ["NO_PRIOR_EQUIVALENT_RESULT"]
+            return result
         for existing in existing_names:
             if self._exam_repeat_family(existing) == requested_family:
-                return "GENERIC_WORKUP_DUPLICATE_BLOCKED"
+                result["authorized"] = False
+                result["prior_result_state"] = "completed_equivalent_exam_family"
+                result["reason_codes"] = [
+                    self._completed_route_reason(detail)
+                    or "GENERIC_WORKUP_DUPLICATE_BLOCKED"
+                ]
+                return result
+        result["reason_codes"] = ["NO_PRIOR_EQUIVALENT_RESULT"]
+        return result
+
+    @staticmethod
+    def _detail_has_valid_repeat_authorization(detail: Dict[str, Any]) -> bool:
+        if not detail:
+            return False
+        if bool(detail.get("repeat_authorized")):
+            return True
+        if bool(detail.get("repeat_requested")) and str(detail.get("repeat_authorized")).lower() == "true":
+            return True
+        reasons = {
+            str(item or "").strip()
+            for item in detail.get("repeat_reason_codes", []) or []
+            if str(item or "").strip()
+        }
+        allowed = {
+            "NEW_TARGET_CLAIM",
+            "PRIOR_RESULT_INADEQUATE",
+            "PRIOR_TOOL_FAILURE",
+            "NEW_MATERIAL_EVIDENCE",
+            "LONGITUDINAL_MONITORING",
+            "EVIDENCE_STALE",
+            "CONTRADICTION_RESOLUTION",
+            "TECHNICAL_FAILURE_RETRY",
+        }
+        return bool(reasons & allowed)
+
+    @staticmethod
+    def _completed_route_reason(detail: Dict[str, Any]) -> str:
+        route_claims = {
+            str(item or "").strip()
+            for item in detail.get("route_target_claims", []) or []
+            if str(item or "").strip()
+        }
+        all_claims = {
+            str(item or "").strip()
+            for item in detail.get("target_claims", []) or []
+            if str(item or "").strip()
+        }
+        if route_claims:
+            return "CLAIM_ROUTE_ALREADY_RESOLVED"
+        if all_claims:
+            return "COMPLETED_EXAM_DUPLICATE"
+        if str(detail.get("exam_source") or "") == "generic_workup":
+            return "GENERIC_WORKUP_DUPLICATE_BLOCKED"
         return ""
 
     @staticmethod
@@ -2282,12 +2442,59 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "exam": exam,
                 "blocked": bool(blocked),
                 "repeat_authorized": not blocked,
-                "reason_codes": [reason] if reason else [],
+                "reason_codes": list(
+                    dict.fromkeys(
+                        ([reason] if reason else [])
+                        + list(detail.get("repeat_reason_codes") or [])
+                    )
+                ),
                 "exam_source": str(detail.get("exam_source") or "generic_workup"),
                 "target_gap_ids": list(detail.get("target_gaps") or []),
                 "target_claim_ids": list(detail.get("target_claims") or []),
+                "route_target_claim_ids": list(detail.get("route_target_claims") or []),
+                "closure_route_ids": [
+                    str(route.get("route_id") or route.get("id") or "")
+                    for route in detail.get("closure_routes", []) or []
+                    if isinstance(route, dict)
+                ],
+                "source_evidence_version": detail.get("source_evidence_version"),
+                "prior_result_state": str(detail.get("prior_result_state") or ""),
             }
         )
+
+    def _record_exam_route_authorization_summary(
+        self,
+        *,
+        stage: str,
+        strategy: Dict[str, Any],
+        authorized_items: Optional[List[str]] = None,
+        target: str = "",
+    ) -> None:
+        audit = [
+            item
+            for item in strategy.get("exam_repeat_authorization_audit", []) or []
+            if isinstance(item, dict)
+        ]
+        if not audit:
+            return
+        summary = {
+            "stage": stage,
+            "target": target,
+            "authorized_items": list(authorized_items or []),
+            "exam_repeat_authorization_audit": audit,
+            "exam_route_authorization_blocked_count": sum(
+                1 for item in audit if item.get("blocked")
+            ),
+            "exam_route_authorization_allowed_count": sum(
+                1 for item in audit if not item.get("blocked")
+            ),
+        }
+        if self._last_exam_authorization and str(
+            self._last_exam_authorization[-1].get("stage") or ""
+        ) == stage:
+            self._last_exam_authorization[-1].update(summary)
+        else:
+            self._last_exam_authorization.append(summary)
 
     def _normalize_with_exam_recovery(
         self,
@@ -2643,6 +2850,12 @@ class MyDoctorAgent(BaseDoctorAgent):
             existing_results=exam_results,
             max_items=self.exam_agent.max_new_items,
             add_strong_verification=False,
+        )
+        self._record_exam_route_authorization_summary(
+            stage="planner_exam",
+            target=target,
+            strategy=strategy,
+            authorized_items=exam_items,
         )
         if not exam_items:
             logger.info("[检查] 无检查项目需要申请")
@@ -3390,6 +3603,13 @@ class MyDoctorAgent(BaseDoctorAgent):
             for detail in (record.get("exam_authorization_details") or [])
             if isinstance(detail, dict)
         ]
+        exam_route_authorization_audit = [
+            item
+            for record in exam_authorization_records
+            if isinstance(record, dict)
+            for item in (record.get("exam_repeat_authorization_audit") or [])
+            if isinstance(item, dict)
+        ]
         ordered_exam_set = set(ordered_exam_names)
         ordered_authorization_details = [
             detail
@@ -3480,6 +3700,24 @@ class MyDoctorAgent(BaseDoctorAgent):
             int(record.get("generic_exam_suppression_count", 0) or 0)
             for record in exam_authorization_records
             if isinstance(record, dict)
+        )
+        exam_route_blocked_count = sum(
+            1 for item in exam_route_authorization_audit if item.get("blocked")
+        )
+        exam_route_repeat_authorized_count = sum(
+            1
+            for item in exam_route_authorization_audit
+            if not item.get("blocked") and item.get("repeat_authorized")
+        )
+        exam_route_claim_resolved_block_count = sum(
+            1
+            for item in exam_route_authorization_audit
+            if "CLAIM_ROUTE_ALREADY_RESOLVED" in (item.get("reason_codes") or [])
+        )
+        exam_route_generic_duplicate_block_count = sum(
+            1
+            for item in exam_route_authorization_audit
+            if "GENERIC_WORKUP_DUPLICATE_BLOCKED" in (item.get("reason_codes") or [])
         )
         post_exam_primary_recomputed_rate = bool(
             any(
@@ -3869,6 +4107,10 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "special_discriminator_rate": special_discriminator_rate,
                 "multi_candidate_exam_rate": multi_candidate_exam_rate,
                 "generic_exam_suppression_count": generic_exam_suppression_count,
+                "exam_route_authorization_blocked_count": exam_route_blocked_count,
+                "exam_route_repeat_authorized_count": exam_route_repeat_authorized_count,
+                "exam_route_claim_resolved_block_count": exam_route_claim_resolved_block_count,
+                "exam_route_generic_duplicate_block_count": exam_route_generic_duplicate_block_count,
                 "post_exam_primary_recomputed_rate": post_exam_primary_recomputed_rate,
                 "discriminating_gap_closed_rate": discriminating_gap_closed_rate,
                 "gap_closure_rate": gap_closure_rate,
@@ -4052,6 +4294,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "failure_attribution": failure_attribution,
                 "exam_authorization": exam_authorization_records,
                 "exam_authorization_mode": exam_authorization_mode,
+                "exam_route_authorization_audit": exam_route_authorization_audit,
                 "exam_result_intent_bindings": targeted_bindings,
                 "exam_execution_resolution": targeted_bindings,
                 "targeted_exam_result_parses": targeted_parses,
@@ -5827,6 +6070,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 max_items=self.diagnosis_critic.max_corrective_exam_items,
                 add_strong_verification=False,
             )
+            route_audit_strategy = strategy_for_items
         else:
             items = self.exam_agent.prepare_order_items(
                 ordered_items,
@@ -5836,10 +6080,16 @@ class MyDoctorAgent(BaseDoctorAgent):
                 max_items=self.diagnosis_critic.max_corrective_exam_items,
                 add_strong_verification=False,
             )
+            route_audit_strategy = strategy
+        if route_audit_strategy.get("exam_repeat_authorization_audit"):
+            strategy["exam_repeat_authorization_audit"] = list(
+                route_audit_strategy.get("exam_repeat_authorization_audit") or []
+            )
         if (
             strategy.get("strict_diagnosis_driven")
             or strategy.get("differential_driven")
             or strategy.get("blocked_items")
+            or strategy.get("exam_repeat_authorization_audit")
         ):
             self._last_exam_authorization.append(
                 {
@@ -5865,6 +6115,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                     ),
                     "generic_exam_suppression_count": int(
                         strategy.get("generic_exam_suppression_count", 0) or 0
+                    ),
+                    "exam_repeat_authorization_audit": list(
+                        strategy.get("exam_repeat_authorization_audit") or []
                     ),
                 }
             )

@@ -332,6 +332,18 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "special_discriminator_rate": metric("special_discriminator_rate"),
         "multi_candidate_exam_rate": metric("multi_candidate_exam_rate"),
         "generic_exam_suppression_count": metric("generic_exam_suppression_count"),
+        "exam_route_authorization_blocked_count": metric(
+            "exam_route_authorization_blocked_count"
+        ),
+        "exam_route_repeat_authorized_count": metric(
+            "exam_route_repeat_authorized_count"
+        ),
+        "exam_route_claim_resolved_block_count": metric(
+            "exam_route_claim_resolved_block_count"
+        ),
+        "exam_route_generic_duplicate_block_count": metric(
+            "exam_route_generic_duplicate_block_count"
+        ),
         "post_exam_primary_recomputed_rate": metric("post_exam_primary_recomputed_rate"),
         "discriminating_gap_closed_rate": metric("discriminating_gap_closed_rate"),
         "gap_closure_rate": metric("gap_closure_rate"),

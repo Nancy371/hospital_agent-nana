@@ -458,6 +458,97 @@ class AgentTargetedExamRecoveryTests(unittest.TestCase):
             & set(audit[0]["reason_codes"])
         )
 
+    def test_completed_claim_route_blocks_repeat_ct_with_route_audit(self):
+        agent = self.make_agent()
+        strategy = {
+            "items": ["chest CT"],
+            "differential_driven": True,
+            "exam_authorization_details": [
+                {
+                    "exam": "chest CT",
+                    "exam_source": "deferred_gap_closure_exam",
+                    "target_gaps": ["G-D100058"],
+                    "target_claims": [
+                        "pulmonary_morphology",
+                        "radiation_field_lung_consistency",
+                    ],
+                    "route_target_claims": [
+                        "pulmonary_morphology",
+                        "radiation_field_lung_consistency",
+                    ],
+                    "closure_routes": [
+                        {
+                            "route_id": "route-ct-spatial",
+                            "route_type": "exam_result",
+                            "target_claims": [
+                                "pulmonary_morphology",
+                                "radiation_field_lung_consistency",
+                            ],
+                        }
+                    ],
+                    "source_evidence_version": 7,
+                }
+            ],
+        }
+
+        items = agent._strategy_order_items(
+            strategy,
+            collected_info={"symptoms": ["dyspnea"]},
+            candidate_diseases=["radiation pneumonitis"],
+            existing_results={"chest CT": {"status": "abnormal"}},
+            max_items=None,
+            add_strong_verification=False,
+        )
+
+        self.assertEqual(items, [])
+        audit = strategy.get("exam_repeat_authorization_audit") or []
+        self.assertTrue(audit)
+        self.assertIn("CLAIM_ROUTE_ALREADY_RESOLVED", audit[0]["reason_codes"])
+        self.assertEqual(audit[0]["route_target_claim_ids"], [
+            "pulmonary_morphology",
+            "radiation_field_lung_consistency",
+        ])
+        self.assertEqual(audit[0]["closure_route_ids"], ["route-ct-spatial"])
+        self.assertEqual(audit[0]["source_evidence_version"], 7)
+        self.assertEqual(audit[0]["prior_result_state"], "completed_same_exam")
+
+    def test_repeat_exam_requires_explicit_route_authorization(self):
+        agent = self.make_agent()
+        strategy = {
+            "items": ["chest CT"],
+            "differential_driven": True,
+            "exam_authorization_details": [
+                {
+                    "exam": "chest CT",
+                    "exam_source": "deferred_gap_closure_exam",
+                    "target_gaps": ["G-D100058-new"],
+                    "target_claims": ["new_spatial_progression_claim"],
+                    "route_target_claims": ["new_spatial_progression_claim"],
+                    "repeat_requested": True,
+                    "repeat_authorized": True,
+                    "repeat_reason_codes": ["NEW_TARGET_CLAIM"],
+                    "source_evidence_version": 8,
+                }
+            ],
+        }
+
+        items = agent._strategy_order_items(
+            strategy,
+            collected_info={"symptoms": ["dyspnea"]},
+            candidate_diseases=["radiation pneumonitis"],
+            existing_results={"chest CT": {"status": "abnormal"}},
+            max_items=None,
+            add_strong_verification=False,
+        )
+
+        self.assertEqual(items, ["chest CT"])
+        audit = strategy.get("exam_repeat_authorization_audit") or []
+        self.assertTrue(audit)
+        self.assertFalse(audit[0]["blocked"])
+        self.assertTrue(audit[0]["repeat_authorized"])
+        self.assertIn("NEW_TARGET_CLAIM", audit[0]["reason_codes"])
+        self.assertEqual(audit[0]["target_claim_ids"], ["new_spatial_progression_claim"])
+
 
 if __name__ == "__main__":
     unittest.main()
