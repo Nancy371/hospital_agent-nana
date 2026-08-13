@@ -7,6 +7,7 @@ import yaml
 from agent.agent import MyDoctorAgent
 from agent.clinical_evidence import EvidenceBundle, Observation
 from agent.evidence_pattern_compiler import EvidencePatternCompiler
+from agent.claim_resolution import claim_key
 from agent.targeted_exam_result_parser import (
     ExamResultIntentBinding,
     TargetedExamResultParser,
@@ -380,6 +381,125 @@ class AgentTargetedExamRecoveryTests(unittest.TestCase):
         self.assertIn(
             "pulmonary_av_fistula_pattern",
             set(evidence.findings("positive")),
+        )
+
+    def test_exam_result_applicability_updates_radiation_claim_contract(self):
+        agent = self.make_agent()
+        radiation_detail = {
+            "exam": "chest CT",
+            "requested_exam": "chest CT",
+            "resolved_exam": "CT",
+            "exam_source": "deferred_gap_closure_exam",
+            "target_gaps": ["G-D100058"],
+            "entity_id": "D100058",
+            "target_candidates": ["D100058"],
+            "target_claims": [
+                "pulmonary_morphology",
+                "radiation_field_lung_consistency",
+                "post_radiotherapy_time_window",
+            ],
+            "route_target_claims": [
+                "pulmonary_morphology",
+                "radiation_field_lung_consistency",
+            ],
+            "claim_requirements": [
+                {"claim_id": "pulmonary_morphology", "required_for_anchor": True},
+                {"claim_id": "radiation_field_lung_consistency", "required_for_anchor": True},
+                {"claim_id": "post_radiotherapy_time_window", "required_for_anchor": True},
+            ],
+            "closure_routes": [
+                {
+                    "route_id": "route_pulmonary_morphology_ct",
+                    "route_type": "exam_result",
+                    "exam": "chest CT",
+                    "target_claims": ["pulmonary_morphology"],
+                },
+                {
+                    "route_id": "route_radiation_field_ct",
+                    "route_type": "exam_result",
+                    "exam": "chest CT",
+                    "target_claims": ["radiation_field_lung_consistency"],
+                },
+            ],
+            "claim_closure_plan_version": "claim_closure_plan_v1",
+            "source_evidence_version": 7,
+        }
+        strategy = {
+            "exam_authorization_details": [
+                {
+                    "exam": "chest CT",
+                    "requested_exam": "chest CT",
+                    "resolved_exam": "CT",
+                    "exam_source": "judge_discriminating_exam",
+                    "target_gaps": ["G-D100037"],
+                    "entity_id": "D100037",
+                    "target_candidates": ["D100037"],
+                    "target_claims": ["tuberculosis_imaging_pattern"],
+                    "route_target_claims": ["tuberculosis_imaging_pattern"],
+                },
+                radiation_detail,
+            ]
+        }
+
+        agent._record_targeted_exam_result_recovery(
+            patient_id="Patient_03674",
+            stage="unit_test",
+            ordered_items=["chest CT"],
+            new_results={
+                "CT": {
+                    "status": "abnormal",
+                    "result": {
+                        "conclusion": (
+                            "Chest CT shows ground-glass opacity and consolidation, "
+                            "within prior radiation field."
+                        )
+                    },
+                }
+            },
+            strategy=strategy,
+        )
+
+        morph_key = claim_key(
+            entity_id="D100058",
+            claim_id="pulmonary_morphology",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        spatial_key = claim_key(
+            entity_id="D100058",
+            claim_id="radiation_field_lung_consistency",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        self.assertEqual(
+            agent._claim_resolution_ledger[morph_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            agent._claim_resolution_ledger[spatial_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(agent._claim_state_version, 1)
+        self.assertEqual(agent._diagnostic_state_version, 1)
+        radiation_payloads = [
+            item
+            for item in agent._targeted_exam_result_parses
+            if item.get("entity_id") == "D100058"
+        ]
+        self.assertTrue(radiation_payloads)
+        self.assertIn(
+            radiation_payloads[0].get("binding_source"),
+            {"SHARED_AUTHORIZATION", "RESULT_APPLICABILITY"},
+        )
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in agent._targeted_exam_observations
+                    if item.finding == "ground_glass_opacity"
+                ]
+            ),
+            1,
         )
 
     def test_pre_exam_judge_payload_injects_runtime_claim_state(self):

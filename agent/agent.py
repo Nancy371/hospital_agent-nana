@@ -2556,18 +2556,18 @@ class MyDoctorAgent(BaseDoctorAgent):
     ) -> None:
         if not new_results:
             return
-        details = [
-            item
-            for item in (strategy or {}).get("exam_authorization_details", []) or []
-            if isinstance(item, dict) and item.get("target_gaps")
-        ]
+        details = self._exam_authorization_details_for_result_recovery(strategy)
         if not details:
             return
         pairs = self._match_ordered_items_to_results(ordered_items, new_results)
         observations_before = len(self._targeted_exam_observations)
         for index, (ordered_exam, actual_exam, raw_result) in enumerate(pairs, start=1):
-            detail = self._authorization_detail_for_exam(ordered_exam, actual_exam, details)
-            if not detail:
+            applicable_details = self._authorization_details_for_exam_result(
+                ordered_exam,
+                actual_exam,
+                details,
+            )
+            if not applicable_details:
                 self._targeted_exam_result_parses.append(
                     {
                         "status": "unbound",
@@ -2578,50 +2578,107 @@ class MyDoctorAgent(BaseDoctorAgent):
                     }
                 )
                 continue
-            binding = binding_from_authorization_detail(
-                detail=detail,
+            parse_detail = self._neutral_parse_detail_for_applicable_contracts(
+                applicable_details
+            )
+            parse_binding = binding_from_authorization_detail(
+                detail=parse_detail,
                 requested_exam=ordered_exam,
                 actual_result_exam=actual_exam,
                 patient_id=patient_id,
                 stage=stage,
                 order_index=len(self._exam_result_intent_bindings) + index,
             )
-            self._exam_result_intent_bindings.append(binding.to_dict())
-            parsed = self.targeted_exam_result_parser.parse(raw_result, binding)
-            payload = parsed.to_dict()
-            payload["stage"] = stage
-            payload["gap_closure_allowed"] = parsed.gap_closure_assessment in {
-                "positive_closed",
-                "negative_closed",
-            }
-            claim_update = self.claim_resolution_updater.update_from_parse(
-                ledger=self._claim_resolution_ledger,
-                parsed_result=payload,
-                intent_binding=binding.to_dict(),
-                gap_contract=self._claim_gap_contract_from_authorization_detail(detail),
-            )
-            self._claim_resolution_ledger = normalize_ledger(
-                claim_update.get("ledger") or {}
-            )
-            self._claim_match_events.extend(
-                list(claim_update.get("claim_match_events") or [])
-            )
-            self._claim_resolution_update_audit.extend(
-                list(claim_update.get("claim_resolution_update_audit") or [])
-            )
-            claim_delta = int(
-                claim_update.get("persisted_claim_resolution_delta_count") or 0
-            )
-            if claim_delta:
-                self._claim_state_version += claim_delta
+            neutral_parsed = self.targeted_exam_result_parser.parse(raw_result, parse_binding)
+            result_claim_delta = 0
+            result_route_attempt_delta = 0
+            observations_recorded = False
+            for detail_index, detail in enumerate(applicable_details, start=1):
+                binding = binding_from_authorization_detail(
+                    detail=detail,
+                    requested_exam=ordered_exam,
+                    actual_result_exam=actual_exam,
+                    patient_id=patient_id,
+                    stage=stage,
+                    order_index=(
+                        len(self._exam_result_intent_bindings) + index * 100 + detail_index
+                    ),
+                )
+                binding_payload = binding.to_dict()
+                binding_payload["binding_source"] = str(
+                    detail.get("_result_binding_source") or "RESULT_APPLICABILITY"
+                )
+                self._exam_result_intent_bindings.append(binding_payload)
+                if detail is parse_detail:
+                    parsed = neutral_parsed
+                else:
+                    parsed = self.targeted_exam_result_parser.rematch_claims_for_binding(
+                        neutral_parsed,
+                        binding,
+                    )
+                payload = parsed.to_dict()
+                payload["stage"] = stage
+                payload["ordered_exam"] = ordered_exam
+                payload["binding_source"] = binding_payload["binding_source"]
+                payload["applicability_reason"] = str(
+                    detail.get("_applicability_reason") or ""
+                )
+                payload["gap_closure_allowed"] = parsed.gap_closure_assessment in {
+                    "positive_closed",
+                    "negative_closed",
+                }
+                claim_update = self.claim_resolution_updater.update_from_parse(
+                    ledger=self._claim_resolution_ledger,
+                    parsed_result=payload,
+                    intent_binding=binding_payload,
+                    gap_contract=self._claim_gap_contract_from_authorization_detail(detail),
+                )
+                self._claim_resolution_ledger = normalize_ledger(
+                    claim_update.get("ledger") or {}
+                )
+                self._claim_match_events.extend(
+                    list(claim_update.get("claim_match_events") or [])
+                )
+                update_audit = list(
+                    claim_update.get("claim_resolution_update_audit") or []
+                )
+                self._claim_resolution_update_audit.extend(update_audit)
+                claim_delta = int(
+                    claim_update.get("persisted_claim_resolution_delta_count") or 0
+                )
+                route_delta = sum(
+                    int(item.get("route_attempt_state_delta") or 0)
+                    for item in update_audit
+                    if isinstance(item, dict)
+                )
+                result_claim_delta += claim_delta
+                result_route_attempt_delta += route_delta
+                payload["claim_resolution_update"] = {
+                    key: value
+                    for key, value in claim_update.items()
+                    if key != "ledger"
+                }
+                self._targeted_exam_result_parses.append(payload)
+                if not observations_recorded:
+                    self._targeted_exam_observations.extend(neutral_parsed.observations)
+                    observations_recorded = True
+            if result_claim_delta:
+                self._claim_state_version += 1
                 self._diagnostic_state_version += 1
-            payload["claim_resolution_update"] = {
-                key: value
-                for key, value in claim_update.items()
-                if key != "ledger"
-            }
-            self._targeted_exam_result_parses.append(payload)
-            self._targeted_exam_observations.extend(parsed.observations)
+                self._targeted_exam_result_parses.append(
+                    {
+                        "status": "claim_state_transaction_committed",
+                        "stage": stage,
+                        "ordered_exam": ordered_exam,
+                        "actual_result_exam": actual_exam,
+                        "persisted_claim_resolution_delta_count": result_claim_delta,
+                        "route_attempt_state_delta_count": result_route_attempt_delta,
+                        "claim_state_version_after": int(self._claim_state_version or 0),
+                        "diagnostic_state_version_after": int(
+                            self._diagnostic_state_version or 0
+                        ),
+                    }
+                )
         if len(self._targeted_exam_observations) > observations_before:
             findings = [
                 item.finding
@@ -2631,6 +2688,142 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "[ExamEvidenceRecovery] targeted evidence recovered: %s",
                 list(dict.fromkeys(findings)),
             )
+
+    def _exam_authorization_details_for_result_recovery(
+        self,
+        strategy: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        details: List[Dict[str, Any]] = []
+        for item in (strategy or {}).get("exam_authorization_details", []) or []:
+            if isinstance(item, dict) and item.get("target_gaps"):
+                details.append(dict(item))
+        for record in getattr(self, "_last_exam_authorization", []) or []:
+            if not isinstance(record, dict):
+                continue
+            for item in record.get("exam_authorization_details", []) or []:
+                if isinstance(item, dict) and item.get("target_gaps"):
+                    details.append(dict(item))
+        seen: set[tuple] = set()
+        result: List[Dict[str, Any]] = []
+        for detail in details:
+            key = (
+                _compact_exam_name(detail.get("exam")),
+                tuple(str(item or "") for item in detail.get("target_gaps", []) or []),
+                str(detail.get("entity_id") or ""),
+                tuple(str(item or "") for item in detail.get("route_target_claims", []) or []),
+                str(detail.get("claim_closure_plan_version") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(detail)
+        return result
+
+    def _authorization_details_for_exam_result(
+        self,
+        ordered_exam: str,
+        actual_exam: str,
+        details: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        ordered_key = _compact_exam_name(ordered_exam)
+        actual_key = _compact_exam_name(actual_exam)
+        ordered_family = self._exam_repeat_family(ordered_exam)
+        actual_family = self._exam_repeat_family(actual_exam)
+        primary = self._authorization_detail_for_exam(ordered_exam, actual_exam, details)
+        result: List[Dict[str, Any]] = []
+        seen: set[tuple] = set()
+
+        def add(detail: Dict[str, Any], source: str, reason: str) -> None:
+            key = (
+                _compact_exam_name(detail.get("exam")),
+                tuple(str(item or "") for item in detail.get("target_gaps", []) or []),
+                str(detail.get("entity_id") or ""),
+                tuple(str(item or "") for item in detail.get("route_target_claims", []) or []),
+                str(detail.get("claim_closure_plan_version") or ""),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            payload = dict(detail)
+            payload["_result_binding_source"] = source
+            payload["_applicability_reason"] = reason
+            result.append(payload)
+
+        if primary:
+            add(primary, "AUTHORIZED_TARGET", "ordered_or_actual_exam_match")
+        for detail in details or []:
+            keys = {
+                _compact_exam_name(detail.get("exam")),
+                _compact_exam_name(detail.get("requested_exam")),
+                _compact_exam_name(detail.get("resolved_exam")),
+            }
+            if (ordered_key and ordered_key in keys) or (actual_key and actual_key in keys):
+                add(detail, "SHARED_AUTHORIZATION", "same_exam_authorization")
+                continue
+            detail_family = self._exam_repeat_family(
+                detail.get("resolved_exam") or detail.get("exam") or detail.get("requested_exam")
+            )
+            if detail_family and detail_family in {ordered_family, actual_family}:
+                add(detail, "RESULT_APPLICABILITY", "same_exam_family")
+                continue
+            if self._detail_has_applicable_exam_route(
+                detail,
+                ordered_exam=ordered_exam,
+                actual_exam=actual_exam,
+            ):
+                add(detail, "RESULT_APPLICABILITY", "claim_closure_route_exam_match")
+        return result
+
+    def _neutral_parse_detail_for_applicable_contracts(
+        self,
+        details: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        for detail in details or []:
+            if not self._authorization_detail_is_pavm(detail):
+                return detail
+        return details[0] if details else {}
+
+    @staticmethod
+    def _authorization_detail_is_pavm(detail: Dict[str, Any]) -> bool:
+        text = _compact_exam_name(
+            " ".join(
+                str(item or "")
+                for item in list(detail.get("target_candidates") or [])
+                + list(detail.get("target_claims") or [])
+                + list(detail.get("target_gaps") or [])
+                + [detail.get("entity_id")]
+            )
+        )
+        return any(marker in text for marker in ("d100055", "pavm", "pulmonaryav"))
+
+    def _detail_has_applicable_exam_route(
+        self,
+        detail: Dict[str, Any],
+        *,
+        ordered_exam: str,
+        actual_exam: str,
+    ) -> bool:
+        ordered_family = self._exam_repeat_family(ordered_exam)
+        actual_family = self._exam_repeat_family(actual_exam)
+        ordered_key = _compact_exam_name(ordered_exam)
+        actual_key = _compact_exam_name(actual_exam)
+        for route in detail.get("closure_routes", []) or []:
+            if not isinstance(route, dict):
+                continue
+            if str(route.get("route_type") or "") != "exam_result":
+                continue
+            route_exam = str(route.get("exam") or route.get("requested_exam") or "").strip()
+            if not route_exam:
+                return True
+            route_key = _compact_exam_name(route_exam)
+            route_family = self._exam_repeat_family(route_exam)
+            if route_key and route_key in {ordered_key, actual_key}:
+                return True
+            if route_family and route_family in {ordered_family, actual_family}:
+                return True
+            if route_key and (route_key in ordered_key or route_key in actual_key):
+                return True
+        return False
 
     @staticmethod
     def _match_ordered_items_to_results(

@@ -207,6 +207,54 @@ class TargetedExamResultParser:
             parsed.append(self.parse(raw, binding))
         return parsed
 
+    def rematch_claims_for_binding(
+        self,
+        parsed_result: TargetedExamParseResult,
+        intent_binding: Any,
+    ) -> TargetedExamParseResult:
+        """Reuse a neutral exam parse against another claim contract."""
+
+        binding = ExamResultIntentBinding.from_any(intent_binding)
+        if binding is None:
+            return TargetedExamParseResult(
+                binding_id="",
+                order_id="",
+                target_gap_ids=[],
+                entity_id="",
+                parser_profile="",
+                status=UNBOUND,
+                binding_status="unbound",
+                gap_closure_assessment="unbound",
+            )
+        binding = self._with_actual_capability(binding)
+        result = TargetedExamParseResult(
+            binding_id=binding.binding_id,
+            order_id=binding.order_id,
+            target_gap_ids=list(binding.target_gap_ids),
+            entity_id=binding.entity_id,
+            parser_profile=binding.parser_profile or parsed_result.parser_profile,
+            source_text=parsed_result.source_text,
+            actual_closure_level=binding.actual_closure_level,
+            binding_status=binding.binding_status,
+            actual_result_exam=binding.actual_result_exam or parsed_result.actual_result_exam,
+            execution_status=binding.execution_status,
+            observations=list(parsed_result.observations or []),
+            atomic_observations=list(parsed_result.atomic_observations or []),
+            relation_observations=list(parsed_result.relation_observations or []),
+            matched_rules=list(parsed_result.matched_rules or []),
+        )
+        relation_status_by_claim = self._relation_status_by_claim_from_observations(
+            result.observations
+        )
+        claim_matches = self._match_target_claims(
+            binding.target_claims,
+            result.observations,
+            relation_status_by_claim,
+            binding.route_target_claims,
+        )
+        self._apply_claim_match_assessment(result, binding, claim_matches)
+        return result
+
     def _parse_generic_targeted(
         self,
         raw_exam_result: Any,
@@ -304,7 +352,6 @@ class TargetedExamResultParser:
                     }
                 )
 
-        relation_status_by_claim: Dict[str, str] = {}
         if _has_any(text, _RADIATION_FIELD_WITHIN_TERMS):
             item = add_observation(
                 "lesion_within_prior_radiation_field",
@@ -325,7 +372,6 @@ class TargetedExamResultParser:
                     "observation_ref": item.finding,
                 }
             )
-            relation_status_by_claim["radiation_field_lung_consistency"] = SUPPORTED
         if _has_any(text, _RADIATION_FIELD_OUTSIDE_TERMS):
             item = add_observation(
                 "lesion_outside_prior_radiation_field",
@@ -346,7 +392,9 @@ class TargetedExamResultParser:
                     "observation_ref": item.finding,
                 }
             )
-            relation_status_by_claim["radiation_field_lung_consistency"] = CONTRADICTED
+        relation_status_by_claim = self._relation_status_by_claim_from_observations(
+            observations
+        )
 
         claim_matches = self._match_target_claims(
             binding.target_claims,
@@ -354,6 +402,35 @@ class TargetedExamResultParser:
             relation_status_by_claim,
             binding.route_target_claims,
         )
+        result.observations = _dedupe_observations(observations)
+        result.atomic_observations = atomic
+        result.relation_observations = relations
+        result.matched_rules = list(dict.fromkeys(matched))
+        self._apply_claim_match_assessment(result, binding, claim_matches)
+        return result
+
+    @staticmethod
+    def _relation_status_by_claim_from_observations(
+        observations: Sequence[Observation],
+    ) -> Dict[str, str]:
+        findings = {
+            item.finding: item
+            for item in observations or []
+            if getattr(item, "polarity", "positive") != "negative"
+        }
+        result: Dict[str, str] = {}
+        if "lesion_within_prior_radiation_field" in findings:
+            result["radiation_field_lung_consistency"] = SUPPORTED
+        if "lesion_outside_prior_radiation_field" in findings:
+            result["radiation_field_lung_consistency"] = CONTRADICTED
+        return result
+
+    @staticmethod
+    def _apply_claim_match_assessment(
+        result: TargetedExamParseResult,
+        binding: ExamResultIntentBinding,
+        claim_matches: List[Dict[str, Any]],
+    ) -> None:
         supported = [item for item in claim_matches if item.get("claim_status") == SUPPORTED]
         contradicted = [item for item in claim_matches if item.get("claim_status") == CONTRADICTED]
         addressed = [
@@ -378,7 +455,7 @@ class TargetedExamResultParser:
             result.status = POSITIVE
             result.gap_closure_assessment = "partial"
             result.gap_resolution_status = PARTIALLY_CLOSED
-        elif observations or addressed:
+        elif result.observations or addressed:
             result.status = INCONCLUSIVE
             result.gap_closure_assessment = "partial"
             result.gap_resolution_status = GAP_UNRESOLVED
@@ -387,11 +464,8 @@ class TargetedExamResultParser:
             result.gap_closure_assessment = "not_closed"
             result.gap_resolution_status = OPEN
 
-        for item in observations:
+        for item in result.observations:
             item.gap_closure_assessment = result.gap_closure_assessment
-        result.observations = _dedupe_observations(observations)
-        result.atomic_observations = atomic
-        result.relation_observations = relations
         result.claim_matches = claim_matches
         matched_claims = {
             str(item.get("target_claim") or "")
@@ -401,13 +475,11 @@ class TargetedExamResultParser:
         result.unmatched_target_claims = [
             claim for claim in binding.target_claims or [] if claim not in matched_claims
         ]
-        result.matched_rules = list(dict.fromkeys(matched))
         result.material_evidence_delta = _material_evidence_delta(
             result.observations,
             claim_matches,
             result.gap_resolution_status,
         )
-        return result
 
     @staticmethod
     def _match_target_claims(
