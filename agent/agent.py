@@ -1005,20 +1005,33 @@ class MyDoctorAgent(BaseDoctorAgent):
             self._llm_context_audit.append(audit)
         return dict(compiled.get("context") or state)
 
-    def _can_call_llm(self, kind: str) -> bool:
+    def _can_call_llm(self, kind: str, purpose: str = "") -> bool:
         """Return False when the per-case LLM budget has been exhausted."""
         if kind == "json_repair":
             if self.max_llm_repair_calls_per_case <= 0:
                 logger.warning("[LLM] skip %s call: repair budget disabled", kind)
                 return False
+            remaining = self.max_llm_repair_calls_per_case - self._llm_repair_call_count
+            if remaining <= 0:
+                logger.warning(
+                    "[LLM] skip %s call: repair budget reached (%s)",
+                    kind,
+                    self.max_llm_repair_calls_per_case,
+                )
+                return False
+            priority = "medium"
+            executor = getattr(self, "llm_contract_executor", None)
+            if executor is not None and hasattr(executor, "repair_priority_for"):
+                priority = str(executor.repair_priority_for(purpose) or "medium")
+            if remaining == 1 and priority not in ("critical", "high"):
+                logger.warning(
+                    "[LLM] skip %s call for %s: reserve final repair budget for critical stages",
+                    kind,
+                    purpose or "unclassified",
+                )
+                return False
             if self._llm_repair_call_count < self.max_llm_repair_calls_per_case:
                 return True
-            logger.warning(
-                "[LLM] skip %s call: repair budget reached (%s)",
-                kind,
-                self.max_llm_repair_calls_per_case,
-            )
-            return False
         if self.max_llm_calls_per_case <= 0:
             return True
         if self._llm_call_count < self.max_llm_calls_per_case:
@@ -1034,15 +1047,11 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._llm_logical_call_index += 1
         return f"L{self._llm_logical_call_index:04d}"
 
-    @staticmethod
-    def _llm_required_fields_for_purpose(purpose: str) -> List[str]:
-        mapping = {
-            "planning": ["strategy"],
-            "planning_criticism": ["criticisms"],
-            "thinking": ["differential_diagnosis"],
-            "diagnosis": ["diagnosis"],
-        }
-        return list(mapping.get(str(purpose or ""), []))
+    def _llm_required_fields_for_purpose(self, purpose: str) -> List[str]:
+        executor = getattr(self, "llm_contract_executor", None)
+        if executor is not None and hasattr(executor, "required_fields_for"):
+            return list(executor.required_fields_for(purpose))
+        return []
 
     @staticmethod
     def _llm_failure_priority(flags: List[str]) -> str:
@@ -1059,6 +1068,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             "schema_missing_fields",
             "schema_type_mismatch",
             "semantic_validation_failed",
+            "contract_drift",
             "consumer_rejected",
             "unknown_exception",
         ]
@@ -1125,6 +1135,9 @@ class MyDoctorAgent(BaseDoctorAgent):
             if contract_validation.get("semantic_success") is False:
                 flags.append("semantic_validation_failed")
         if record.get("consumer_accepted") is False:
+            if record.get("schema_success") is True:
+                flags.append("contract_drift")
+                record["contract_drift_detected"] = True
             flags.append("consumer_rejected")
         flags = list(dict.fromkeys(flags))
         record["failure_flags"] = flags
@@ -1175,6 +1188,18 @@ class MyDoctorAgent(BaseDoctorAgent):
         schema_success: Optional[bool] = None
         if schema_applicable:
             schema_success = not missing_fields
+        contract_validation = metadata.get("contract_validation") or {}
+        if isinstance(contract_validation, dict) and contract_validation.get("applicable"):
+            schema_applicable = True
+            schema_success = contract_validation.get("schema_success")
+            missing_fields = list(contract_validation.get("missing_fields") or [])
+            required_fields = list(
+                dict.fromkeys(
+                    required_fields
+                    + list(contract_validation.get("critical_fields") or [])
+                    + list(contract_validation.get("missing_fields") or [])
+                )
+            )
         record: Dict[str, Any] = {
             "call_id": f"{logical_id}-A{attempt_index}",
             "logical_call_id": logical_id,
@@ -1194,6 +1219,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             "finish_reason": metadata.get("finish_reason"),
             "raw_response_present": bool(metadata.get("raw_response_present")),
             "response_chars": int(metadata.get("response_chars") or 0),
+            "requested_max_tokens": metadata.get("requested_max_tokens"),
             "json_expected": bool(json_expected),
             "parse_success": parse_success,
             "parsed_type": parsed_type,
@@ -1201,6 +1227,17 @@ class MyDoctorAgent(BaseDoctorAgent):
             "schema_success": schema_success,
             "required_fields": required_fields,
             "missing_fields": missing_fields if schema_applicable else [],
+            "contract_version": metadata.get("contract_version") or (
+                (metadata.get("contract_validation") or {}).get("contract_version")
+                if isinstance(metadata.get("contract_validation"), dict)
+                else ""
+            ),
+            "deterministic_normalizations": list(
+                metadata.get("deterministic_normalizations") or []
+            ),
+            "contract_drift_detected": False,
+            "consumer_acceptance_reason": metadata.get("consumer_acceptance_reason") or "",
+            "consumer_rejection_code": metadata.get("consumer_rejection_code") or "",
             "consumer_accepted": (
                 None
                 if json_expected
@@ -1210,7 +1247,7 @@ class MyDoctorAgent(BaseDoctorAgent):
             "primary_failure_reason": "",
             "fallback_trigger": "",
             "fallback_used": bool(fallback_used),
-            "contract_validation": dict(metadata.get("contract_validation") or {}),
+            "contract_validation": dict(contract_validation or {}),
             "contract_repair_attempted": bool(metadata.get("contract_repair_attempted", False)),
             "contract_repair_succeeded": metadata.get("contract_repair_succeeded"),
             "exception_type": type(exception).__name__ if exception else metadata.get("exception_type", ""),
@@ -1226,10 +1263,22 @@ class MyDoctorAgent(BaseDoctorAgent):
         *,
         fallback_used: bool = False,
         fallback_trigger: str = "",
+        consumer_acceptance_reason: str = "",
+        consumer_rejection_code: str = "",
     ) -> None:
         for record in reversed(self._llm_call_audit):
             if record.get("purpose") == purpose and record.get("consumer_accepted") is None:
                 record["consumer_accepted"] = bool(accepted)
+                if accepted:
+                    record["consumer_acceptance_reason"] = (
+                        consumer_acceptance_reason or "ACCEPTED"
+                    )
+                else:
+                    record["consumer_rejection_code"] = (
+                        consumer_rejection_code or "LEGACY_CONSUMER_CONTRACT_DRIFT"
+                    )
+                    if record.get("schema_success") is True:
+                        record["contract_drift_detected"] = True
                 if fallback_used:
                     record["fallback_used"] = True
                 if fallback_trigger:
@@ -1243,6 +1292,10 @@ class MyDoctorAgent(BaseDoctorAgent):
         failures: Dict[str, int] = {}
         fallback_purposes: List[str] = []
         fallback_calls = 0
+        repair_calls = 0
+        repair_success = 0
+        contract_drift = 0
+        deterministic_normalizations = 0
         for record in records or []:
             purpose = str(record.get("purpose") or "unclassified")
             by_purpose[purpose] = by_purpose.get(purpose, 0) + 1
@@ -1253,12 +1306,127 @@ class MyDoctorAgent(BaseDoctorAgent):
                 fallback_calls += 1
                 if purpose not in fallback_purposes:
                     fallback_purposes.append(purpose)
+            if record.get("contract_repair_attempted") or str(record.get("attempt_type") or "") == "repair":
+                repair_calls += 1
+                if record.get("contract_repair_succeeded") is True:
+                    repair_success += 1
+            if record.get("contract_drift_detected") or "contract_drift" in (
+                record.get("failure_flags") or []
+            ):
+                contract_drift += 1
+            deterministic_normalizations += len(record.get("deterministic_normalizations") or [])
         return {
             "total_calls": len(records or []),
             "fallback_calls": fallback_calls,
             "fallback_purposes": fallback_purposes,
             "call_count_by_purpose": by_purpose,
             "primary_failure_reasons": failures,
+            "repair_attempts": repair_calls,
+            "repair_successes": repair_success,
+            "contract_drift_count": contract_drift,
+            "deterministic_normalization_count": deterministic_normalizations,
+        }
+
+    @staticmethod
+    def _deterministic_failure_attribution(
+        *,
+        report: Dict[str, Any],
+        runtime_audit: Dict[str, Any],
+        llm_call_audit: List[Dict[str, Any]],
+        expected: List[str],
+        top_twenty: List[str],
+        submitted: List[str],
+    ) -> Dict[str, Any]:
+        """Classify the dominant failure domain without using another LLM."""
+        diagnosis_accuracy = None
+        for key in ("diagnosisAccuracy", "diagnosis_accuracy"):
+            try:
+                if report.get(key) is not None:
+                    diagnosis_accuracy = float(report.get(key))
+                    break
+            except (TypeError, ValueError):
+                pass
+        if diagnosis_accuracy == 1.0:
+            return {
+                "primary_failure_domain": "NONE",
+                "primary_failure_reason": "",
+                "secondary_failure_reasons": [],
+                "medical_failure_evaluable": True,
+            }
+
+        tool_summary = runtime_audit.get("tool_contract_summary") or {}
+        if int(tool_summary.get("retry_exhausted_calls") or 0) > 0:
+            return {
+                "primary_failure_domain": "TOOL_BACKEND",
+                "primary_failure_reason": "TOOL_RETRY_EXHAUSTED",
+                "secondary_failure_reasons": [],
+                "medical_failure_evaluable": False,
+            }
+
+        flags = [
+            str(flag)
+            for record in llm_call_audit
+            for flag in (record.get("failure_flags") or [])
+        ]
+        purposes_by_failure: Dict[str, List[str]] = {}
+        for record in llm_call_audit:
+            purpose = str(record.get("purpose") or "unclassified")
+            for flag in record.get("failure_flags") or []:
+                purposes_by_failure.setdefault(str(flag), []).append(purpose)
+
+        if "llm_budget_exhausted" in flags:
+            return {
+                "primary_failure_domain": "LLM_GENERATION",
+                "primary_failure_reason": "LLM_BUDGET_EXHAUSTED",
+                "secondary_failure_reasons": sorted(set(flags)),
+                "medical_failure_evaluable": False,
+                "affected_purposes": sorted(set(purposes_by_failure.get("llm_budget_exhausted", []))),
+            }
+        if "contract_drift" in flags:
+            return {
+                "primary_failure_domain": "CONTRACT",
+                "primary_failure_reason": "CONTRACT_DRIFT",
+                "secondary_failure_reasons": sorted(set(flags)),
+                "medical_failure_evaluable": False,
+            }
+        if "schema_type_mismatch" in flags:
+            return {
+                "primary_failure_domain": "CONTRACT",
+                "primary_failure_reason": "SCHEMA_TYPE_MISMATCH",
+                "secondary_failure_reasons": sorted(set(flags)),
+                "medical_failure_evaluable": False,
+            }
+        if "generation_truncated" in flags and any(
+            str(record.get("purpose") or "") == "diagnosis"
+            for record in llm_call_audit
+            if "generation_truncated" in (record.get("failure_flags") or [])
+        ):
+            return {
+                "primary_failure_domain": "LLM_GENERATION",
+                "primary_failure_reason": "DIAGNOSIS_GENERATION_TRUNCATED",
+                "secondary_failure_reasons": sorted(set(flags)),
+                "medical_failure_evaluable": False,
+            }
+
+        if expected and not all(name in top_twenty for name in expected):
+            return {
+                "primary_failure_domain": "RECALL",
+                "primary_failure_reason": "EXPECTED_NOT_IN_TOP20",
+                "secondary_failure_reasons": [],
+                "medical_failure_evaluable": True,
+            }
+        if expected and submitted and set(submitted) != set(expected):
+            return {
+                "primary_failure_domain": "ARBITRATION",
+                "primary_failure_reason": "SUBMITTED_DIFFERS_FROM_EXPECTED",
+                "secondary_failure_reasons": sorted(set(flags)),
+                "medical_failure_evaluable": True,
+            }
+        return {
+            "primary_failure_domain": "REASONING",
+            "primary_failure_reason": "UNATTRIBUTED_MEDICAL_FAILURE",
+            "secondary_failure_reasons": sorted(set(flags)),
+            "medical_failure_evaluable": True,
         }
 
     def _get_planner(self) -> Planner:
@@ -3643,6 +3811,14 @@ class MyDoctorAgent(BaseDoctorAgent):
             if getattr(self, "candidate_policy_store", None) is not None
             else {}
         )
+        failure_attribution = self._deterministic_failure_attribution(
+            report=report,
+            runtime_audit=runtime_audit,
+            llm_call_audit=list(self._llm_call_audit),
+            expected=expected,
+            top_twenty=top_twenty,
+            submitted=submitted,
+        )
         return {
             "patient_id": patient_id,
             "status": "evaluated" if report else "evaluation_failed",
@@ -3873,6 +4049,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "tool_contract_summary": dict(
                     runtime_audit.get("tool_contract_summary") or {}
                 ),
+                "failure_attribution": failure_attribution,
                 "exam_authorization": exam_authorization_records,
                 "exam_authorization_mode": exam_authorization_mode,
                 "exam_result_intent_bindings": targeted_bindings,
@@ -6870,13 +7047,20 @@ class MyDoctorAgent(BaseDoctorAgent):
             return {}
         logical_call_id = self._next_llm_logical_call_id()
         try:
-            result = await self.llm.chat_json(messages, temperature=temperature)
+            max_tokens = self.llm_contract_executor.output_tokens_for(purpose)
+            result = await self.llm.chat_json(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
             self._bump_llm_counter("json")
             parse_failed = (
                 isinstance(result, dict)
                 and set(result.keys()) == {"raw_response"}
                 and isinstance(result.get("raw_response"), str)
             )
+            normalization = self.llm_contract_executor.normalize(result, purpose)
+            result = normalization.value
             validation = self.llm_contract_executor.validate(result, purpose)
             metadata = dict(getattr(self.llm, "last_call_metadata", {}) or {})
             metadata.update(
@@ -6885,6 +7069,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "attempt_index": 1,
                     "attempt_type": "generate",
                     "contract_validation": validation.to_audit(),
+                    "contract_version": validation.contract_version,
+                    "deterministic_normalizations": normalization.normalizations,
+                    "requested_max_tokens": max_tokens,
                 }
             )
             self._append_llm_audit(
@@ -6936,7 +7123,7 @@ class MyDoctorAgent(BaseDoctorAgent):
         logical_call_id: str,
         purpose: str,
     ) -> Optional[Dict[str, Any]]:
-        if not self._can_call_llm("json_repair"):
+        if not self._can_call_llm("json_repair", purpose):
             self._append_llm_audit(
                 kind="json_repair",
                 purpose=purpose,
@@ -6959,14 +7146,26 @@ class MyDoctorAgent(BaseDoctorAgent):
                 previous_value=previous_value,
                 validation=validation,
             )
-            repaired = await self.llm.chat_json(repair_messages, temperature=0.0)
-            self._bump_llm_counter("json_repair")
-            repair_validation = self.llm_contract_executor.validate(repaired, purpose)
-            parse_failed = (
-                isinstance(repaired, dict)
-                and set(repaired.keys()) == {"raw_response"}
-                and isinstance(repaired.get("raw_response"), str)
+            max_tokens = self.llm_contract_executor.repair_output_tokens_for(purpose)
+            repair_payload = await self.llm.chat_json(
+                repair_messages,
+                temperature=0.0,
+                max_tokens=max_tokens,
             )
+            self._bump_llm_counter("json_repair")
+            parse_failed = (
+                isinstance(repair_payload, dict)
+                and set(repair_payload.keys()) == {"raw_response"}
+                and isinstance(repair_payload.get("raw_response"), str)
+            )
+            merged = self.llm_contract_executor.merge_repair(
+                previous_value=previous_value,
+                repair_value=repair_payload,
+                validation=validation,
+                purpose=purpose,
+            )
+            repaired = merged.value
+            repair_validation = self.llm_contract_executor.validate(repaired, purpose)
             metadata = dict(getattr(self.llm, "last_call_metadata", {}) or {})
             metadata.update(
                 {
@@ -6974,8 +7173,11 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "attempt_index": 2,
                     "attempt_type": "repair",
                     "contract_validation": repair_validation.to_audit(),
+                    "contract_version": repair_validation.contract_version,
+                    "deterministic_normalizations": merged.normalizations,
                     "contract_repair_attempted": True,
                     "contract_repair_succeeded": bool(repair_validation.accepted),
+                    "requested_max_tokens": max_tokens,
                 }
             )
             self._append_llm_audit(

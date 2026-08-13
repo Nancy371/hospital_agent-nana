@@ -28,12 +28,13 @@ class FakeLLM:
         }
         self.model_name = "fake-model"
 
-    async def chat_json(self, messages, temperature=None):
+    async def chat_json(self, messages, temperature=None, **kwargs):
         if self.raise_exc:
             raise self.raise_exc
+        self.last_chat_json_kwargs = dict(kwargs)
         return self.result
 
-    async def chat(self, messages, temperature=None):
+    async def chat(self, messages, temperature=None, **kwargs):
         if self.raise_exc:
             raise self.raise_exc
         return str(self.result)
@@ -45,10 +46,11 @@ class SequenceLLM(FakeLLM):
         self.results = list(results)
         self.calls = 0
 
-    async def chat_json(self, messages, temperature=None):
+    async def chat_json(self, messages, temperature=None, **kwargs):
         if not self.results:
             raise AssertionError("no more fake LLM responses")
         self.calls += 1
+        self.last_chat_json_kwargs = dict(kwargs)
         self.last_call_metadata = {
             "model": "fake-model",
             "model_invoked": True,
@@ -168,6 +170,70 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._llm_call_by_kind["json"], 1)
         self.assertEqual(agent._llm_call_by_kind["json_repair"], 1)
 
+    async def test_stage_contract_sets_output_budget(self):
+        agent = make_agent()
+        agent.llm = FakeLLM({"diagnosis": ["A"]})
+
+        await agent._llm_chat_json([], purpose="diagnosis")
+
+        self.assertEqual(agent.llm.last_chat_json_kwargs["max_tokens"], 2048)
+        record = agent._llm_call_audit[-1]
+        self.assertEqual(record["requested_max_tokens"], 2048)
+        self.assertEqual(record["contract_version"], "diagnosis.v1")
+
+    async def test_thinking_contract_normalizes_string_differential(self):
+        agent = make_agent()
+        agent.llm = FakeLLM({"differential_diagnosis": ["A", "B"]})
+
+        result = await agent._llm_chat_json([], purpose="thinking")
+
+        self.assertEqual(result["differential_diagnosis"][0], {"diagnosis": "A"})
+        record = agent._llm_call_audit[-1]
+        self.assertIn(
+            "thinking.differential_diagnosis:canonical_object_list",
+            record["deterministic_normalizations"],
+        )
+        self.assertTrue(record["schema_success"])
+
+    async def test_field_level_repair_merges_missing_critical_field(self):
+        agent = make_agent()
+        agent.llm = SequenceLLM(
+            [
+                {"reasoning": "kept"},
+                {"diagnosis": ["A"]},
+            ]
+        )
+
+        result = await agent._llm_chat_json([], purpose="diagnosis")
+
+        self.assertEqual(result["diagnosis"], ["A"])
+        self.assertEqual(result["reasoning"], "kept")
+        self.assertIn(
+            "field_level_repair_merge",
+            agent._llm_call_audit[-1]["deterministic_normalizations"],
+        )
+
+    async def test_contract_drift_is_audited_when_consumer_rejects_valid_schema(self):
+        agent = make_agent()
+        agent.llm = FakeLLM({"diagnosis": ["A"]})
+
+        await agent._llm_chat_json([], purpose="diagnosis")
+        agent._mark_last_llm_consumer_result(
+            "diagnosis",
+            False,
+            fallback_used=True,
+            fallback_trigger="consumer_rejected",
+        )
+
+        record = agent._llm_call_audit[-1]
+        self.assertTrue(record["schema_success"])
+        self.assertTrue(record["contract_drift_detected"])
+        self.assertIn("contract_drift", record["failure_flags"])
+        self.assertEqual(
+            record["consumer_rejection_code"],
+            "LEGACY_CONSUMER_CONTRACT_DRIFT",
+        )
+
     async def test_contract_repair_respects_repair_budget(self):
         agent = make_agent()
         agent.max_llm_repair_calls_per_case = 0
@@ -181,6 +247,20 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(records[1]["contract_repair_attempted"])
         self.assertFalse(records[1]["model_invoked"])
         self.assertEqual(records[1]["primary_failure_reason"], "llm_budget_exhausted")
+
+    async def test_low_priority_repair_does_not_spend_reserved_final_budget(self):
+        agent = make_agent()
+        agent.max_llm_repair_calls_per_case = 1
+        agent.llm = SequenceLLM([{"unexpected": []}])
+
+        result = await agent._llm_chat_json([], purpose="planning_criticism")
+
+        self.assertEqual(result, {"unexpected": []})
+        records = agent._llm_call_audit
+        self.assertEqual(len(records), 2)
+        self.assertFalse(records[1]["model_invoked"])
+        self.assertEqual(records[1]["primary_failure_reason"], "llm_budget_exhausted")
+        self.assertEqual(agent._llm_call_by_kind.get("json_repair", 0), 0)
 
     async def test_contract_repair_does_not_consume_clinical_budget(self):
         agent = make_agent()
@@ -350,3 +430,35 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["average_llm_source_context_chars"], 1000.0)
         self.assertEqual(summary["average_llm_context_compression_ratio"], 0.4)
         self.assertEqual(summary["llm_context_audit_payload_detected_count"], 1)
+
+    def test_failure_attribution_marks_llm_budget_as_not_medically_evaluable(self):
+        attribution = MyDoctorAgent._deterministic_failure_attribution(
+            report={"diagnosisAccuracy": 0.0},
+            runtime_audit={"tool_contract_summary": {}},
+            llm_call_audit=[
+                {
+                    "purpose": "diagnosis",
+                    "failure_flags": ["llm_budget_exhausted"],
+                }
+            ],
+            expected=["A"],
+            top_twenty=["A"],
+            submitted=["B"],
+        )
+
+        self.assertEqual(attribution["primary_failure_domain"], "LLM_GENERATION")
+        self.assertEqual(attribution["primary_failure_reason"], "LLM_BUDGET_EXHAUSTED")
+        self.assertFalse(attribution["medical_failure_evaluable"])
+
+    def test_failure_attribution_marks_wrong_submission_as_arbitration(self):
+        attribution = MyDoctorAgent._deterministic_failure_attribution(
+            report={"diagnosisAccuracy": 0.0},
+            runtime_audit={"tool_contract_summary": {}},
+            llm_call_audit=[],
+            expected=["A"],
+            top_twenty=["A", "B"],
+            submitted=["B"],
+        )
+
+        self.assertEqual(attribution["primary_failure_domain"], "ARBITRATION")
+        self.assertTrue(attribution["medical_failure_evaluable"])

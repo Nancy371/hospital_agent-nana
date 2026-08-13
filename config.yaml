@@ -207,7 +207,7 @@ execution:
   train_post_submit_reserve_seconds: 55
   train_evaluation_timeout_seconds: 12
   train_reflection_timeout_seconds: 40
-  max_llm_calls_per_case: 12
+  max_llm_calls_per_case: 18
   planner_criticism_max_calls: 1
   planner_max_total_actions: 5
   skip_train_reflection: false

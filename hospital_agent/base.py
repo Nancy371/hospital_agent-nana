@@ -152,6 +152,11 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         for record in (audit.get("llm_context_audit") or [])
         if isinstance(record, dict)
     ]
+    failure_attributions = [
+        audit.get("failure_attribution")
+        for audit in audits
+        if isinstance(audit.get("failure_attribution"), dict)
+    ]
 
     def llm_distribution(key: str) -> Dict[str, int]:
         result: Dict[str, int] = {}
@@ -176,6 +181,14 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 result[text] = result.get(text, 0) + 1
         return result
 
+    def _distribution_for_records(records: List[Dict[str, Any]], key: str) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for record in records:
+            text = str(record.get(key) or "")
+            if text:
+                result[text] = result.get(text, 0) + 1
+        return result
+
     llm_failure_by_purpose: Dict[str, int] = {}
     for record in llm_call_audits:
         if not record.get("primary_failure_reason") and not record.get("fallback_used"):
@@ -192,6 +205,21 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     schema_applicable_calls = [
         record for record in llm_call_audits if record.get("schema_applicable")
+    ]
+    repair_calls = [
+        record
+        for record in llm_call_audits
+        if str(record.get("attempt_type") or "") == "repair"
+        or record.get("contract_repair_attempted")
+    ]
+    diagnosis_repair_calls = [
+        record for record in repair_calls if str(record.get("purpose") or "") == "diagnosis"
+    ]
+    contract_drift_calls = [
+        record
+        for record in llm_call_audits
+        if record.get("contract_drift_detected")
+        or "contract_drift" in (record.get("failure_flags") or [])
     ]
     fallback_call_count = sum(1 for record in llm_call_audits if record.get("fallback_used"))
     fallback_case_count = sum(
@@ -451,6 +479,61 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             if llm_call_audits
             else 0.0
         ),
+        "llm_generation_truncation_count_by_purpose": {
+            purpose: count
+            for purpose, count in _distribution_for_records(
+                [
+                    record
+                    for record in llm_call_audits
+                    if "generation_truncated" in (record.get("failure_flags") or [])
+                ],
+                "purpose",
+            ).items()
+        },
+        "llm_schema_type_mismatch_count": sum(
+            1
+            for record in llm_call_audits
+            if "schema_type_mismatch" in (record.get("failure_flags") or [])
+        ),
+        "llm_contract_drift_count": len(contract_drift_calls),
+        "llm_contract_drift_rate": (
+            round(len(contract_drift_calls) / len(llm_call_audits), 4)
+            if llm_call_audits
+            else 0.0
+        ),
+        "llm_deterministic_normalization_count": sum(
+            len(record.get("deterministic_normalizations") or [])
+            for record in llm_call_audits
+        ),
+        "llm_repair_attempt_count": len(repair_calls),
+        "llm_repair_success_count": sum(
+            1 for record in repair_calls if record.get("contract_repair_succeeded") is True
+        ),
+        "llm_repair_success_rate": (
+            round(
+                sum(
+                    1
+                    for record in repair_calls
+                    if record.get("contract_repair_succeeded") is True
+                )
+                / len(repair_calls),
+                4,
+            )
+            if repair_calls
+            else 0.0
+        ),
+        "llm_repair_budget_skip_count": sum(
+            1
+            for record in repair_calls
+            if record.get("model_invoked") is False
+            and record.get("primary_failure_reason") == "llm_budget_exhausted"
+        ),
+        "llm_diagnosis_repair_budget_skip_count": sum(
+            1
+            for record in diagnosis_repair_calls
+            if record.get("model_invoked") is False
+            and record.get("primary_failure_reason") == "llm_budget_exhausted"
+        ),
         "llm_consumer_rejection_rate": (
             round(
                 sum(1 for record in llm_call_audits if record.get("consumer_accepted") is False)
@@ -466,6 +549,23 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             else 0.0
         ),
         "llm_fallback_case_rate": round(fallback_case_count / total, 4) if total else 0.0,
+        "failure_attribution_domain_distribution": _distribution_for_records(
+            failure_attributions,
+            "primary_failure_domain",
+        ),
+        "failure_attribution_reason_distribution": _distribution_for_records(
+            failure_attributions,
+            "primary_failure_reason",
+        ),
+        "medical_failure_evaluable_rate": (
+            round(
+                sum(1 for item in failure_attributions if item.get("medical_failure_evaluable"))
+                / len(failure_attributions),
+                4,
+            )
+            if failure_attributions
+            else 0.0
+        ),
         "llm_context_compile_count": len(llm_context_audits),
         "llm_context_compile_count_by_stage": llm_context_distribution("stage"),
         "average_llm_context_chars": _mean_training_value(
