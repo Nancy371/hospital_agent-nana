@@ -1,5 +1,8 @@
 import copy
+import asyncio
+import shutil
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
@@ -332,6 +335,53 @@ class AgentTargetedExamRecoveryTests(unittest.TestCase):
         config["self_improve_enabled"] = False
         return MyDoctorAgent(config)
 
+    def radiation_claim_detail(self):
+        return {
+            "exam": "chest CT",
+            "requested_exam": "chest CT",
+            "resolved_exam": "CT",
+            "exam_source": "deferred_gap_closure_exam",
+            "target_gaps": ["G-D100058"],
+            "entity_id": "D100058",
+            "target_candidates": ["D100058"],
+            "target_claims": [
+                "pulmonary_morphology",
+                "radiation_field_lung_consistency",
+                "post_radiotherapy_time_window",
+            ],
+            "route_target_claims": [
+                "pulmonary_morphology",
+                "radiation_field_lung_consistency",
+            ],
+            "claim_requirements": [
+                {"claim_id": "pulmonary_morphology", "required_for_anchor": True},
+                {
+                    "claim_id": "radiation_field_lung_consistency",
+                    "required_for_anchor": True,
+                },
+                {
+                    "claim_id": "post_radiotherapy_time_window",
+                    "required_for_anchor": True,
+                },
+            ],
+            "closure_routes": [
+                {
+                    "route_id": "route_pulmonary_morphology_ct",
+                    "route_type": "exam_result",
+                    "exam": "chest CT",
+                    "target_claims": ["pulmonary_morphology"],
+                },
+                {
+                    "route_id": "route_radiation_field_ct",
+                    "route_type": "exam_result",
+                    "exam": "chest CT",
+                    "target_claims": ["radiation_field_lung_consistency"],
+                },
+            ],
+            "claim_closure_plan_version": "claim_closure_plan_v1",
+            "source_evidence_version": 7,
+        }
+
     def test_agent_binds_returned_cect_name_to_original_pavm_gap(self):
         agent = self.make_agent()
         strategy = {
@@ -385,45 +435,7 @@ class AgentTargetedExamRecoveryTests(unittest.TestCase):
 
     def test_exam_result_applicability_updates_radiation_claim_contract(self):
         agent = self.make_agent()
-        radiation_detail = {
-            "exam": "chest CT",
-            "requested_exam": "chest CT",
-            "resolved_exam": "CT",
-            "exam_source": "deferred_gap_closure_exam",
-            "target_gaps": ["G-D100058"],
-            "entity_id": "D100058",
-            "target_candidates": ["D100058"],
-            "target_claims": [
-                "pulmonary_morphology",
-                "radiation_field_lung_consistency",
-                "post_radiotherapy_time_window",
-            ],
-            "route_target_claims": [
-                "pulmonary_morphology",
-                "radiation_field_lung_consistency",
-            ],
-            "claim_requirements": [
-                {"claim_id": "pulmonary_morphology", "required_for_anchor": True},
-                {"claim_id": "radiation_field_lung_consistency", "required_for_anchor": True},
-                {"claim_id": "post_radiotherapy_time_window", "required_for_anchor": True},
-            ],
-            "closure_routes": [
-                {
-                    "route_id": "route_pulmonary_morphology_ct",
-                    "route_type": "exam_result",
-                    "exam": "chest CT",
-                    "target_claims": ["pulmonary_morphology"],
-                },
-                {
-                    "route_id": "route_radiation_field_ct",
-                    "route_type": "exam_result",
-                    "exam": "chest CT",
-                    "target_claims": ["radiation_field_lung_consistency"],
-                },
-            ],
-            "claim_closure_plan_version": "claim_closure_plan_v1",
-            "source_evidence_version": 7,
-        }
+        radiation_detail = self.radiation_claim_detail()
         strategy = {
             "exam_authorization_details": [
                 {
@@ -500,6 +512,131 @@ class AgentTargetedExamRecoveryTests(unittest.TestCase):
                 ]
             ),
             1,
+        )
+        transition_names = [
+            item["name"] for item in agent._clinical_transition_trace
+        ]
+        for name in [
+            "exam_result_received",
+            "claim_contracts_bound",
+            "observations_parsed",
+            "claim_matches_generated",
+            "claim_ledger_updated",
+            "claim_state_transaction_committed",
+        ]:
+            self.assertIn(name, transition_names)
+        self.assertLess(
+            transition_names.index("exam_result_received"),
+            transition_names.index("observations_parsed"),
+        )
+        self.assertLess(
+            transition_names.index("observations_parsed"),
+            transition_names.index("claim_matches_generated"),
+        )
+
+    def test_failed_train_row_persists_d100058_clinical_runtime_audit(self):
+        agent = self.make_agent()
+        output_dir = Path("tests/_runtime_chain/clinical_runtime_audit")
+        shutil.rmtree(output_dir, ignore_errors=True)
+        agent.output_dir = str(output_dir)
+        agent.config.setdefault("train", {})["patient_ids"] = ["Patient_03674"]
+        agent.config["train"]["patient_count"] = 1
+        strategy = {
+            "exam_authorization_details": [
+                {
+                    "exam": "chest CT",
+                    "requested_exam": "chest CT",
+                    "resolved_exam": "CT",
+                    "exam_source": "judge_discriminating_exam",
+                    "target_gaps": ["G-D100037"],
+                    "entity_id": "D100037",
+                    "target_candidates": ["D100037"],
+                    "target_claims": ["tuberculosis_imaging_pattern"],
+                    "route_target_claims": ["tuberculosis_imaging_pattern"],
+                },
+                self.radiation_claim_detail(),
+            ]
+        }
+
+        async def fail_after_claim_recovery(patient_id):
+            agent._record_targeted_exam_result_recovery(
+                patient_id=patient_id,
+                stage="unit_test_failure",
+                ordered_items=["chest CT"],
+                new_results={
+                    "CT": {
+                        "status": "abnormal",
+                        "result": {
+                            "conclusion": (
+                                "Chest CT shows ground-glass opacity and consolidation, "
+                                "within prior radiation field."
+                            )
+                        },
+                    }
+                },
+                strategy=strategy,
+            )
+            raise RuntimeError("boom-after-claim-ledger")
+
+        agent.train = fail_after_claim_recovery
+        try:
+            result = asyncio.run(agent.run_train())
+            row = result["results"][0]
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+        self.assertEqual(row["status"], "failed")
+        audit = row["audit"]
+        for field in [
+            "targeted_exam_result_parses",
+            "exam_result_applicability",
+            "targeted_exam_observations",
+            "claim_match_events",
+            "claim_resolution_ledger",
+            "claim_resolution_update_audit",
+            "claim_state_version",
+            "diagnostic_state_version",
+            "gap_state",
+            "last_completed_stage",
+            "failure_stage",
+            "last_successful_clinical_transition",
+            "clinical_transition_trace",
+        ]:
+            self.assertIn(field, audit)
+        self.assertGreater(audit["claim_state_version"], 0)
+        self.assertGreater(audit["diagnostic_state_version"], 0)
+        morph_key = claim_key(
+            entity_id="D100058",
+            claim_id="pulmonary_morphology",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        spatial_key = claim_key(
+            entity_id="D100058",
+            claim_id="radiation_field_lung_consistency",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        self.assertEqual(
+            audit["claim_resolution_ledger"][morph_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            audit["claim_resolution_ledger"][spatial_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        applicability_entities = {
+            item.get("entity_id") for item in audit["exam_result_applicability"]
+        }
+        self.assertIn("D100058", applicability_entities)
+        transition_names = [
+            item.get("name") for item in audit["clinical_transition_trace"]
+        ]
+        self.assertIn("claim_ledger_updated", transition_names)
+        self.assertEqual(audit["failure_stage"], "post_result_re_evaluation")
+        self.assertEqual(
+            audit["last_successful_clinical_transition"]["name"],
+            "claim_state_transaction_committed",
         )
 
     def test_pre_exam_judge_payload_injects_runtime_claim_state(self):
