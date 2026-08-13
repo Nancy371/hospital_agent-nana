@@ -474,6 +474,24 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "average_llm_context_estimated_input_tokens": _mean_training_value(
             [record.get("estimated_input_tokens") for record in llm_context_audits]
         ),
+        "average_llm_source_context_chars": _mean_training_value(
+            [record.get("source_context_chars") for record in llm_context_audits]
+        ),
+        "average_llm_source_estimated_tokens": _mean_training_value(
+            [record.get("source_estimated_tokens") for record in llm_context_audits]
+        ),
+        "average_llm_context_compression_ratio": _mean_training_value(
+            [record.get("compression_ratio") for record in llm_context_audits]
+        ),
+        "llm_context_budget_violation_count": sum(
+            1 for record in llm_context_audits if record.get("budget_violation_after_packing")
+        ),
+        "llm_context_audit_payload_detected_count": sum(
+            1 for record in llm_context_audits if record.get("audit_payload_detected")
+        ),
+        "llm_context_recursive_payload_detected_count": sum(
+            1 for record in llm_context_audits if record.get("recursive_payload_detected")
+        ),
         "tool_logical_call_count": len(tool_logical_finals),
         "tool_attempt_count": len(tool_call_audits),
         "tool_logical_call_count_by_action": tool_logical_distribution("action"),

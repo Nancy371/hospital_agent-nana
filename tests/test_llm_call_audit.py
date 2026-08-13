@@ -4,6 +4,7 @@ import unittest
 import yaml
 
 from agent.agent import MyDoctorAgent
+from agent.context_compiler import StageContextCompiler
 from hospital_agent.base import summarize_training_results
 
 
@@ -167,9 +168,9 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._llm_call_by_kind["json"], 1)
         self.assertEqual(agent._llm_call_by_kind["json_repair"], 1)
 
-    async def test_contract_repair_respects_llm_budget(self):
+    async def test_contract_repair_respects_repair_budget(self):
         agent = make_agent()
-        agent.max_llm_calls_per_case = 1
+        agent.max_llm_repair_calls_per_case = 0
         agent.llm = SequenceLLM([{"not_diagnosis": ["x"]}])
 
         result = await agent._llm_chat_json([], purpose="diagnosis")
@@ -180,6 +181,26 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(records[1]["contract_repair_attempted"])
         self.assertFalse(records[1]["model_invoked"])
         self.assertEqual(records[1]["primary_failure_reason"], "llm_budget_exhausted")
+
+    async def test_contract_repair_does_not_consume_clinical_budget(self):
+        agent = make_agent()
+        agent.max_llm_calls_per_case = 2
+        agent.max_llm_repair_calls_per_case = 1
+        agent.llm = SequenceLLM(
+            [
+                {"not_diagnosis": ["x"]},
+                {"diagnosis": ["A"]},
+                {"diagnosis": ["B"]},
+            ]
+        )
+
+        first = await agent._llm_chat_json([], purpose="diagnosis")
+        second = await agent._llm_chat_json([], purpose="diagnosis")
+
+        self.assertEqual(first["diagnosis"], ["A"])
+        self.assertEqual(second["diagnosis"], ["B"])
+        self.assertEqual(agent._llm_call_by_kind["json"], 2)
+        self.assertEqual(agent._llm_call_by_kind["json_repair"], 1)
 
     def test_stage_context_compiler_trims_and_audits_context(self):
         agent = make_agent()
@@ -192,12 +213,81 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
             chat_history=chat_history,
         )
 
-        self.assertEqual(len(compiled["chat_history"]), 12)
-        self.assertEqual(compiled["chat_history"][0]["text"], "8")
+        self.assertEqual(len(compiled["chat_history"]), 8)
+        self.assertEqual(compiled["chat_history"][0]["text"], "12")
         audit = agent._llm_context_audit[-1]
         self.assertEqual(audit["stage"], "thinking")
-        self.assertIn("chat_history:8_old_items", audit["omitted_sections"])
+        self.assertGreater(audit["source_context_chars"], audit["compiled_context_chars"])
+        self.assertIn("dropped_item_counts", audit)
         self.assertGreater(audit["estimated_input_tokens"], 0)
+
+    def test_context_compiler_drops_oversized_single_audit_field(self):
+        compiler = StageContextCompiler(
+            {
+                "stage_budget": {
+                    "diagnosis": {"max_input_tokens": 3000, "fallback_max_chars": 12000}
+                }
+            }
+        )
+        huge_audit = "x" * 3_000_000
+
+        compiled = compiler.compile(
+            "diagnosis",
+            collected_info={"chief_complaint": "cough"},
+            candidate_table="放射性肺炎 | AnchorSatisfied | ground_glass_opacity",
+            evidence_summary="thoracic_radiotherapy\nlesion_within_prior_radiation_field",
+            top_candidates=[
+                {
+                    "name": "放射性肺炎",
+                    "audit": huge_audit,
+                    "anchor_status": "AnchorSatisfied",
+                }
+            ],
+        )
+
+        context_text = str(compiled["context"])
+        audit = compiled["audit"]
+        self.assertLess(audit["compiled_context_chars"], 12000)
+        self.assertTrue(audit["audit_payload_detected"])
+        self.assertNotIn(huge_audit[:100], context_text)
+        self.assertGreater(audit["dropped_item_counts"].get("tier3_field", 0), 0)
+
+    def test_context_compiler_retains_critical_evidence_under_extreme_budget(self):
+        compiler = StageContextCompiler(
+            {
+                "stage_budget": {
+                    "diagnosis": {"max_input_tokens": 800, "fallback_max_chars": 3200}
+                }
+            }
+        )
+
+        compiled = compiler.compile(
+            "diagnosis",
+            collected_info={
+                "chief_complaint": "呼吸困难",
+                "background": "low value " * 2000,
+            },
+            evidence_summary=(
+                "new material evidence: lesion_within_prior_radiation_field SUPPORTED\n"
+                "hard contradiction: infection evidence absent\n"
+                + ("generic symptom line\n" * 1000)
+            ),
+            candidate_table=(
+                "current_primary: 放射性肺炎\n"
+                "protected contender: 肺不张 associated finding\n"
+                + ("low rank candidate\n" * 1000)
+            ),
+            chat_history=[{"from": "doctor", "text": str(i)} for i in range(30)],
+        )
+
+        text = str(compiled["context"])
+        audit = compiled["audit"]
+        self.assertIn("chief_complaint", text)
+        self.assertIn("lesion_within_prior_radiation_field", text)
+        self.assertIn("hard contradiction", text)
+        self.assertIn("current_primary", text)
+        self.assertLessEqual(audit["compiled_context_chars"], 3200)
+        self.assertTrue(audit["critical_evidence_retained"])
 
     def test_training_summary_aggregates_llm_contract_metrics(self):
         rows = [
@@ -207,8 +297,14 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
                     "llm_context_audit": [
                         {
                             "stage": "diagnosis",
+                            "source_context_chars": 1000,
+                            "source_estimated_tokens": 250,
                             "context_chars": 400,
                             "estimated_input_tokens": 100,
+                            "compression_ratio": 0.4,
+                            "budget_violation_after_packing": False,
+                            "audit_payload_detected": True,
+                            "recursive_payload_detected": False,
                         }
                     ],
                     "llm_call_audit": [
@@ -251,3 +347,6 @@ class LLMCallAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["llm_context_compile_count"], 1)
         self.assertEqual(summary["llm_context_compile_count_by_stage"], {"diagnosis": 1})
         self.assertEqual(summary["average_llm_context_estimated_input_tokens"], 100.0)
+        self.assertEqual(summary["average_llm_source_context_chars"], 1000.0)
+        self.assertEqual(summary["average_llm_context_compression_ratio"], 0.4)
+        self.assertEqual(summary["llm_context_audit_payload_detected_count"], 1)

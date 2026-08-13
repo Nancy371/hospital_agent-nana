@@ -738,6 +738,9 @@ class MyDoctorAgent(BaseDoctorAgent):
             execution_config.get("train_reflection_timeout_seconds", 24) or 24
         )
         self.max_llm_calls_per_case = int(execution_config.get("max_llm_calls_per_case", 0) or 0)
+        self.max_llm_repair_calls_per_case = int(
+            execution_config.get("max_llm_repair_calls_per_case", 2) or 2
+        )
         self.skip_train_reflection = bool(
             execution_config.get("skip_train_reflection", self.fast_mode)
         )
@@ -867,6 +870,7 @@ class MyDoctorAgent(BaseDoctorAgent):
 
         # LLM 成本可观测：调用次数统计
         self._llm_call_count = 0
+        self._llm_repair_call_count = 0
         self._llm_call_by_kind: Dict[str, int] = {}
         self._llm_call_audit: List[Dict[str, Any]] = []
         self._llm_logical_call_index = 0
@@ -974,12 +978,16 @@ class MyDoctorAgent(BaseDoctorAgent):
 
     def _bump_llm_counter(self, kind: str = "chat") -> None:
         """LLM 调用计数（用于成本监控）。"""
-        self._llm_call_count += 1
+        if kind == "json_repair":
+            self._llm_repair_call_count += 1
+        else:
+            self._llm_call_count += 1
         self._llm_call_by_kind[kind] = self._llm_call_by_kind.get(kind, 0) + 1
 
     def _reset_llm_counter(self) -> None:
         """重置计数器（每个患者独立统计）。"""
         self._llm_call_count = 0
+        self._llm_repair_call_count = 0
         self._llm_call_by_kind = {}
         self._llm_call_audit = []
         self._llm_logical_call_index = 0
@@ -999,6 +1007,18 @@ class MyDoctorAgent(BaseDoctorAgent):
 
     def _can_call_llm(self, kind: str) -> bool:
         """Return False when the per-case LLM budget has been exhausted."""
+        if kind == "json_repair":
+            if self.max_llm_repair_calls_per_case <= 0:
+                logger.warning("[LLM] skip %s call: repair budget disabled", kind)
+                return False
+            if self._llm_repair_call_count < self.max_llm_repair_calls_per_case:
+                return True
+            logger.warning(
+                "[LLM] skip %s call: repair budget reached (%s)",
+                kind,
+                self.max_llm_repair_calls_per_case,
+            )
+            return False
         if self.max_llm_calls_per_case <= 0:
             return True
         if self._llm_call_count < self.max_llm_calls_per_case:
