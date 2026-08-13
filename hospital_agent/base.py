@@ -298,6 +298,15 @@ def summarize_training_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "examination_precision": metric("examination_precision"),
         "treatment_overall_score": metric("treatment_overall_score"),
         "treatment_safety": metric("treatment_safety"),
+        "treatment_protocol_coverage_rate": metric(
+            "treatment_protocol_coverage_rate"
+        ),
+        "treatment_uncovered_diagnosis_count": metric(
+            "treatment_uncovered_diagnosis_count"
+        ),
+        "treatment_actionability_section_count": metric(
+            "treatment_actionability_section_count"
+        ),
         "candidate_recall_at_20": _mean_training_value(recall20_values),
         "candidate_recall_at_5": _mean_training_value(recall_values),
         "ranking_accuracy": metric("ranking_accuracy"),

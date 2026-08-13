@@ -10,6 +10,7 @@ from agent.qc import QualityAgent
 from agent.policy_store import PolicyStore
 from agent.replay import DiagnosticReplay
 from agent.treatment_safety import TreatmentSafetyGate
+from agent.treatment_strategy import TreatmentStrategyAgent
 
 
 def load_config():
@@ -134,7 +135,9 @@ class TreatmentAndMemoryTests(unittest.TestCase):
         engine = DiagnosisDecisionEngine(config, "data/ref_data")
         cls.gate = TreatmentSafetyGate(engine.knowledge)
         from agent.knowledge import KnowledgeBase
-        cls.qc = QualityAgent(KnowledgeBase("data/ref_data"), engine.knowledge.allowed_names)
+        knowledge = KnowledgeBase("data/ref_data")
+        cls.qc = QualityAgent(knowledge, engine.knowledge.allowed_names)
+        cls.strategy = TreatmentStrategyAgent(knowledge, engine.knowledge)
 
     def test_qc_never_invents_upper_respiratory_infection_for_empty_evidence(self):
         result = self.qc.review_final_result({}, collected_info={}, exam_results={})
@@ -165,6 +168,28 @@ class TreatmentAndMemoryTests(unittest.TestCase):
         )
         self.assertNotIn("给予布洛芬", fixed["treatment_plan"])
         self.assertIn("采用物理治疗", fixed["treatment_plan"])
+
+    def test_treatment_strategy_covers_authorized_diagnosis_protocols(self):
+        fixed = self.strategy.review(
+            {
+                "diagnosis": ["\u4f4e\u9541\u8840\u75c7"],
+                "treatment_plan": "\u5148\u7ed9\u4e88\u5bf9\u75c7\u5904\u7406\u3002",
+                "reasoning": "\u5df2\u6388\u6743\u8be5\u4e3b\u8bca\u65ad\u3002",
+            },
+            {"age": 70},
+            {"\u7535\u89e3\u8d28": {"result": "\u8840\u9541\u964d\u4f4e"}},
+        )
+
+        plan = fixed["treatment_plan"]
+        audit = fixed["_treatment_strategy"]
+        self.assertIn("\u6388\u6743\u8bca\u65ad\u5bf9\u5e94\u6cbb\u7597", plan)
+        self.assertIn("\u6309\u75c7\u72b6\u4e25\u91cd\u5ea6\u548c\u80be\u529f\u80fd\u8865\u9541", plan)
+        self.assertIn("\u76d1\u6d4b\u4e0e\u590d\u67e5", plan)
+        self.assertIn("\u4e13\u79d1\u4e0e\u968f\u8bbf", plan)
+        self.assertEqual(audit["covered_diagnoses"], ["\u4f4e\u9541\u8840\u75c7"])
+        self.assertEqual(audit["uncovered_diagnoses"], [])
+        self.assertEqual(audit["treatment_protocol_coverage_rate"], 1.0)
+        self.assertIn("diagnosis_specific_protocol", audit["actionability_sections"])
 
     def test_failure_memory_renders_lesson_not_wrong_submission(self):
         section = DoctorPrompt()._build_experience_section(

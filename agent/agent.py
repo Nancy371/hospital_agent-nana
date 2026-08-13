@@ -4057,6 +4057,21 @@ class MyDoctorAgent(BaseDoctorAgent):
             top_twenty=top_twenty,
             submitted=submitted,
         )
+        treatment_strategy = (
+            final_result.get("_treatment_strategy")
+            if isinstance(final_result, dict)
+            and isinstance(final_result.get("_treatment_strategy"), dict)
+            else {}
+        )
+        treatment_protocol_coverage_rate = float(
+            treatment_strategy.get("treatment_protocol_coverage_rate") or 0.0
+        )
+        treatment_uncovered_diagnosis_count = len(
+            treatment_strategy.get("uncovered_diagnoses") or []
+        )
+        treatment_actionability_section_count = len(
+            treatment_strategy.get("actionability_sections") or []
+        )
         return {
             "patient_id": patient_id,
             "status": "evaluated" if report else "evaluation_failed",
@@ -4073,6 +4088,9 @@ class MyDoctorAgent(BaseDoctorAgent):
                     "treatmentOverallScore", "treatment_overall_score"
                 ),
                 "treatment_safety": _metric("treatmentSafety", "treatment_safety"),
+                "treatment_protocol_coverage_rate": treatment_protocol_coverage_rate,
+                "treatment_uncovered_diagnosis_count": treatment_uncovered_diagnosis_count,
+                "treatment_actionability_section_count": treatment_actionability_section_count,
                 "candidate_recall_at_20": recall_at_twenty,
                 "candidate_recall_at_5": recall_at_five,
                 "ranking_accuracy": ranking_accuracy,
@@ -4292,6 +4310,7 @@ class MyDoctorAgent(BaseDoctorAgent):
                     runtime_audit.get("tool_contract_summary") or {}
                 ),
                 "failure_attribution": failure_attribution,
+                "treatment_strategy": treatment_strategy,
                 "exam_authorization": exam_authorization_records,
                 "exam_authorization_mode": exam_authorization_mode,
                 "exam_route_authorization_audit": exam_route_authorization_audit,
