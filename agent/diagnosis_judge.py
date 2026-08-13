@@ -47,6 +47,22 @@ _USABLE_CLOSURE_RESOLUTION_TYPES = {
     PARTIAL_SUBSTITUTE,
 }
 
+LIFECYCLE_WORKUP_REQUIRED = "WORKUP_REQUIRED"
+LIFECYCLE_READY_FOR_ARBITRATION = "READY_FOR_ARBITRATION"
+LIFECYCLE_PRIMARY = "PRIMARY"
+LIFECYCLE_SECONDARY = "SECONDARY"
+LIFECYCLE_REJECTED = "REJECTED"
+LIFECYCLE_DIFFERENTIAL_ONLY = "DIFFERENTIAL_ONLY"
+
+INVARIANT_VALID = "VALID"
+INVARIANT_DEADLOCK = "DEADLOCK"
+INVARIANT_INCONSISTENT = "INCONSISTENT"
+
+REASON_PRIMARY_ELIGIBLE = "PRIMARY_ELIGIBLE"
+REASON_ANCHOR_SATISFIED = "ANCHOR_SATISFIED"
+REASON_PROTECTED_CONTENDER = "PROTECTED_CONTENDER"
+REASON_PAIRWISE_ALLOWED = "PAIRWISE_ALLOWED"
+
 
 def _compact_text(value: Any) -> str:
     return "".join(str(value or "").strip().lower().split())
@@ -504,6 +520,8 @@ class JudgeDecision:
     contender_admission_audit: List[Dict[str, Any]] = field(default_factory=list)
     material_contender_filter: List[Dict[str, Any]] = field(default_factory=list)
     candidate_disposition_audit: List[Dict[str, Any]] = field(default_factory=list)
+    candidate_lifecycle_transitions: List[Dict[str, Any]] = field(default_factory=list)
+    lifecycle_recoveries: List[Dict[str, Any]] = field(default_factory=list)
     arbitration_deadlocks: List[Dict[str, Any]] = field(default_factory=list)
     primary_arbitration_candidates: List[Dict[str, Any]] = field(default_factory=list)
     primary_arbitration_decision: Dict[str, Any] = field(default_factory=dict)
@@ -1502,7 +1520,12 @@ class DiagnosisJudge:
             if self._eligibility_status(item) == PRIMARY_ELIGIBLE
         ]
         primary = self._choose_primary(primary_candidates)
-        arbitration = self._primary_arbitration(primary, differential_pool, pairwise)
+        arbitration = self._primary_arbitration(
+            primary,
+            differential_pool,
+            pairwise,
+            full_pool=ranked,
+        )
         if arbitration.get("selected_candidate") is not None:
             primary = arbitration["selected_candidate"]
         pairwise_gap_tasks = self._pairwise_gap_exam_tasks(
@@ -2169,11 +2192,55 @@ class DiagnosisJudge:
     def _pairwise_discriminating_exams(self, left: Any, right: Any) -> List[str]:
         return self._candidate_exam_union([left, right])[: self.discriminating_exam_max_items]
 
+    def _candidate_key(self, candidate: Any) -> str:
+        entity_id = str(getattr(candidate, "entity_id", "") or "").strip()
+        if entity_id:
+            return f"entity:{entity_id}"
+        return f"name:{self._name(candidate)}"
+
+    def _unique_candidate_sequence(
+        self,
+        *pools: Sequence[Any],
+    ) -> List[Any]:
+        result: List[Any] = []
+        seen: set[str] = set()
+        for pool in pools:
+            for candidate in pool or []:
+                if not candidate:
+                    continue
+                key = self._candidate_key(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(candidate)
+        return result
+
+    def _arbitration_admission_reason(
+        self,
+        candidate: Any,
+        *,
+        pairwise_allowed: bool,
+        protected_entry: bool,
+        primary_eligible_entry: bool,
+        candidate_anchor: str,
+    ) -> str:
+        if primary_eligible_entry:
+            return REASON_PRIMARY_ELIGIBLE
+        if candidate_anchor == "AnchorSatisfied":
+            return REASON_ANCHOR_SATISFIED
+        if protected_entry:
+            return REASON_PROTECTED_CONTENDER
+        if pairwise_allowed:
+            return REASON_PAIRWISE_ALLOWED
+        return "PAIRWISE_NOT_ALLOWED"
+
     def _primary_arbitration(
         self,
         primary: Any,
         pool: Sequence[Any],
         pairwise: Sequence[Dict[str, Any]],
+        *,
+        full_pool: Optional[Sequence[Any]] = None,
     ) -> Dict[str, Any]:
         if not primary:
             return {
@@ -2187,10 +2254,15 @@ class DiagnosisJudge:
             for item in pairwise or []
             if isinstance(item, dict)
         }
+        differential_names = {self._name(item) for item in pool or [] if item}
+        admission_pool = self._unique_candidate_sequence(full_pool or [], pool or [])
         contenders = []
         admission_audit: List[Dict[str, Any]] = []
         material_filter_audit: List[Dict[str, Any]] = []
-        for index, item in enumerate(pool or [], start=1):
+        arbitration_pool_names: set[str] = set()
+        arbitration_admission_reason_by_name: Dict[str, str] = {}
+        lifecycle_recoveries: List[Dict[str, Any]] = []
+        for index, item in enumerate(admission_pool or [], start=1):
             if not item or item is primary or self._name(item) == self._name(primary):
                 continue
             pairwise_allowed = (
@@ -2211,17 +2283,13 @@ class DiagnosisJudge:
             admission_decision = bool(
                 pairwise_allowed or protected_entry or primary_eligible_entry
             )
-            admission_reason = ""
-            if primary_eligible_entry and index <= max(1, self.differential_top_k):
-                admission_reason = "TOPK_PRIMARY_ELIGIBLE"
-            elif primary_eligible_entry:
-                admission_reason = "PRIMARY_ELIGIBLE_ANCHOR"
-            elif protected_entry:
-                admission_reason = self._arbitration_entry_reason(item)
-            elif pairwise_allowed:
-                admission_reason = "PAIRWISE_ALLOWED"
-            else:
-                admission_reason = "PAIRWISE_NOT_ALLOWED"
+            admission_reason = self._arbitration_admission_reason(
+                item,
+                pairwise_allowed=pairwise_allowed,
+                protected_entry=protected_entry,
+                primary_eligible_entry=primary_eligible_entry,
+                candidate_anchor=candidate_anchor,
+            )
             if not admission_decision:
                 audit = self._material_contender_filter_record(
                     item,
@@ -2238,11 +2306,26 @@ class DiagnosisJudge:
                     admission_decision=False,
                     admission_reason=admission_reason,
                     filtered_reason="pairwise_not_allowed_and_no_protection",
+                    differential_pool_member=self._name(item) in differential_names,
+                    arbitration_pool_member=False,
                 )
                 admission_audit.append(audit)
                 material_filter_audit.append(audit)
                 continue
             material_contender = self.clinical_comparator.material_contender(item, primary)
+            if primary_eligible_entry and not material_contender:
+                material_contender = True
+                lifecycle_recoveries.append(
+                    {
+                        "candidate": self._name(item),
+                        "entity_id": str(getattr(item, "entity_id", "") or ""),
+                        "lifecycle_recovery_applied": True,
+                        "recovery_reason": "PRIMARY_ELIGIBLE_MATERIALITY_OVERRIDE",
+                        "score_unchanged": True,
+                        "evidence_version_unchanged": True,
+                        "claim_state_unchanged": True,
+                    }
+                )
             filtered_reason = ""
             if not material_contender:
                 filtered_reason = self._material_contender_filtered_reason(
@@ -2269,11 +2352,15 @@ class DiagnosisJudge:
                 admission_decision=admission_decision,
                 admission_reason=admission_reason,
                 filtered_reason=filtered_reason,
+                differential_pool_member=self._name(item) in differential_names,
+                arbitration_pool_member=bool(material_contender),
             )
             admission_audit.append(audit)
             material_filter_audit.append(audit)
             if not material_contender:
                 continue
+            arbitration_pool_names.add(self._name(item))
+            arbitration_admission_reason_by_name[self._name(item)] = admission_reason
             contenders.append(item)
         contenders = sorted(
             contenders,
@@ -2286,7 +2373,27 @@ class DiagnosisJudge:
                 self._judge_score(item),
             ),
             reverse=True,
-        )[:3]
+        )
+        mandatory_contenders = [
+            item
+            for item in contenders
+            if arbitration_admission_reason_by_name.get(self._name(item))
+            in {
+                REASON_PRIMARY_ELIGIBLE,
+                REASON_ANCHOR_SATISFIED,
+                REASON_PROTECTED_CONTENDER,
+            }
+        ]
+        optional_limit = max(0, 3 - len(mandatory_contenders))
+        optional_contenders = [
+            item
+            for item in contenders
+            if item not in mandatory_contenders
+        ][:optional_limit]
+        contenders = self._unique_candidate_sequence(
+            mandatory_contenders,
+            optional_contenders,
+        )
         records: List[Dict[str, Any]] = []
         candidate_audits: List[Dict[str, Any]] = []
         gaps: List[Dict[str, Any]] = []
@@ -2342,41 +2449,50 @@ class DiagnosisJudge:
             )
             action = str(record.get("recommended_action") or "")
             if action == SWITCH_PRIMARY:
-                selected = contender
-                selected_action = action
-                selected_reason_codes = list(record.get("decision_reason_codes") or [])
-                break
+                if selected_action != SWITCH_PRIMARY:
+                    selected = contender
+                    selected_action = action
+                    selected_reason_codes = list(record.get("decision_reason_codes") or [])
+                continue
             if action == UNLOCK_AND_DEFER:
-                selected = contender
-                selected_action = action
-                selected_reason_codes = list(record.get("decision_reason_codes") or [])
-                defer_reason = (
-                    "better_explanatory_candidate_requires_gap_closure:"
-                    f" {self._name(contender)} challenges {self._name(primary)}"
-                )
+                if selected_action not in {SWITCH_PRIMARY, UNLOCK_AND_DEFER}:
+                    selected = contender
+                    selected_action = action
+                    selected_reason_codes = list(record.get("decision_reason_codes") or [])
+                    defer_reason = (
+                        "better_explanatory_candidate_requires_gap_closure:"
+                        f" {self._name(contender)} challenges {self._name(primary)}"
+                    )
                 gaps.append(self._pairwise_discriminating_gap(primary, contender, record))
-                break
+                continue
             if action == KEEP_CURRENT_AND_DEFER_CONTENDER:
                 gaps.append(self._pairwise_discriminating_gap(primary, contender, record))
                 if selected_action == KEEP_CURRENT_PRIMARY:
                     selected_action = action
                     selected_reason_codes = list(record.get("decision_reason_codes") or [])
-            elif action not in {REJECT_CONTENDER, NO_MATERIAL_DIFFERENCE}:
+            elif (
+                selected_action == KEEP_CURRENT_PRIMARY
+                and action not in {REJECT_CONTENDER, NO_MATERIAL_DIFFERENCE}
+            ):
                 selected_action = action
                 selected_reason_codes = list(record.get("decision_reason_codes") or [])
 
         disposition_audit = self._candidate_disposition_audit(
             primary,
-            pool,
+            admission_pool,
             admission_audit,
             comparison_action_by_name,
             comparison_reason_by_name,
+            differential_pool_names=differential_names,
+            arbitration_pool_names=arbitration_pool_names,
+            arbitration_admission_reason_by_name=arbitration_admission_reason_by_name,
         )
         deadlocks = [
-            item for item in disposition_audit if item.get("deadlock_code") == "ARBITRATION_DEADLOCK"
+            item for item in disposition_audit if item.get("invariant_status") == INVARIANT_DEADLOCK
         ]
+        lifecycle_transitions = self._candidate_lifecycle_transitions(disposition_audit)
         summary = self._primary_arbitration_summary(
-            pool,
+            admission_pool,
             records,
             candidate_audits,
             disposition_audit,
@@ -2402,6 +2518,8 @@ class DiagnosisJudge:
                 "material_contender_filter": material_filter_audit,
                 "candidate_disposition_audit": disposition_audit,
                 "arbitration_deadlocks": deadlocks,
+                "candidate_lifecycle_transitions": lifecycle_transitions,
+                "lifecycle_recoveries": lifecycle_recoveries,
                 "summary": summary,
                 "decision": {
                     "action": KEEP_CURRENT_PRIMARY,
@@ -2418,6 +2536,8 @@ class DiagnosisJudge:
             "material_contender_filter": material_filter_audit,
             "candidate_disposition_audit": disposition_audit,
             "arbitration_deadlocks": deadlocks,
+            "candidate_lifecycle_transitions": lifecycle_transitions,
+            "lifecycle_recoveries": lifecycle_recoveries,
             "summary": summary,
             "decision": {
                 "action": selected_action,
@@ -2461,6 +2581,8 @@ class DiagnosisJudge:
         admission_decision: bool,
         admission_reason: str,
         filtered_reason: str,
+        differential_pool_member: bool = False,
+        arbitration_pool_member: bool = False,
     ) -> Dict[str, Any]:
         eligibility = self._eligibility_status(candidate)
         return {
@@ -2482,6 +2604,9 @@ class DiagnosisJudge:
             "primary_eligible_entry": bool(primary_eligible_entry),
             "admission_decision": bool(admission_decision),
             "admission_reason": str(admission_reason or ""),
+            "differential_pool_member": bool(differential_pool_member),
+            "arbitration_pool_member": bool(arbitration_pool_member),
+            "arbitration_admission_reason": str(admission_reason or ""),
             "material_contender": bool(material_contender),
             "filtered_reason": str(filtered_reason or ""),
         }
@@ -2519,13 +2644,21 @@ class DiagnosisJudge:
         admission_audit: Sequence[Dict[str, Any]],
         comparison_action_by_name: Dict[str, str],
         comparison_reason_by_name: Dict[str, List[str]],
+        *,
+        differential_pool_names: Optional[set[str]] = None,
+        arbitration_pool_names: Optional[set[str]] = None,
+        arbitration_admission_reason_by_name: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         admission_by_name = {
             str(item.get("candidate") or ""): dict(item)
             for item in admission_audit or []
             if str(item.get("candidate") or "")
         }
-        top_k = max(1, int(getattr(self, "differential_top_k", 5) or 5))
+        differential_pool_names = set(differential_pool_names or [])
+        arbitration_pool_names = set(arbitration_pool_names or [])
+        arbitration_admission_reason_by_name = dict(
+            arbitration_admission_reason_by_name or {}
+        )
         records: List[Dict[str, Any]] = []
         for index, candidate in enumerate(pool or [], start=1):
             if not candidate:
@@ -2546,48 +2679,132 @@ class DiagnosisJudge:
             primary_eligible = bool(
                 eligibility == PRIMARY_ELIGIBLE or anchor == "AnchorSatisfied"
             )
-            gap_count = int(getattr(candidate, "actionable_gap_count", 0) or 0)
-            gap_count += len(getattr(candidate, "required_gaps", []) or [])
+            gap_count = self._actionable_workup_count(candidate)
             comparison_action = str(comparison_action_by_name.get(name) or "")
             compared = bool(comparison_action)
+            differential_member = bool(
+                name in differential_pool_names
+                or admission.get("differential_pool_member")
+            )
+            arbitration_member = bool(
+                is_primary
+                or name in arbitration_pool_names
+                or admission.get("arbitration_pool_member")
+            )
+            arbitration_reason = (
+                str(arbitration_admission_reason_by_name.get(name) or "")
+                or str(admission.get("arbitration_admission_reason") or "")
+            )
             rejection_reason = ""
-            disposition = ""
+            lifecycle_state = ""
+            lifecycle_reason = ""
+            required_action = ""
+            arbitration_status = ""
+            invariant_status = INVARIANT_VALID
+            deadlock_codes: List[str] = []
+            failure_stage = ""
             if is_primary:
-                disposition = "CURRENT_PRIMARY"
+                lifecycle_state = LIFECYCLE_PRIMARY
+                lifecycle_reason = "CURRENT_PRIMARY"
+                required_action = "PRIMARY_DECIDED"
+                arbitration_status = "CURRENT_PRIMARY"
             elif compared:
                 if comparison_action == REJECT_CONTENDER:
-                    disposition = "REJECTED_WITH_REASON"
+                    lifecycle_state = LIFECYCLE_REJECTED
+                    lifecycle_reason = "COMPARATOR_REJECTED"
                     rejection_reason = "clinical_reasoning_comparator_rejected"
+                    arbitration_status = "COMPARED_REJECT"
                 elif comparison_action == NO_MATERIAL_DIFFERENCE:
-                    disposition = "NON_MATERIAL_AFTER_COMPARISON"
+                    lifecycle_state = (
+                        LIFECYCLE_READY_FOR_ARBITRATION
+                        if primary_eligible
+                        else LIFECYCLE_DIFFERENTIAL_ONLY
+                    )
+                    lifecycle_reason = "NO_MATERIAL_DIFFERENCE_AFTER_COMPARISON"
+                    arbitration_status = "COMPARED_DEFER"
                 else:
-                    disposition = "ARBITRATED"
+                    lifecycle_state = LIFECYCLE_READY_FOR_ARBITRATION
+                    lifecycle_reason = "COMPARISON_COMPLETED"
+                    arbitration_status = (
+                        "COMPARED_SWITCH"
+                        if comparison_action == SWITCH_PRIMARY
+                        else "COMPARED_DEFER"
+                        if comparison_action in {
+                            UNLOCK_AND_DEFER,
+                            KEEP_CURRENT_AND_DEFER_CONTENDER,
+                        }
+                        else "COMPARED_KEEP"
+                    )
+                required_action = "ARBITRATION_RESOLVED"
             elif bool(getattr(candidate, "hard_contradiction", False)):
-                disposition = "REJECTED_WITH_REASON"
+                lifecycle_state = LIFECYCLE_REJECTED
+                lifecycle_reason = "HARD_CONTRADICTION"
+                required_action = "NONE"
                 rejection_reason = "hard_contradiction"
             elif eligibility == EXCLUDED:
-                disposition = "REJECTED_WITH_REASON"
+                lifecycle_state = LIFECYCLE_REJECTED
+                lifecycle_reason = "EXCLUDED"
+                required_action = "NONE"
                 rejection_reason = "excluded_candidate"
+            elif primary_eligible:
+                lifecycle_state = LIFECYCLE_READY_FOR_ARBITRATION
+                lifecycle_reason = arbitration_reason or (
+                    REASON_PRIMARY_ELIGIBLE
+                    if eligibility == PRIMARY_ELIGIBLE
+                    else REASON_ANCHOR_SATISFIED
+                )
+                required_action = "ARBITRATE"
+                if not arbitration_member:
+                    invariant_status = INVARIANT_DEADLOCK
+                    deadlock_codes.append("PRIMARY_ELIGIBLE_NOT_IN_ARBITRATION_POOL")
+                    failure_stage = "candidate_routing"
+                else:
+                    invariant_status = INVARIANT_DEADLOCK
+                    deadlock_codes.append("ARBITRATION_MEMBER_NOT_RESOLVED")
+                    failure_stage = "arbitration_resolution"
             elif gap_count > 0:
-                disposition = "ACTIONABLE_GAP_CREATED"
+                lifecycle_state = LIFECYCLE_WORKUP_REQUIRED
+                lifecycle_reason = "ACTIONABLE_WORKUP_AVAILABLE"
+                required_action = "WORKUP"
+                arbitration_status = "NOT_REQUIRED"
+            elif eligibility == DEFERRED or anchor == "PatternSupportedButUnconfirmed":
+                lifecycle_state = LIFECYCLE_WORKUP_REQUIRED
+                lifecycle_reason = "DEFERRED_WITHOUT_ACTIONABLE_WORKUP"
+                required_action = "WORKUP"
+                invariant_status = INVARIANT_DEADLOCK
+                deadlock_codes.append("DEFERRED_WITHOUT_ACTIONABLE_WORKUP")
+                if not getattr(candidate, "required_gaps", None):
+                    deadlock_codes.append("GAPLESS_DEFERRED_CANDIDATE")
+                failure_stage = "candidate_routing"
+            elif eligibility == DIFFERENTIAL_ONLY or getattr(candidate, "differential_only", False):
+                lifecycle_state = LIFECYCLE_DIFFERENTIAL_ONLY
+                lifecycle_reason = "DIFFERENTIAL_ONLY_STILL_ALIVE"
+                required_action = "MONITOR"
+                arbitration_status = "NOT_REQUIRED"
             else:
-                disposition = "NONE"
-            deadlock_code = ""
-            failure_stage = ""
+                lifecycle_state = LIFECYCLE_DIFFERENTIAL_ONLY
+                lifecycle_reason = "SEARCH_SPACE_ONLY"
+                required_action = "MONITOR"
+                arbitration_status = "NOT_REQUIRED"
             if (
-                not is_primary
-                and index <= top_k
-                and primary_eligible
+                arbitration_member
+                and not is_primary
                 and not compared
                 and not rejection_reason
-                and gap_count <= 0
+                and "ARBITRATION_MEMBER_NOT_RESOLVED" not in deadlock_codes
             ):
-                deadlock_code = "ARBITRATION_DEADLOCK"
-                failure_stage = (
-                    "contender_admission"
-                    if not admission.get("material_contender")
-                    else "arbitration_disposition"
-                )
+                invariant_status = INVARIANT_DEADLOCK
+                deadlock_codes.append("ARBITRATION_MEMBER_NOT_RESOLVED")
+                failure_stage = failure_stage or "arbitration_resolution"
+            deadlock_code = "ARBITRATION_DEADLOCK" if deadlock_codes else ""
+            final_disposition = self._legacy_disposition(
+                lifecycle_state,
+                compared=compared,
+                comparison_action=comparison_action,
+                rejection_reason=rejection_reason,
+                gap_count=gap_count,
+                is_primary=is_primary,
+            )
             records.append(
                 {
                     "candidate": name,
@@ -2598,6 +2815,9 @@ class DiagnosisJudge:
                     "anchor_status": anchor,
                     "primary_eligible": primary_eligible,
                     "pairwise_status": bool(admission.get("pairwise_allowed", False)),
+                    "differential_pool_member": differential_member,
+                    "arbitration_pool_member": arbitration_member,
+                    "arbitration_admission_reason": arbitration_reason,
                     "material_contender_status": bool(
                         admission.get("material_contender", False)
                     ),
@@ -2610,12 +2830,93 @@ class DiagnosisJudge:
                     "rejection_reason": rejection_reason,
                     "active_gap_count": gap_count,
                     "deferred_gap_count": len(getattr(candidate, "required_gaps", []) or []),
-                    "final_disposition": disposition,
+                    "lifecycle_state": lifecycle_state,
+                    "lifecycle_reason": lifecycle_reason,
+                    "required_action": required_action,
+                    "arbitration_status": arbitration_status,
+                    "source_state_version": int(
+                        getattr(candidate, "diagnostic_state_version", 0) or 0
+                    ),
+                    "disposition_version": int(
+                        getattr(candidate, "diagnostic_state_version", 0) or 0
+                    ),
+                    "invariant_status": invariant_status,
+                    "deadlock_codes": deadlock_codes,
+                    "final_disposition": final_disposition,
                     "deadlock_code": deadlock_code,
                     "failure_stage": failure_stage,
                 }
             )
         return records
+
+    def _legacy_disposition(
+        self,
+        lifecycle_state: str,
+        *,
+        compared: bool,
+        comparison_action: str,
+        rejection_reason: str,
+        gap_count: int,
+        is_primary: bool,
+    ) -> str:
+        if is_primary:
+            return "CURRENT_PRIMARY"
+        if rejection_reason or lifecycle_state == LIFECYCLE_REJECTED:
+            return "REJECTED_WITH_REASON"
+        if compared:
+            if comparison_action == NO_MATERIAL_DIFFERENCE:
+                return "NON_MATERIAL_AFTER_COMPARISON"
+            return "ARBITRATED"
+        if lifecycle_state == LIFECYCLE_WORKUP_REQUIRED or gap_count > 0:
+            return "ACTIONABLE_GAP_CREATED"
+        if lifecycle_state == LIFECYCLE_READY_FOR_ARBITRATION:
+            return "READY_FOR_ARBITRATION"
+        if lifecycle_state == LIFECYCLE_DIFFERENTIAL_ONLY:
+            return "DIFFERENTIAL_ONLY"
+        return "NONE"
+
+    def _actionable_workup_count(self, candidate: Any) -> int:
+        count = int(getattr(candidate, "actionable_gap_count", 0) or 0)
+        count += len(getattr(candidate, "required_gaps", []) or [])
+        count += len(getattr(candidate, "evidence_gaps", []) or [])
+        count += len(getattr(candidate, "claim_closure_plan", []) or [])
+        count += len(getattr(candidate, "claim_closure_plans", []) or [])
+        count += len(getattr(candidate, "pending_exam_bindings", []) or [])
+        count += len(getattr(candidate, "pending_history_inquiries", []) or [])
+        count += len(getattr(candidate, "pending_relation_resolutions", []) or [])
+        if bool(getattr(candidate, "pending_exam_result", False)):
+            count += 1
+        if self._critical_claim_followup_candidate(candidate):
+            count += 1
+        return count
+
+    @staticmethod
+    def _candidate_lifecycle_transitions(
+        disposition_audit: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        transitions: List[Dict[str, Any]] = []
+        for item in disposition_audit or []:
+            if not isinstance(item, dict):
+                continue
+            transitions.append(
+                {
+                    "candidate": str(item.get("candidate") or ""),
+                    "entity_id": str(item.get("entity_id") or ""),
+                    "diagnostic_state_version": int(
+                        item.get("source_state_version") or 0
+                    ),
+                    "from": "",
+                    "to": str(item.get("lifecycle_state") or ""),
+                    "trigger": "candidate_lifecycle_projection",
+                    "eligibility_status": str(item.get("eligibility_status") or ""),
+                    "anchor_status": str(item.get("anchor_status") or ""),
+                    "reason": str(item.get("lifecycle_reason") or ""),
+                    "required_action": str(item.get("required_action") or ""),
+                    "invariant_status": str(item.get("invariant_status") or ""),
+                    "deadlock_codes": list(item.get("deadlock_codes") or []),
+                }
+            )
+        return transitions
 
     @staticmethod
     def _primary_arbitration_summary(
@@ -2798,6 +3099,12 @@ class DiagnosisJudge:
         )
         decision.candidate_disposition_audit = list(
             arbitration.get("candidate_disposition_audit") or []
+        )
+        decision.candidate_lifecycle_transitions = list(
+            arbitration.get("candidate_lifecycle_transitions") or []
+        )
+        decision.lifecycle_recoveries = list(
+            arbitration.get("lifecycle_recoveries") or []
         )
         decision.arbitration_deadlocks = list(
             arbitration.get("arbitration_deadlocks") or []

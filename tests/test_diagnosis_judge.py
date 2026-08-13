@@ -937,7 +937,278 @@ class DiagnosisJudgeTests(unittest.TestCase):
             mitral_disposition["deadlock_code"],
             "ARBITRATION_DEADLOCK",
         )
-        self.assertEqual(mitral_disposition["failure_stage"], "contender_admission")
+        self.assertEqual(mitral_disposition["failure_stage"], "candidate_routing")
+        self.assertEqual(
+            mitral_disposition["lifecycle_state"],
+            "READY_FOR_ARBITRATION",
+        )
+        self.assertIn(
+            "PRIMARY_ELIGIBLE_NOT_IN_ARBITRATION_POOL",
+            mitral_disposition["deadlock_codes"],
+        )
+
+    def test_primary_eligible_outside_differential_pool_enters_arbitration_pool(self):
+        primary = candidate(
+            FRACTURE,
+            0.86,
+            required=True,
+            matched=["osteophyte", "joint_pain"],
+            coverage=0.40,
+            residual=0.55,
+            residual_core=2,
+        )
+        primary.entity_id = "D100031"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        distractors = []
+        for index in range(6):
+            item = candidate(
+                f"候选{index}",
+                0.80 - index * 0.02,
+                required=False,
+                matched=[f"generic_{index}"],
+            )
+            item.entity_id = f"D_NOISE_{index}"
+            item.eligibility_status = "DifferentialOnly"
+            item.differential_only = True
+            distractors.append(item)
+
+        radiation = candidate(
+            "放射性肺炎",
+            0.40,
+            required=True,
+            matched=[
+                "thoracic_radiotherapy",
+                "ground_glass_opacity",
+                "lesion_within_prior_radiation_field",
+            ],
+            core_score=0.34,
+            diagnostic_score=0.20,
+            coverage=0.82,
+            residual=0.12,
+            core_coverage=0.84,
+        )
+        radiation.entity_id = "D100058"
+        radiation.eligibility_status = "PrimaryEligible"
+        radiation.eligibility_anchor_status = "AnchorSatisfied"
+
+        result = self.engine.judge._primary_arbitration(
+            primary,
+            [primary] + distractors[:2],
+            [],
+            full_pool=[primary] + distractors + [radiation],
+        )
+
+        dispositions = {
+            item["entity_id"]: item for item in result["candidate_disposition_audit"]
+        }
+        radiation_disposition = dispositions["D100058"]
+        self.assertEqual(
+            radiation_disposition["lifecycle_state"],
+            "READY_FOR_ARBITRATION",
+        )
+        self.assertTrue(radiation_disposition["arbitration_pool_member"])
+        self.assertEqual(
+            radiation_disposition["arbitration_admission_reason"],
+            "PRIMARY_ELIGIBLE",
+        )
+        self.assertTrue(radiation_disposition["comparison_present"])
+        self.assertEqual(radiation_disposition["invariant_status"], "VALID")
+        self.assertFalse(radiation_disposition["deadlock_codes"])
+
+    def test_arbitration_pool_member_without_resolution_is_deadlock(self):
+        primary = candidate(PNEUMONIA, 0.80, required=True)
+        primary.entity_id = "D_PRIMARY"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        contender = candidate(
+            MITRAL_REGURGITATION,
+            0.70,
+            required=True,
+            matched=["mitral_regurgitation"],
+            core_score=0.35,
+        )
+        contender.entity_id = "D100012"
+        contender.eligibility_status = "PrimaryEligible"
+        contender.eligibility_anchor_status = "AnchorSatisfied"
+
+        dispositions = self.engine.judge._candidate_disposition_audit(
+            primary,
+            [primary, contender],
+            [
+                {
+                    "candidate": MITRAL_REGURGITATION,
+                    "entity_id": "D100012",
+                    "eligibility_status": "PrimaryEligible",
+                    "candidate_anchor_status": "AnchorSatisfied",
+                    "arbitration_pool_member": True,
+                    "arbitration_admission_reason": "PRIMARY_ELIGIBLE",
+                    "material_contender": True,
+                }
+            ],
+            {},
+            {},
+            arbitration_pool_names={MITRAL_REGURGITATION},
+            arbitration_admission_reason_by_name={
+                MITRAL_REGURGITATION: "PRIMARY_ELIGIBLE"
+            },
+        )
+
+        contender_disposition = next(
+            item for item in dispositions if item["entity_id"] == "D100012"
+        )
+        self.assertIn(
+            "ARBITRATION_MEMBER_NOT_RESOLVED",
+            contender_disposition["deadlock_codes"],
+        )
+        self.assertEqual(
+            contender_disposition["failure_stage"],
+            "arbitration_resolution",
+        )
+
+    def test_disposition_scoped_by_diagnostic_state_version(self):
+        primary = candidate(PNEUMONIA, 0.80, required=True)
+        primary.entity_id = "D_PRIMARY"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        contender = candidate(MITRAL_REGURGITATION, 0.70, required=False)
+        contender.entity_id = "D100012"
+        contender.eligibility_status = "Deferred"
+        contender.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        contender.required_gaps = ["mitral_regurgitant_jet"]
+        contender.diagnostic_state_version = 1
+        v1 = self.engine.judge._candidate_disposition_audit(
+            primary,
+            [primary, contender],
+            [],
+            {},
+            {},
+        )
+        contender.eligibility_status = "PrimaryEligible"
+        contender.eligibility_anchor_status = "AnchorSatisfied"
+        contender.required_gaps = []
+        contender.required_met = True
+        contender.diagnostic_state_version = 2
+        v2 = self.engine.judge._candidate_disposition_audit(
+            primary,
+            [primary, contender],
+            [
+                {
+                    "candidate": MITRAL_REGURGITATION,
+                    "entity_id": "D100012",
+                    "eligibility_status": "PrimaryEligible",
+                    "candidate_anchor_status": "AnchorSatisfied",
+                    "arbitration_pool_member": True,
+                    "arbitration_admission_reason": "PRIMARY_ELIGIBLE",
+                    "material_contender": True,
+                }
+            ],
+            {MITRAL_REGURGITATION: "KEEP_CURRENT_PRIMARY"},
+            {MITRAL_REGURGITATION: ["INCUMBENT_PREFERRED"]},
+            arbitration_pool_names={MITRAL_REGURGITATION},
+        )
+
+        first = next(item for item in v1 if item["entity_id"] == "D100012")
+        second = next(item for item in v2 if item["entity_id"] == "D100012")
+        self.assertEqual(first["source_state_version"], 1)
+        self.assertEqual(first["lifecycle_state"], "WORKUP_REQUIRED")
+        self.assertEqual(second["source_state_version"], 2)
+        self.assertEqual(second["lifecycle_state"], "READY_FOR_ARBITRATION")
+        self.assertEqual(second["invariant_status"], "VALID")
+
+    def test_deferred_with_pending_workup_without_new_gap_is_valid(self):
+        primary = candidate(PNEUMONIA, 0.80, required=True)
+        primary.entity_id = "D_PRIMARY"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        contender = candidate("待确认疾病", 0.55, required=False)
+        contender.entity_id = "D_PENDING"
+        contender.eligibility_status = "Deferred"
+        contender.eligibility_anchor_status = "PatternSupportedButUnconfirmed"
+        contender.required_gaps = []
+        contender.pending_exam_result = True
+
+        dispositions = self.engine.judge._candidate_disposition_audit(
+            primary,
+            [primary, contender],
+            [],
+            {},
+            {},
+        )
+        record = next(item for item in dispositions if item["entity_id"] == "D_PENDING")
+        self.assertEqual(record["lifecycle_state"], "WORKUP_REQUIRED")
+        self.assertEqual(record["invariant_status"], "VALID")
+        self.assertNotIn("GAPLESS_DEFERRED_CANDIDATE", record["deadlock_codes"])
+
+    def test_differential_only_remains_alive_without_deadlock(self):
+        primary = candidate(PNEUMONIA, 0.80, required=True)
+        primary.entity_id = "D_PRIMARY"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        contender = candidate("低优先鉴别", 0.42, required=False)
+        contender.entity_id = "D_DIFF"
+        contender.eligibility_status = "DifferentialOnly"
+        contender.differential_only = True
+
+        dispositions = self.engine.judge._candidate_disposition_audit(
+            primary,
+            [primary, contender],
+            [],
+            {},
+            {},
+        )
+        record = next(item for item in dispositions if item["entity_id"] == "D_DIFF")
+        self.assertEqual(record["lifecycle_state"], "DIFFERENTIAL_ONLY")
+        self.assertEqual(record["required_action"], "MONITOR")
+        self.assertEqual(record["invariant_status"], "VALID")
+
+    def test_lifecycle_recovery_does_not_mutate_score_or_state_versions(self):
+        primary = candidate(PNEUMONIA, 0.80, required=True)
+        primary.entity_id = "D_PRIMARY"
+        primary.eligibility_status = "PrimaryEligible"
+        primary.eligibility_anchor_status = "AnchorSatisfied"
+
+        contender = candidate(
+            MITRAL_REGURGITATION,
+            0.61,
+            required=True,
+            matched=["mitral_regurgitation"],
+            core_score=0.28,
+        )
+        contender.entity_id = "D100012"
+        contender.eligibility_status = "PrimaryEligible"
+        contender.eligibility_anchor_status = "AnchorSatisfied"
+        contender.evidence_version = 7
+        contender.claim_state_version = 3
+        score_before = contender.score
+        evidence_version_before = contender.evidence_version
+        claim_state_version_before = contender.claim_state_version
+
+        original = self.engine.judge.clinical_comparator.material_contender
+        self.engine.judge.clinical_comparator.material_contender = lambda *_args, **_kwargs: False
+        try:
+            result = self.engine.judge._primary_arbitration(
+                primary,
+                [primary],
+                [],
+                full_pool=[primary, contender],
+            )
+        finally:
+            self.engine.judge.clinical_comparator.material_contender = original
+
+        self.assertEqual(contender.score, score_before)
+        self.assertEqual(contender.evidence_version, evidence_version_before)
+        self.assertEqual(contender.claim_state_version, claim_state_version_before)
+        self.assertTrue(result["lifecycle_recoveries"])
+        recovery = result["lifecycle_recoveries"][0]
+        self.assertTrue(recovery["score_unchanged"])
+        self.assertTrue(recovery["evidence_version_unchanged"])
+        self.assertTrue(recovery["claim_state_unchanged"])
 
     def test_primary_arbitration_switches_when_score_primary_has_no_anchor(self):
         zoster = candidate(
