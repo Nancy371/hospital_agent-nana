@@ -1,214 +1,906 @@
-# Hospital Agent Baseline Example
+# Hospital Agent
 
-这是一个虚拟诊疗比赛的医生 Agent 示例项目，展示如何基于 hospital-agent-sdk 开发、训练、测试和部署自己的医生 Agent。
-
-## 目录说明
-
-```
-baseline_example/
-├── agent/
-│   ├── __init__.py
-│   ├── agent.py          # 需要修改：医生 Agent 主逻辑，包含 train/test 和诊疗策略
-│   ├── prompt.py         # 需要修改：Prompt 模板和输出格式约束
-│   ├── memory.py         # 需要修改：训练反思、病例经验、检索记忆等
-│   ├── knowledge.py      # 知识库召回、标准名称规范化、疾病画像检索
-│   ├── rag_retriever.py  # Hybrid RAG 统一检索入口
-│   ├── exam_strategy.py  # 检查策略 Agent
-│   ├── inquiry_strategy.py # 问诊策略 Agent
-│   ├── treatment_strategy.py # 治疗策略 Agent
-│   ├── memory_system.py  # 轻量结构化记忆管理器
-│   ├── clinical_evidence.py # 通用临床证据标准化
-│   ├── diagnosis_engine.py  # 全目录证据评分与终诊裁决
-│   ├── diagnosis_critic.py  # 提交前确定性/受限 LLM 审查
-│   ├── diagnostic_learning.py # shadow 诊断规则学习
-│   ├── treatment_safety.py # 治疗禁忌与过敏安全门
-│   └── qc.py             # 提交前质控 Agent
-├── data/
-│   ├── memory_data/
-│   │   └── memory.md     # 可自定义：baseline 默认的本地文件记忆
-│   └── ref_data/
-│       ├── departments.json
-│       ├── diseases_catalog.json
-│       ├── examinations_catalog.json
-│       ├── disease_profiles.json
-│       └── disease_profiles_extra.json
-├── config.yaml           # 可配置：训练患者数量、输出目录、memory 路径等
-├── train.py              # 可选修改：本地训练入口，默认可直接使用
-├── test.py               # 可选修改：本地测试和批量评估示例，默认可直接使用
-├── requirements.txt      # 必须维护：新增第三方库需要写在这里
-├── Dockerfile            # 一般不需要修改：部署入口，默认启动 python3 -m agent
-└── README.md
-```
-
-## 重点修改文件
-
-参赛时需要重点修改以下文件：
-
-- **agent/agent.py**：负责诊疗流程和 action 调用策略
-- **agent/prompt.py**：负责模型输入和输出格式约束
-- **agent/memory.py**：负责训练反思、病例经验、检索记忆等记忆逻辑
-
-## 当前多智能体结构
-
-本项目已经在 baseline 上升级为轻量多智能体编排：
-
-- **主诊断 Agent**：`agent/agent.py`，负责整体流程、Planner 决策和 action 调用。
-- **问诊策略 Agent**：`agent/inquiry_strategy.py`，根据疾病画像补齐关键追问和红旗信号。
-- **检查策略 Agent**：`agent/exam_strategy.py`，根据候选疾病补齐必查检查并过滤无效检查名。
-- **治疗策略 Agent**：`agent/treatment_strategy.py`，根据疾病画像补齐治疗原则、个体化和安全提醒。
-- **质控 Agent**：`agent/qc.py`，提交前修复 `diagnosis/treatment_plan/reasoning` 并规范诊断名称。
-- **知识库层**：`agent/knowledge.py`，加载标准目录和疾病画像，负责症状召回、标准化和 RAG 上下文。
-- **Hybrid RAG 检索层**：`agent/rag_retriever.py`，统一召回疾病画像、标准检查、历史病例经验和策略补丁。
-- **结构化记忆层**：`agent/memory_system.py`，统一管理工作记忆、病例经验记忆、语义知识记忆和策略补丁记忆。
-
-## 证据优先诊断链
-
-当前终诊路径不再由 LLM 单独决定：
+这是一个面向虚拟诊疗评测后端的医生 Agent 项目。它不是单纯让 LLM 直接输出诊断，而是把病例处理拆成可审计的状态机：
 
 ```text
-Planner 问诊/检查
-  -> ClinicalEvidenceNormalizer 按字段与局部语义生成 EvidenceBundle
-  -> Hybrid RAG 召回疾病画像、标准检查、历史经验和策略补丁
-  -> LLM 开放提出具体临床候选
-  -> OpenWorldDiagnosisResolver 执行别名、上下位和保守模糊匹配
-  -> DiagnosisDecisionEngine 对 50 个官方疾病和 21 个受控扩展全量评分
-  -> DiagnosisCritic 检查低置信、硬反证、遗漏病因和未解释严重异常
-  -> QualityAgent 校验名称边界
-  -> TreatmentStrategyAgent 读取诊断协议
-  -> TreatmentSafetyGate 过滤过敏、年龄和检查异常相关冲突
-  -> prescribe_treatment
+Raw Case / Patient Dialogue / Exam Result
+        ↓
+Typed Clinical Facts
+        ↓
+Evidence / Relation / Claim State
+        ↓
+Candidate Search + Eligibility
+        ↓
+Candidate Lifecycle / Arbitration
+        ↓
+Submission Authorization
+        ↓
+Dumb Submitter
 ```
 
-LLM 可以提出目录外候选，但原始名称不能直接提交。只有映射到官方 catalog 或 evaluation 已确认的受控扩展后，才会进入证据评分；无法可靠映射的候选只保留在审计与学习记录中。反思与 evaluation 反馈只生成 pending/shadow 候选，不直接改写正式知识。
+核心目标是：**最终提交的诊断必须来自当前证据、当前裁决、当前授权**。候选召回、Pattern、RAG、LLM reasoning 都可以帮助系统发现方向，但不能直接创造 Evidence、Claim Resolution、Judge Score 或最终提交权限。
 
-## 配置说明
+## Current Architecture
 
-### 环境变量
+```mermaid
+flowchart TD
+    A["Backend Case / Dialogue / Exam Result"] --> B["MyDoctorAgent Orchestrator"]
 
-| 变量名 | 说明 |
-|--------|------|
-| `SERVICE_BASE_URL` | 比赛后端服务地址 |
-| `SERVICE_TRAIN_TOKEN` | 训练阶段访问令牌 |
-| `MODEL_API_KEY` | 大语言模型调用密钥 |
-| `TEAM_ID` | 队伍账号 |
+    B --> C["Clinical Fact Layer"]
+    C --> C1["ClinicalEvidenceNormalizer"]
+    C --> C2["Typed Observation"]
+    C --> C3["Observation Deduplication"]
 
-### config.yaml
+    K["Knowledge Layer"] --> K1["Evidence Ontology"]
+    K --> K2["Clinical Pattern Schemas"]
+    K --> K3["Disease Profiles"]
+    K --> K4["RAG Retrieval Views"]
+    K --> K5["Entity Registry / Disease Catalog"]
 
-- `output_dir`：训练和测试产物输出目录
-- `train.selection`：患者选取方式（random/forward/reverse）
-- `train.patient_count`：训练患者数量
-- `train.random_seed`：随机种子
-- `test.selection`：测试患者选取方式
-- `test.patient_count`：测试患者数量
-- `memory.md_path`：记忆文件路径
-- `max_ask_rounds`：问诊轮次上限
-- `max_exam_rounds`：检查轮次上限
-- `ref_data_dir`：标准疾病、检查、科室和疾病画像目录
-- `self_improve_enabled`：是否启用训练后自迭代补丁
-- `policy_store_path`：策略补丁存储路径
-- `memory_system.working_ttl_seconds`：单病例工作记忆保留时间
-- `memory_system.max_working_cases`：同时保留的工作病例数量上限
-- `service.endpoint_prefixes`：比赛后端 action 接口前缀兜底；如果服务实际是 `/api/ask_patient`，可设为 `["/api"]`
-- `service.invoke_path`：当前比赛服务使用 `/invoke` 入口承载患者问诊。
-- `service.exam_results_path` / `service.case_evaluation_path`：当前比赛服务分别使用 `/exam/results` 获取检查结果、`/evaluate/case` 获取单病例训练评估。
-- `rag.top_k`：Hybrid RAG 最终注入的 chunk 数量
-- `rag.enable_mqe`：是否启用规则版多查询扩展
-- `rag.candidate_pool_multiplier`：候选池扩展倍数，先扩大召回再去重排序
-- `rag.score_threshold`：过滤弱相关 chunk 的最低分数阈值
-- `diagnosis.trusted_threshold`：可信诊断最低分，默认 `0.65`
-- `diagnosis.open_world_candidates`：允许 LLM 提出目录外具体候选，再执行受控标准化
-- `diagnosis.name_match_threshold`：名称模糊映射最低相似度，默认 `0.84`
-- `diagnosis.name_match_margin`：最佳与次佳映射的最小差值，避免歧义名称自动映射
-- `diagnosis.margin_threshold`：前两名小于该差值时触发低边际审查
-- `diagnosis.max_final_diagnoses`：最终最多提交的诊断数
-- `final_critic.max_llm_calls`：每例终诊 Critic 的最大 LLM 调用数
-- `execution.case_timeout_seconds`：单病例总预算，默认 `235` 秒；训练时会从中预留 evaluation 和 Reflection 时间
-- `learning.freeze_active_knowledge`：训练时冻结正式知识与 active 策略
-- `learning.auto_promote_exam_aliases`：是否允许检查别名自动晋级，默认关闭
+    C3 --> R["Relation / Pattern / Claim Layer"]
+    K1 --> R
+    K2 --> R
+    K3 --> R
+    K5 --> R
+
+    R --> R1["EvidenceRefResolver"]
+    R1 --> R2["EvidenceRelationBinder"]
+    R2 --> R3["Relation Constraint Validation"]
+    R3 --> R4["PatternHypothesisVerifier"]
+    R4 --> R5["Family Link / Entity Expansion"]
+
+    K3 --> S["Candidate Search / Scoring"]
+    K4 --> S
+    K5 --> S
+    R5 --> S
+    C3 --> S
+
+    S --> E["Eligibility / Anchor Evaluation"]
+    E --> L["Candidate Lifecycle / Disposition Router"]
+    L --> G["Gap / Claim Closure Planner"]
+    L --> P["Primary Arbitration Pool"]
+
+    G --> X["ExamStrategy / InquiryStrategy"]
+    X --> A
+
+    P --> Q["ClinicalReasoningComparator"]
+    Q --> U["SubmissionAuthorizationLayer"]
+    U --> V["Submitter"]
+```
+
+## Layer Boundaries
+
+| Layer | Can Do | Must Not Do |
+| --- | --- | --- |
+| Evidence / Observation | Record source-grounded facts: symptom, sign, imaging finding, lab finding, treatment history, exposure, disease history | Infer disease, mechanism, or candidate eligibility |
+| Relation / Pattern | Bind existing observations into controlled relation schemas; produce recall/family signals | Write observed evidence, change Judge score, create active gaps directly |
+| Claim Resolution | Decide whether evidence supports, contradicts, or does not address a target claim | Diagnose disease or authorize final submission |
+| Candidate Search / RAG | Retrieve candidates, profiles, external views, and context | Create Evidence or ClaimResolution from retrieved text |
+| Eligibility / Anchor | Decide whether a candidate has minimum medical readiness | Decide encounter primary or final submission |
+| Lifecycle / Disposition | Route every admitted candidate to workup, arbitration, primary, secondary, rejected, or differential-only | Recompute score, create evidence, or submit |
+| Arbitration | Compare current primary against eligible challengers | Bypass evidence/anchor state or directly submit |
+| Submission Authorization | Decide which established diagnoses are reportable in final answer | Re-rank candidates or invent secondary diagnoses |
+| Submitter | Submit authorized diagnoses and treatment | Judge, filter, add, or suppress diagnoses by itself |
+
+## Knowledge Sources
+
+The project uses several knowledge sources with different permissions.
+
+### Evidence Ontology
+
+File: `data/ref_data/evidence_ontology.json`
+
+Used by:
+
+- evidence canonicalization
+- alias and parent-child concept matching
+- relation slot hints
+- anatomical compatibility hints
+
+It must not infer a diagnosis. For example:
+
+```text
+pulmonary_consolidation
+        ↓
+objective imaging fact
+```
+
+does not automatically mean:
+
+```text
+pneumonia
+```
+
+### Clinical Pattern Schemas
+
+Files and modules:
+
+- `agent/pattern_hypothesis.py`
+- `agent/clinical_pattern_compiler.py`
+- `agent/evidence_pattern_compiler.py`
+- `agent/diagnostic_patterns.py`
+
+Patterns define controlled multi-evidence structures such as exposure plus organ injury plus temporal/anatomical consistency. Pattern output is recall/verification oriented.
+
+Pattern permissions stay strict:
+
+```text
+Pattern ≠ Evidence
+Pattern ≠ Eligibility by itself
+Pattern ≠ Judge Score
+Pattern Gap Suggestion ≠ Active Gap
+```
+
+### Disease Profiles
+
+Files:
+
+- `data/ref_data/disease_profiles.json`
+- `data/ref_data/disease_profiles_extra.json`
+
+Disease profiles define disease metadata, expected evidence, required anchors, examination hints, and candidate scoring context. They are used by candidate search, eligibility, gap planning, and increasingly by claim/anchor contracts.
+
+Current architectural status:
+
+```text
+Disease Profile
+        ↓
+Candidate Search / Eligibility / Gap / Exam Strategy
+
+Evidence Ontology + Clinical Patterns
+        ↓
+Relation / Pattern Layer
+```
+
+The intended direction is a more unified Knowledge Layer where Disease Profile also becomes a stable source for Relation/Claim contracts. RAG and Disease Profiles still must not create observed evidence.
+
+### RAG / Retrieval Views
+
+Modules:
+
+- `agent/rag_retriever.py`
+- `agent/medical_retrieval.py`
+- `agent/disease_retrieval.py`
+
+RAG retrieves disease profiles, standard exams, case experience, external medical seed views, and policy notes. It is a context and candidate source, not a fact source.
+
+Allowed:
+
+- candidate/entity metadata
+- differential context
+- anchor or gap hints when represented structurally
+- stage-specific LLM context
+
+Forbidden:
+
+- observed evidence
+- claim resolution
+- direct judge score bonus
+- submission authorization
+
+### Entity Registry / Disease Catalog
+
+Files:
+
+- `data/ref_data/diseases_catalog.json`
+- `agent/disease_entity.py`
+- `agent/diagnosis_resolver.py`
+
+Controls disease IDs, aliases, canonical names, namespace legality, family/entity mapping, and submit names.
+
+## Clinical Fact Layer
+
+Module: `agent/clinical_evidence.py`
+
+The evidence layer records what is observed or reported, with type and provenance.
+
+Supported observation types include:
+
+```text
+symptom
+sign
+imaging_finding
+laboratory_finding
+treatment_history
+medication_history
+procedure_history
+exposure
+disease_history
+```
+
+Important rule:
+
+```text
+Observation = what was seen / reported / measured
+Mechanism = possible why
+Diagnosis = disease identity
+```
+
+For lung imaging, new objective morphology is de-etiologized:
+
+```text
+磨玻璃影       -> ground_glass_opacity
+实变           -> pulmonary_consolidation
+片状阴影       -> patchy_pulmonary_opacity
+放疗野内病灶   -> lesion_within_prior_radiation_field
+```
+
+The parser should not emit `pneumonia_infiltrate` as a new objective imaging finding.
+
+## Relation / Pattern Layer
+
+Module: `agent/pattern_hypothesis.py`
+
+Main components:
+
+- `EvidenceRefResolver`
+- `EvidenceRelationBinder`
+- `RelationConstraintResult`
+- `PatternHypothesisVerifier`
+- `PatternRecallSignal`
+
+Binding order is controlled and auditable:
+
+```text
+derived observation ref exact
+canonical finding exact
+controlled alias
+ontology parent -> existing child observation
+source provenance anchor
+unresolved
+```
+
+Forbidden:
+
+```text
+fuzzy string matching
+embedding similarity auto-binding
+LLM free guessing
+source_text re-extraction into new evidence
+```
+
+Relation activation depends on slots and constraints, not just high score. Example:
+
+```text
+thoracic_radiotherapy
+        + dyspnea / cough
+        + ground_glass_opacity / consolidation
+        + temporal_after
+        + anatomical_consistency
+        ↓
+exposure_temporal_organ_injury relation
+```
+
+## Claim Resolution And Gap Closure
+
+Modules:
+
+- `agent/claim_resolution.py`
+- `agent/targeted_exam_result_parser.py`
+- `agent/agent.py`
+
+Claim closure is a state machine:
+
+```text
+Targeted Exam Result
+        ↓
+Neutral Observations / Explicit Relations
+        ↓
+ExamResultApplicability
+        ↓
+TargetClaimMatcher
+        ↓
+ClaimMatchEvent
+        ↓
+ClaimResolutionReducer
+        ↓
+ClaimResolutionLedger
+        ↓
+GapClosureEvaluator
+        ↓
+AnchorEvaluator / Eligibility
+```
+
+A claim can be:
+
+```text
+SUPPORTED
+CONTRADICTED
+NOT_ADDRESSED
+INCONCLUSIVE
+```
+
+`NOT_ADDRESSED` does not downgrade an existing supported claim. It only records that this route did not answer that claim.
+
+`ClaimResolutionLedger` is the source of truth. Gaps are hydrated from the ledger, not the other way around.
+
+## Gap-Aware Exam Result Parsing
+
+Module: `agent/targeted_exam_result_parser.py`
+
+The parser is modality-aware and disease-agnostic:
+
+```text
+raw exam result
+        ↓
+atomic observations
+        ↓
+explicit relation observations
+        ↓
+claim matching
+```
+
+It must not output:
+
+```text
+radiation_pneumonitis = true
+candidate D100058 supported
+diagnosis = true
+```
+
+Instead, it emits source-grounded findings such as:
+
+```text
+ground_glass_opacity
+pulmonary_consolidation
+pulmonary_volume_loss
+lesion_within_prior_radiation_field
+```
+
+Exam route authorization is gap-aware:
+
+```text
+Exam + Target Claim + Closure Route + Evidence Version + Prior Result State
+        ↓
+ExamRouteAuthorization
+```
+
+Completed claim routes are blocked unless there is an explicit repeat reason such as new target claim, prior inadequate result, tool failure, material clinical change, longitudinal monitoring, stale evidence, or contradiction resolution.
+
+## Candidate Search And Scoring
+
+Modules:
+
+- `agent/candidate_generator.py`
+- `agent/diagnosis_engine.py`
+- `agent/disease_retrieval.py`
+- `agent/rag_retriever.py`
+- `agent/mechanism_reasoner.py`
+
+Candidate sources include:
+
+- disease profile retrieval
+- evidence profile scoring
+- RAG context
+- open-world LLM candidate names mapped through resolver
+- mechanism/family expansion
+- pattern recall signals
+
+Candidate search answers:
+
+```text
+Which diseases should be considered?
+```
+
+It does not answer:
+
+```text
+Which diagnosis is final?
+```
+
+## Eligibility And Anchor Evaluation
+
+Modules:
+
+- `agent/diagnosis_eligibility.py`
+- `agent/diagnostic_patterns.py`
+- `agent/claim_resolution.py`
+
+Typical candidate states:
+
+```text
+PrimaryEligible
+Deferred
+DifferentialOnly
+Excluded
+```
+
+Anchor state is separate:
+
+```text
+AnchorSatisfied
+PatternSupportedButUnconfirmed
+NoValidAnchor
+HardBlocked
+```
+
+Important boundary:
+
+```text
+AnchorSatisfied ≠ PrimaryProtectedForever
+PrimaryEligible ≠ Final Submission
+```
+
+## Candidate Lifecycle / Disposition
+
+Module: `agent/diagnosis_judge.py`
+
+The lifecycle layer is a derived projection, not a new mutable source of truth.
+
+It reads:
+
+- rank / score
+- eligibility status
+- anchor status
+- active gaps / pending workup
+- differential pool membership
+- arbitration pool membership
+- arbitration result
+- rejection state
+- submission role
+
+It emits a current disposition for each admitted candidate:
+
+```text
+WORKUP_REQUIRED
+READY_FOR_ARBITRATION
+PRIMARY
+SECONDARY
+REJECTED
+DIFFERENTIAL_ONLY
+```
+
+System invariant:
+
+```text
+For each candidate at each diagnostic_state_version,
+there must be exactly one current lifecycle disposition
+or one explicit terminal disposition.
+```
+
+Deadlock examples:
+
+```text
+PRIMARY_ELIGIBLE_NOT_IN_ARBITRATION_POOL
+ARBITRATION_MEMBER_NOT_RESOLVED
+DEFERRED_WITHOUT_ACTIONABLE_WORKUP
+GAPLESS_DEFERRED_CANDIDATE
+```
+
+This prevents states like:
+
+```text
+PrimaryEligible
++ no gap
++ not compared
++ not rejected
++ not submitted
+```
+
+## Primary Arbitration
+
+Modules:
+
+- `agent/diagnosis_judge.py`
+- `agent/clinical_reasoning_comparator.py`
+- `agent/root_cause_arbitration.py`
+
+Differential pool and arbitration pool are separate.
+
+Differential pool controls search space:
+
+```text
+top-k
+score proximity
+tail specificity
+pattern recall
+active workup
+```
+
+Arbitration pool controls primary challenge rights:
+
+```text
+current primary
++ PrimaryEligible challengers
++ AnchorSatisfied challengers
++ protected mandatory contenders
++ incumbent challenge overrides
+```
+
+Comparator output includes:
+
+```text
+SWITCH_PRIMARY
+KEEP_CURRENT_PRIMARY
+UNLOCK_AND_DEFER
+KEEP_CURRENT_AND_DEFER_CONTENDER
+REJECT_CONTENDER
+NO_MATERIAL_DIFFERENCE
+```
+
+Candidate Score is used only after clinical explanatory differences are not decisive.
+
+## Submission Authorization
+
+Module: `agent/submission_authorization.py`
+
+Final submission is separated from diagnosis existence and primary arbitration.
+
+Roles:
+
+```text
+PRIMARY
+SECONDARY_INDEPENDENT
+COMPLICATION
+ASSOCIATED_FINDING
+DIFFERENTIAL_ONLY
+UNCONFIRMED
+```
+
+Authorization:
+
+```text
+AUTHORIZED
+NOT_AUTHORIZED
+DEFERRED
+```
+
+The submitter should be dumb:
+
+```python
+final_diagnoses = [
+    record.diagnosis_name
+    for record in authorization_records
+    if record.submission_authorization == "AUTHORIZED"
+]
+```
+
+Associated findings can remain in candidates/audit without entering final diagnosis.
+
+## LLM Reliability Layer
+
+Modules:
+
+- `agent/llm.py`
+- `agent/llm_contract.py`
+- `agent/context_compiler.py`
+
+The project separates:
+
+```text
+Runtime State ≠ LLM Context
+```
+
+Stage-specific context views:
+
+```text
+PlanningContextView
+ThinkingContextView
+DiagnosisContextView
+RepairContextView
+```
+
+The context compiler performs semantic packing instead of blind truncation. Repair context is intentionally small:
+
+```text
+invalid output
++ validation errors
++ canonical schema
++ repair instructions
+```
+
+Contract execution flow:
+
+```text
+Generate
+        ↓
+Parse
+        ↓
+Deterministic Normalize
+        ↓
+Validate
+        ↓
+One bounded repair if needed
+        ↓
+Consumer Adapter
+        ↓
+Fallback if still invalid
+```
+
+`LLMCallAudit` records purpose, stage, model, latency, token counts, finish reason, parse/schema/consumer status, fallback trigger, and failure reason.
+
+## Tool And Runtime Audit
+
+Modules:
+
+- `hospital_agent/base.py`
+- `agent/agent.py`
+- `agent/trace/*`
+
+Every case can include:
+
+```text
+llm_call_audit
+tool_call_audit
+context_audit
+clinical_runtime_audit
+```
+
+Tool audit tracks logical calls and HTTP attempts separately:
+
+```text
+logical_call_id
+attempt_index
+action
+endpoint
+http_status
+latency_ms
+success
+failure_flags
+primary_failure_reason
+retry_exhausted
+```
+
+Clinical runtime audit preserves state snapshots even on failure:
+
+```text
+evidence_version
+targeted_exam_result_parses
+exam_result_applicability
+claim_match_events
+claim_resolution_ledger
+claim_state_version
+diagnostic_state_version
+gap_state
+anchor_state
+eligibility_state
+clinical_transition_trace
+last_successful_clinical_transition
+failure_stage
+```
+
+This allows debugging by first wrong transition rather than by guessing from final diagnosis.
+
+## Main Runtime Flow
+
+```mermaid
+sequenceDiagram
+    participant Backend
+    participant Agent as MyDoctorAgent
+    participant Evidence as Evidence Layer
+    participant Knowledge as Knowledge Layer
+    participant Diagnosis as Diagnosis Engine
+    participant Judge as Judge / Comparator
+    participant Submit as Submission Authorization
+
+    Backend->>Agent: case / patient id
+    Agent->>Backend: ask_patient
+    Backend-->>Agent: patient answer
+    Agent->>Evidence: normalize typed observations
+    Agent->>Knowledge: retrieve candidates / profiles / RAG views
+    Agent->>Diagnosis: score candidates + resolve entities
+    Diagnosis->>Judge: eligibility + anchors + candidate pool
+    Judge->>Judge: lifecycle routing + arbitration
+    Judge-->>Agent: primary / gaps / authorized candidates
+    Agent->>Backend: order_examination if needed
+    Backend-->>Agent: exam results
+    Agent->>Evidence: parse neutral observations
+    Evidence->>Diagnosis: claim resolution + recompute
+    Diagnosis->>Submit: authorization records
+    Submit-->>Agent: final authorized diagnoses
+    Agent->>Backend: prescribe_treatment
+```
+
+## Repository Map
+
+```text
+agent/
+  agent.py                         Orchestrator, runtime state, train/test flow
+  server.py                        HTTP service entrypoint
+  clinical_evidence.py             Typed observation normalization
+  evidence_engine.py               Evidence scoring support
+  evidence_registry.py             Evidence metadata registry
+  pattern_hypothesis.py            Relation binding, Pattern verification, recall signals
+  clinical_pattern_compiler.py     Deterministic clinical pattern compiler
+  evidence_pattern_compiler.py     Evidence pattern compiler
+  claim_resolution.py              Claim events, ledger, gap hydration, anchor eval
+  targeted_exam_result_parser.py   Gap-aware exam result parser
+  candidate_generator.py           Candidate generation
+  diagnosis_engine.py              Candidate scoring, entity resolution, decision engine
+  diagnosis_eligibility.py         Eligibility and anchor state
+  diagnosis_judge.py               Primary arbitration and candidate lifecycle
+  clinical_reasoning_comparator.py Pairwise clinical explanatory comparison
+  submission_authorization.py      Final diagnosis authorization
+  exam_strategy.py                 Exam planning
+  inquiry_strategy.py              Inquiry planning
+  treatment_strategy.py            Treatment plan generation
+  treatment_safety.py              Treatment safety filtering
+  llm.py                           OpenAI-compatible LLM client
+  llm_contract.py                  Stage contracts and repair
+  context_compiler.py              Stage context semantic packing
+  rag_retriever.py                 Hybrid RAG retrieval
+  knowledge.py                     Catalog/profile loading
+  memory.py / memory_system.py     Runtime memory and case experience
+  trace/                           Append-only trace infrastructure
+
+data/ref_data/
+  diseases_catalog.json
+  examinations_catalog.json
+  disease_profiles.json
+  disease_profiles_extra.json
+  evidence_ontology.json
+  medical_knowledge/
+
+tools/
+  run_diagnostic_replay.py
+  run_diagnosis_judge.py
+  run_frozen_training.py
+  compare_pattern_recall_ab.py
+```
+
+## Configuration
+
+Environment variables:
+
+| Variable | Description |
+| --- | --- |
+| `SERVICE_BASE_URL` | Backend service URL |
+| `SERVICE_TRAIN_TOKEN` | Training token |
+| `MODEL_API_KEY` | Model API key |
+| `TEAM_ID` | Team id |
+| `MODEL_BASE_URL` | Optional OpenAI-compatible model base URL override |
+| `MODEL_NAME` | Optional model name override |
+
+Important `config.yaml` sections:
+
+| Section | Purpose |
+| --- | --- |
+| `train` / `test` | patient selection, explicit patient ids, seeds |
+| `service` | backend endpoint paths |
+| `llm` | model, temperature, max tokens, retry, timeout |
+| `diagnosis` | candidate scoring, pool sizes, pattern hypothesis policy |
+| `execution` | case timeout, LLM budget, planner limits |
+| `rag` | retrieval top-k, MQE, chunk filtering |
+| `learning` | freeze active knowledge and promotion controls |
+| `trace` | append-only runtime trace settings |
 
 ## Quick Start
 
-### 1. 安装依赖
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
+Set environment variables:
 
 ```bash
 export SERVICE_BASE_URL=https://baconroot-hospital-service.ms.show
-export SERVICE_TRAIN_TOKEN=<your-train-service-token>
-export MODEL_API_KEY=<your-model-api-key>
-export TEAM_ID=<your-team-id>
+export SERVICE_TRAIN_TOKEN=<token>
+export MODEL_API_KEY=<model-key>
+export TEAM_ID=<team-id>
 ```
 
-### 3. 运行本地训练
+Run training:
 
 ```bash
 python train.py
 ```
 
-每次训练会生成：
+Run service:
+
+```bash
+python -m agent
+```
+
+The service listens on port `7860` and exposes `POST /test`.
+
+## Local Validation
+
+Compile:
+
+```bash
+python -m compileall -q agent hospital_agent tools tests
+```
+
+Run tests:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Run strict replay:
+
+```bash
+python tools/run_diagnostic_replay.py tests/fixtures/diagnostic_replay_cases.jsonl --strict
+```
+
+Run frozen backend batches:
+
+```bash
+python tools/run_frozen_training.py --seeds 46 47 48 --patient-count 5
+```
+
+## Debugging Guide
+
+When a case fails, inspect artifacts in:
 
 ```text
 outputs/train/<run_id>/training_results.jsonl
 outputs/train/<run_id>/training_summary.json
 ```
 
-冻结代码与正式知识后，依次运行 seed 46、47、48：
+Start with these questions:
 
-```bash
-python tools/run_frozen_training.py --seeds 46 47 48 --patient-count 5
+```text
+1. Tool failed?
+   -> tool_call_audit / tool_contract_summary
+
+2. LLM failed?
+   -> llm_call_audit / llm_contract_summary
+
+3. Evidence missing?
+   -> case_board_evidence / finding_extraction_summary
+
+4. Exam result parsed?
+   -> targeted_exam_result_parses / targeted_exam_observations
+
+5. Claim state updated?
+   -> exam_result_applicability / claim_match_events / claim_resolution_ledger
+
+6. Candidate eligible but stuck?
+   -> candidate_disposition_audit / candidate_lifecycle_transitions
+
+7. Candidate compared but lost?
+   -> clinical_reasoning_comparisons / primary_arbitration_decision
+
+8. Diagnosis established but not submitted?
+   -> submission_authorization_records / authorized_diagnoses
 ```
 
-汇总报告包含诊断准确率、检查精确率、治疗评分与安全性、候选 Recall@5、Critic 触发率、平均耗时和超时数。
+Preferred failure attribution style:
 
-### 4. 启动测试服务
-
-```bash
-python -m agent
+```text
+candidate_recall
+evidence_mapping
+claim_contract_binding
+claim_resolution_writeback
+eligibility
+candidate_lifecycle
+arbitration
+submission
+tool_backend
+llm_contract
 ```
 
-服务默认监听 `0.0.0.0:7860`，测试接口为 `POST /test`。
+## Development Rules
 
-### 5. 运行完整测试
+- Do not store tokens or raw LLM prompts in artifacts.
+- Do not commit `outputs/`, runtime memory, pending state, or trace artifacts unless explicitly requested.
+- Do not change official disease or exam catalogs casually.
+- New observations must be source-grounded.
+- New pattern or relation rules must preserve recall-only boundaries unless a separate eligibility contract explicitly consumes them.
+- Final diagnoses must pass current-version Submission Authorization.
 
-```bash
-python test.py
+## Current Known Boundary
+
+The current architecture already routes `PrimaryEligible` candidates into arbitration independently of ordinary differential ranking. However, claim applicability still depends on active claim contracts being available and hydrated at result-recovery time. If a candidate is recalled and eligible but its claim ledger is empty, inspect:
+
+```text
+exam_result_applicability
+claim_match_events
+claim_resolution_ledger
+claim_state_version
+candidate_disposition_audit
+clinical_reasoning_comparisons
 ```
 
-### 6. 离线回放和单元测试
+That distinction matters:
 
-```bash
-python -m unittest discover -s tests -p "test_*.py" -v
-python tools/run_diagnostic_replay.py tests/fixtures/diagnostic_replay_cases.jsonl --strict
+```text
+Candidate admitted / compared
+        ≠
+Claim-verified candidate
+        ≠
+Submission-authorized diagnosis
 ```
-
-离线回放不访问比赛后端或模型服务，可先验证否定语义、证据评分、名称合法性和已知问题病例。
-
-## 知识来源与许可
-
-- 结构化知识记录来源 URL、版本和审核状态；运行时不联网。
-- [WHO Guidelines](https://www.who.int/publications/who-guidelines)作为权威指南索引。
-- 血管炎规则记录了[2021 ACR/VF ANCA 相关血管炎指南](https://rheumatology.org/vasculitis-guideline)的版本元数据。
-- [ESC 瓣膜病指南页面](https://www.escardio.org/guidelines/clinical-practice-guidelines/all-esc-practice-guidelines/valvular-heart-disease/)声明软件或 AI 转化需要正式许可，因此当前规则库明确标记为未获许可时不转化其内容。
-
-## 医生可用 Actions
-
-| Action | 说明 |
-|--------|------|
-| `ask_patient` | 向患者提问，返回患者回复 |
-| `order_examination` | 申请检查，返回检查结果 |
-| `prescribe_treatment` | 提交诊断和治疗方案 |
-| `evaluation` | 训练阶段获取评测结果 |
-| `batch_evaluation` | 批量评估测试结果 |
-
-## 注意事项
-
-- `data/ref_data/` 是标准科室、疾病和检查名称，不要修改
-- 提交结果中的诊断和检查名称必须使用标准名称
-- `Dockerfile` 一般不需要修改，以免影响平台部署和评测
-- 记忆存储形式不限定，但不要依赖 docker-compose 拉起额外服务
-- 自定义疾病画像放在 `disease_profiles*.json`，不改变标准 catalog 文件
-- Docker 构建会通过 `.dockerignore` 排除输出目录、缓存和本地冒烟脚本
