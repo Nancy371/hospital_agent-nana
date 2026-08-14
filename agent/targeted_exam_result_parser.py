@@ -27,6 +27,7 @@ SUPPORTED = "SUPPORTED"
 CONTRADICTED = "CONTRADICTED"
 CLAIM_UNRESOLVED = "UNRESOLVED"
 NOT_ADDRESSED = "NOT_ADDRESSED"
+NOT_APPLICABLE = "NOT_APPLICABLE"
 CLAIM_INCONCLUSIVE = "INCONCLUSIVE"
 
 OPEN = "OPEN"
@@ -441,7 +442,8 @@ class TargetedExamResultParser:
         unresolved_required = [
             item
             for item in claim_matches
-            if item.get("claim_status") in {NOT_ADDRESSED, CLAIM_INCONCLUSIVE, CLAIM_UNRESOLVED}
+            if item.get("claim_status")
+            in {NOT_ADDRESSED, NOT_APPLICABLE, CLAIM_INCONCLUSIVE, CLAIM_UNRESOLVED}
         ]
         if contradicted:
             result.status = NEGATIVE
@@ -544,9 +546,9 @@ class TargetedExamResultParser:
                     status = SUPPORTED
                     supporting = [claim_id]
             elif not route_targets_claim:
-                status = NOT_ADDRESSED
+                status = NOT_APPLICABLE
             elif claim_id in {"post_radiotherapy_time_window", "radiotherapy_temporal_consistency"}:
-                status = NOT_ADDRESSED
+                status = NOT_APPLICABLE
             matches.append(
                 {
                     "target_claim": claim_id,

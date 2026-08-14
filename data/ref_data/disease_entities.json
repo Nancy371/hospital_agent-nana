@@ -10901,7 +10901,76 @@
             "radiation_field_lung_consistency",
             "post_radiotherapy_time_window"
           ],
-          "optional_claims": []
+          "optional_claims": [],
+          "claim_requirements": [
+            {
+              "claim_id": "pulmonary_morphology",
+              "required_for_anchor": true,
+              "anchor_role": "objective_organ_injury",
+              "allowed_evidence_types": [
+                "imaging_finding"
+              ],
+              "allowed_exam_types": [
+                "chest_ct",
+                "ct"
+              ]
+            },
+            {
+              "claim_id": "radiation_field_lung_consistency",
+              "required_for_anchor": true,
+              "anchor_role": "spatial_relation",
+              "allowed_relation_types": [
+                "lesion_within_prior_radiation_field",
+                "lesion_outside_prior_radiation_field"
+              ],
+              "allowed_exam_types": [
+                "chest_ct",
+                "ct"
+              ]
+            },
+            {
+              "claim_id": "post_radiotherapy_time_window",
+              "required_for_anchor": true,
+              "anchor_role": "temporal_relation",
+              "allowed_evidence_types": [
+                "history",
+                "derived_temporal_relation"
+              ],
+              "allowed_exam_types": []
+            }
+          ],
+          "closure_routes": [
+            {
+              "route_id": "route_pulmonary_morphology_ct",
+              "route_type": "exam_result",
+              "exam": "chest CT",
+              "target_claims": [
+                "pulmonary_morphology"
+              ]
+            },
+            {
+              "route_id": "route_radiation_field_ct",
+              "route_type": "exam_result",
+              "exam": "chest CT",
+              "target_claims": [
+                "radiation_field_lung_consistency"
+              ]
+            },
+            {
+              "route_id": "route_post_radiotherapy_history",
+              "route_type": "history_inquiry",
+              "target_claims": [
+                "post_radiotherapy_time_window"
+              ]
+            },
+            {
+              "route_id": "route_post_radiotherapy_temporal_relation",
+              "route_type": "derived_relation",
+              "target_claims": [
+                "post_radiotherapy_time_window"
+              ]
+            }
+          ]
         },
         "eligibility_anchor_policy": {
           "mode": "any_of",

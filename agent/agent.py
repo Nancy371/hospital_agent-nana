@@ -18,7 +18,7 @@ import os
 import re
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from hospital_agent import BaseDoctorAgent
 from .llm import LLMClient
@@ -50,10 +50,16 @@ from .candidate_policy_store import CandidatePolicyStore, RuleGeneralizer
 from .treatment_safety import TreatmentSafetyGate
 from .targeted_exam_result_parser import (
     ExamResultIntentBinding,
+    TargetedExamParseResult,
     TargetedExamResultParser,
     binding_from_authorization_detail,
 )
-from .claim_resolution import ClaimResolutionUpdater, normalize_ledger
+from .claim_resolution import (
+    ClaimResolutionUpdater,
+    claim_requirements_from_contract,
+    materialize_candidate_claim_states,
+    normalize_ledger,
+)
 from .context_compiler import StageContextCompiler
 from .llm_contract import LLMContractExecutor
 from .pattern_hypothesis import ThinkingSnapshot, evidence_snapshot_hash as pattern_evidence_snapshot_hash
@@ -862,6 +868,12 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._claim_match_events: List[Dict[str, Any]] = []
         self._claim_state_version = 0
         self._diagnostic_state_version = 0
+        self._last_diagnosis_decision_obj: Any = None
+        self._clinical_admission_audit: List[Dict[str, Any]] = []
+        self._candidate_claim_contract_views: List[Dict[str, Any]] = []
+        self._claim_state_materialization_audit: List[Dict[str, Any]] = []
+        self._claim_state_invariant_audit: List[Dict[str, Any]] = []
+        self._historical_claim_hydration_keys: set[str] = set()
         self._clinical_transition_trace: List[Dict[str, Any]] = []
         self._last_successful_clinical_transition: Dict[str, Any] = {}
         self._case_id_for_thinking = ""
@@ -1489,6 +1501,12 @@ class MyDoctorAgent(BaseDoctorAgent):
         self._claim_match_events = []
         self._claim_state_version = 0
         self._diagnostic_state_version = 0
+        self._last_diagnosis_decision_obj = None
+        self._clinical_admission_audit = []
+        self._candidate_claim_contract_views = []
+        self._claim_state_materialization_audit = []
+        self._claim_state_invariant_audit = []
+        self._historical_claim_hydration_keys = set()
         self._clinical_transition_trace = []
         self._last_successful_clinical_transition = {}
         self._case_id_for_thinking = patient_id
@@ -1550,6 +1568,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 self._diagnosis_input_with_runtime_state(fallback),
                 [],
                 evidence,
+            )
+            self._last_diagnosis_decision_obj = decision
+            admitted_views = self._materialize_admitted_candidate_claim_states()
+            self._hydrate_claim_states_from_existing_exam_observations(
+                admitted_views,
+                stage="timeout_decision_claim_hydration",
             )
             fallback = self.diagnosis_engine.apply_to_result(fallback, decision, evidence)
         else:
@@ -2151,6 +2175,18 @@ class MyDoctorAgent(BaseDoctorAgent):
             "targeted_exam_result_parses": parses,
             "exam_result_applicability": self._clinical_exam_result_applicability(parses),
             "targeted_exam_observations": observations,
+            "clinical_admission_audit": list(
+                getattr(self, "_clinical_admission_audit", []) or []
+            ),
+            "candidate_claim_contract_views": list(
+                getattr(self, "_candidate_claim_contract_views", []) or []
+            ),
+            "claim_state_materialization_audit": list(
+                getattr(self, "_claim_state_materialization_audit", []) or []
+            ),
+            "claim_state_invariant_audit": list(
+                getattr(self, "_claim_state_invariant_audit", []) or []
+            ),
             "claim_match_events": claim_events,
             "claim_resolution_ledger": ledger,
             "claim_resolution_update_audit": update_audit,
@@ -2941,9 +2977,8 @@ class MyDoctorAgent(BaseDoctorAgent):
     ) -> None:
         if not new_results:
             return
+        admitted_claim_views = self._materialize_admitted_candidate_claim_states()
         details = self._exam_authorization_details_for_result_recovery(strategy)
-        if not details:
-            return
         pairs = self._match_ordered_items_to_results(ordered_items, new_results)
         observations_before = len(self._targeted_exam_observations)
         for index, (ordered_exam, actual_exam, raw_result) in enumerate(pairs, start=1):
@@ -2957,7 +2992,12 @@ class MyDoctorAgent(BaseDoctorAgent):
             applicable_details = self._authorization_details_for_exam_result(
                 ordered_exam,
                 actual_exam,
-                details,
+                list(details)
+                + self._candidate_claim_contract_details_for_exam_result(
+                    ordered_exam,
+                    actual_exam,
+                    admitted_claim_views,
+                ),
             )
             if not applicable_details:
                 self._targeted_exam_result_parses.append(
@@ -3203,6 +3243,450 @@ class MyDoctorAgent(BaseDoctorAgent):
             result.append(detail)
         return result
 
+    def _clinical_admission_top_k(self) -> int:
+        judge = getattr(getattr(self, "diagnosis_engine", None), "judge", None)
+        return int(getattr(judge, "filtered_pool_max_size", 0) or 8)
+
+    def _clinical_admitted_candidate_views(self) -> List[Dict[str, Any]]:
+        decision = getattr(self, "_last_diagnosis_decision_obj", None)
+        candidates = list(getattr(decision, "candidates", []) or [])
+        if not candidates:
+            return []
+        top_k = max(1, self._clinical_admission_top_k())
+        current_primary = str(getattr(decision, "judge_primary", "") or "")
+        bridge_protected = {
+            str(item or "").strip()
+            for item in getattr(decision, "bridge_protected_candidates", []) or []
+            if str(item or "").strip()
+        }
+        arbitration_entities: set[str] = set()
+        arbitration_names: set[str] = set()
+        judge_decision = dict(getattr(decision, "judge_decision", {}) or {})
+        for item in judge_decision.get("primary_arbitration_candidates", []) or []:
+            if not isinstance(item, dict):
+                continue
+            entity_id = str(item.get("entity_id") or "").strip()
+            name = str(item.get("diagnosis") or item.get("candidate") or "").strip()
+            if entity_id:
+                arbitration_entities.add(entity_id)
+            if name:
+                arbitration_names.add(name)
+        for item in judge_decision.get("candidate_disposition_audit", []) or []:
+            if not isinstance(item, dict) or not item.get("arbitration_pool_member"):
+                continue
+            entity_id = str(item.get("entity_id") or item.get("candidate_id") or "").strip()
+            name = str(item.get("candidate") or "").strip()
+            if entity_id:
+                arbitration_entities.add(entity_id)
+            if name:
+                arbitration_names.add(name)
+
+        records: List[Dict[str, Any]] = []
+        admission_audit: List[Dict[str, Any]] = []
+        seen_entities: set[str] = set()
+        for index, candidate in enumerate(candidates, start=1):
+            diagnosis = str(getattr(candidate, "diagnosis", "") or "").strip()
+            entity_id = str(getattr(candidate, "entity_id", "") or "").strip()
+            if not entity_id and self.diagnosis_engine.knowledge:
+                entity_id = self.diagnosis_engine.knowledge.entity_id_for(diagnosis)
+            if not diagnosis and not entity_id:
+                continue
+            reasons: List[str] = []
+            if diagnosis and diagnosis == current_primary:
+                reasons.append("CURRENT_PRIMARY")
+            if index <= top_k:
+                reasons.append("TOP_K")
+            eligibility = str(getattr(candidate, "eligibility_status", "") or "")
+            anchor = str(getattr(candidate, "eligibility_anchor_status", "") or "")
+            if eligibility == "PrimaryEligible":
+                reasons.append("PRIMARY_ELIGIBLE")
+            if anchor == "AnchorSatisfied":
+                reasons.append("ANCHOR_SATISFIED")
+            if diagnosis in bridge_protected or entity_id in bridge_protected:
+                reasons.append("PROTECTED_RECALL")
+            if (
+                int(getattr(candidate, "actionable_gap_count", 0) or 0) > 0
+                or getattr(candidate, "required_gaps", None)
+                or getattr(candidate, "evidence_gaps", None)
+            ):
+                reasons.append("ACTIVE_OR_PENDING_WORKUP")
+            if diagnosis in arbitration_names or entity_id in arbitration_entities:
+                reasons.append("ARBITRATION_MEMBER")
+            material_evidence = bool(
+                getattr(candidate, "matched_evidence", None)
+                or getattr(candidate, "core_matched_evidence", None)
+                or getattr(candidate, "diagnostic_matched_evidence", None)
+                or getattr(candidate, "evidence_contributions", None)
+            )
+            if material_evidence:
+                reasons.append("MATERIAL_EVIDENCE_FOR_EXISTING_CANDIDATE")
+            if not reasons:
+                continue
+            entry = self.diagnosis_engine.knowledge.get(diagnosis) if diagnosis else {}
+            contract = dict(entry.get("claim_anchor_contract") or {})
+            if not contract and entity_id:
+                entry = self._knowledge_entry_for_entity(entity_id)
+                contract = dict(entry.get("claim_anchor_contract") or {})
+            record = {
+                "candidate": diagnosis,
+                "diagnosis": diagnosis,
+                "entity_id": entity_id,
+                "rank": index,
+                "clinical_admitted": True,
+                "clinical_admission_reasons": list(dict.fromkeys(reasons)),
+                "admission_state_version": int(
+                    getattr(self, "_diagnostic_state_version", 0) or 0
+                ),
+                "eligibility_status": eligibility,
+                "anchor_status": anchor,
+                "claim_schema_available": bool(contract),
+                "claim_anchor_contract": contract,
+            }
+            admission_audit.append({k: v for k, v in record.items() if k != "claim_anchor_contract"})
+            if entity_id and entity_id in seen_entities:
+                continue
+            if entity_id:
+                seen_entities.add(entity_id)
+            records.append(record)
+        self._clinical_admission_audit = admission_audit
+        return records
+
+    def _knowledge_entry_for_entity(self, entity_id: str) -> Dict[str, Any]:
+        if not entity_id:
+            return {}
+        knowledge = getattr(self.diagnosis_engine, "knowledge", None)
+        for entry in getattr(knowledge, "entries", {}).values():
+            if str(entry.get("entity_id") or "") == entity_id:
+                return dict(entry)
+        return {}
+
+    def _materialize_admitted_candidate_claim_states(self) -> List[Dict[str, Any]]:
+        views = self._clinical_admitted_candidate_views()
+        self._candidate_claim_contract_views = [
+            self._compact_candidate_claim_contract_view(item)
+            for item in views
+            if item.get("claim_anchor_contract")
+        ]
+        active_entities = [
+            str(item.get("entity_id") or "")
+            for item in views
+            if str(item.get("entity_id") or "")
+        ]
+        ledger, audit = materialize_candidate_claim_states(
+            ledger=self._claim_resolution_ledger,
+            contract_views=views,
+            active_entity_ids=active_entities,
+        )
+        self._claim_resolution_ledger = normalize_ledger(ledger)
+        if audit.get("contract_view_count") or audit.get("missing_claim_contracts"):
+            self._claim_state_materialization_audit.append(audit)
+            self._mark_clinical_transition(
+                "candidate_claim_state_materialized",
+                "claim_materialization",
+                contract_view_count=audit.get("contract_view_count", 0),
+                materialized_claim_state_count=audit.get(
+                    "materialized_claim_state_count", 0
+                ),
+                reactivated_claim_state_count=audit.get(
+                    "reactivated_claim_state_count", 0
+                ),
+                missing_claim_contract_count=len(audit.get("missing_claim_contracts") or []),
+            )
+        invariants = self._candidate_claim_state_invariants(views)
+        if invariants:
+            self._claim_state_invariant_audit.extend(invariants)
+        return views
+
+    @staticmethod
+    def _compact_candidate_claim_contract_view(view: Dict[str, Any]) -> Dict[str, Any]:
+        contract = dict(view.get("claim_anchor_contract") or {})
+        requirements = claim_requirements_from_contract(contract)
+        return {
+            "candidate": view.get("candidate") or view.get("diagnosis") or "",
+            "entity_id": view.get("entity_id"),
+            "contract_id": contract.get("contract_id"),
+            "contract_version": contract.get("contract_version"),
+            "claims": [
+                {
+                    "claim_id": item.get("claim_id"),
+                    "required_for_anchor": bool(item.get("required_for_anchor", True)),
+                    "allowed_evidence_types": list(item.get("allowed_evidence_types") or []),
+                    "allowed_exam_types": list(item.get("allowed_exam_types") or []),
+                    "allowed_relation_types": list(item.get("allowed_relation_types") or []),
+                }
+                for item in requirements
+            ],
+            "closure_routes": list(contract.get("closure_routes") or []),
+            "clinical_admission_reasons": list(
+                view.get("clinical_admission_reasons") or []
+            ),
+            "contract_source": "disease_entity.claim_anchor_contract",
+        }
+
+    def _candidate_claim_state_invariants(
+        self,
+        views: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        ledger = normalize_ledger(self._claim_resolution_ledger)
+        records: List[Dict[str, Any]] = []
+        for view in views or []:
+            entity_id = str(view.get("entity_id") or "").strip()
+            if not entity_id:
+                continue
+            contract = dict(view.get("claim_anchor_contract") or {})
+            reasons = list(view.get("clinical_admission_reasons") or [])
+            high_requirement = any(
+                item in {"CURRENT_PRIMARY", "PRIMARY_ELIGIBLE", "ANCHOR_SATISFIED", "ARBITRATION_MEMBER"}
+                for item in reasons
+            )
+            if not contract:
+                records.append(
+                    {
+                        "entity_id": entity_id,
+                        "candidate": view.get("candidate") or view.get("diagnosis") or "",
+                        "invariant_code": (
+                            "CLAIM_SCHEMA_REQUIRED_BUT_MISSING"
+                            if high_requirement
+                            else "NO_CLAIM_SCHEMA_AVAILABLE"
+                        ),
+                        "clinical_admission_reasons": reasons,
+                        "diagnostic_state_version": int(
+                            getattr(self, "_diagnostic_state_version", 0) or 0
+                        ),
+                    }
+                )
+                continue
+            contract_id = str(contract.get("contract_id") or f"claim_anchor_contract:{entity_id}")
+            contract_version = str(contract.get("contract_version") or "1")
+            missing: List[str] = []
+            for requirement in claim_requirements_from_contract(contract):
+                claim_id = str(requirement.get("claim_id") or "").strip()
+                if not claim_id:
+                    continue
+                key = "|".join([entity_id, claim_id, contract_id, contract_version])
+                if key not in ledger:
+                    missing.append(claim_id)
+            if missing:
+                records.append(
+                    {
+                        "entity_id": entity_id,
+                        "candidate": view.get("candidate") or view.get("diagnosis") or "",
+                        "invariant_code": "CLAIM_STATE_MATERIALIZATION_MISSING",
+                        "missing_claims": missing,
+                        "clinical_admission_reasons": reasons,
+                        "diagnostic_state_version": int(
+                            getattr(self, "_diagnostic_state_version", 0) or 0
+                        ),
+                    }
+                )
+        return records
+
+    def _candidate_claim_contract_details_for_exam_result(
+        self,
+        ordered_exam: str,
+        actual_exam: str,
+        views: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        details: List[Dict[str, Any]] = []
+        for view in views or []:
+            contract = dict(view.get("claim_anchor_contract") or {})
+            entity_id = str(view.get("entity_id") or "").strip()
+            if not entity_id or not contract:
+                continue
+            routes = [
+                dict(route)
+                for route in contract.get("closure_routes", []) or []
+                if isinstance(route, dict)
+                and str(route.get("route_type") or "") == "exam_result"
+                and self._closure_route_matches_exam(
+                    route,
+                    ordered_exam=ordered_exam,
+                    actual_exam=actual_exam,
+                )
+            ]
+            if not routes:
+                continue
+            route_claims = list(
+                dict.fromkeys(
+                    str(claim_id or "").strip()
+                    for route in routes
+                    for claim_id in route.get("target_claims", []) or []
+                    if str(claim_id or "").strip()
+                )
+            )
+            if not route_claims:
+                continue
+            requirements = claim_requirements_from_contract(contract)
+            target_claims = [
+                str(item.get("claim_id") or "").strip()
+                for item in requirements
+                if str(item.get("claim_id") or "").strip()
+            ]
+            detail = {
+                "exam": ordered_exam or actual_exam,
+                "requested_exam": ordered_exam or actual_exam,
+                "resolved_exam": actual_exam or ordered_exam,
+                "exam_source": "candidate_claim_state_applicability",
+                "target_gaps": [f"claim_contract:{entity_id}"],
+                "entity_id": entity_id,
+                "target_candidates": [
+                    view.get("candidate") or view.get("diagnosis") or entity_id
+                ],
+                "target_claims": target_claims,
+                "route_target_claims": route_claims,
+                "claim_requirements": requirements,
+                "closure_routes": routes,
+                "claim_closure_plan_version": str(
+                    contract.get("contract_version")
+                    or contract.get("claim_closure_plan_version")
+                    or "1"
+                ),
+                "contract_id": str(
+                    contract.get("contract_id") or f"claim_anchor_contract:{entity_id}"
+                ),
+                "contract_version": str(
+                    contract.get("contract_version")
+                    or contract.get("claim_closure_plan_version")
+                    or "1"
+                ),
+                "_result_binding_source": "RESULT_APPLICABILITY",
+                "_applicability_reason": "candidate_claim_contract_compatibility",
+                "clinical_admission_reasons": list(
+                    view.get("clinical_admission_reasons") or []
+                ),
+                "contract_source": "candidate_claim_state",
+            }
+            details.append(detail)
+        return details
+
+    def _closure_route_matches_exam(
+        self,
+        route: Dict[str, Any],
+        *,
+        ordered_exam: str,
+        actual_exam: str,
+    ) -> bool:
+        route_exam = str(route.get("exam") or route.get("requested_exam") or "").strip()
+        if not route_exam:
+            return True
+        route_key = _compact_exam_name(route_exam)
+        ordered_key = _compact_exam_name(ordered_exam)
+        actual_key = _compact_exam_name(actual_exam)
+        if route_key and route_key in {ordered_key, actual_key}:
+            return True
+        route_family = self._exam_repeat_family(route_exam)
+        ordered_family = self._exam_repeat_family(ordered_exam)
+        actual_family = self._exam_repeat_family(actual_exam)
+        if route_family and route_family in {ordered_family, actual_family}:
+            return True
+        return bool(route_key and (route_key in ordered_key or route_key in actual_key))
+
+    def _hydrate_claim_states_from_existing_exam_observations(
+        self,
+        views: Optional[Sequence[Dict[str, Any]]] = None,
+        *,
+        stage: str = "historical_claim_hydration",
+    ) -> None:
+        observations = list(getattr(self, "_targeted_exam_observations", []) or [])
+        if not observations:
+            return
+        contract_views = list(views or self._candidate_claim_contract_views or [])
+        if not contract_views:
+            return
+        by_exam: Dict[str, List[Observation]] = {}
+        for obs in observations:
+            exam = str(getattr(obs, "source_exam", "") or "historical_exam")
+            by_exam.setdefault(exam, []).append(obs)
+        total_delta = 0
+        total_events = 0
+        for exam, exam_observations in by_exam.items():
+            details = self._candidate_claim_contract_details_for_exam_result(
+                exam,
+                exam,
+                contract_views,
+            )
+            if not details:
+                continue
+            finding_key = ",".join(
+                sorted(
+                    {
+                        str(getattr(obs, "finding", "") or "")
+                        for obs in exam_observations
+                        if str(getattr(obs, "finding", "") or "")
+                    }
+                )
+            )
+            neutral = TargetedExamParseResult(
+                binding_id=f"historical-neutral:{exam}",
+                order_id=f"historical-order:{exam}",
+                target_gap_ids=[],
+                entity_id="",
+                parser_profile="historical_observation_hydration",
+                observations=list(exam_observations),
+                actual_result_exam=exam,
+                execution_status="historical",
+            )
+            for index, detail in enumerate(details, start=1):
+                contract_id = str(detail.get("contract_id") or "")
+                entity_id = str(detail.get("entity_id") or "")
+                hydration_key = "|".join([entity_id, contract_id, exam, finding_key])
+                if hydration_key in self._historical_claim_hydration_keys:
+                    continue
+                self._historical_claim_hydration_keys.add(hydration_key)
+                binding = binding_from_authorization_detail(
+                    detail=detail,
+                    requested_exam=exam,
+                    actual_result_exam=exam,
+                    patient_id=str(getattr(self, "_case_id_for_thinking", "") or ""),
+                    stage=stage,
+                    order_index=900000 + index,
+                )
+                parsed = self.targeted_exam_result_parser.rematch_claims_for_binding(
+                    neutral,
+                    binding,
+                )
+                payload = parsed.to_dict()
+                payload["stage"] = stage
+                payload["ordered_exam"] = exam
+                payload["binding_source"] = "HISTORICAL_RESULT_APPLICABILITY"
+                payload["applicability_reason"] = "historical_candidate_claim_hydration"
+                claim_update = self.claim_resolution_updater.update_from_parse(
+                    ledger=self._claim_resolution_ledger,
+                    parsed_result=payload,
+                    intent_binding=binding.to_dict(),
+                    gap_contract=self._claim_gap_contract_from_authorization_detail(detail),
+                )
+                self._claim_resolution_ledger = normalize_ledger(
+                    claim_update.get("ledger") or {}
+                )
+                self._claim_match_events.extend(
+                    list(claim_update.get("claim_match_events") or [])
+                )
+                self._claim_resolution_update_audit.extend(
+                    list(claim_update.get("claim_resolution_update_audit") or [])
+                )
+                total_events += int(claim_update.get("claim_match_event_count") or 0)
+                total_delta += int(
+                    claim_update.get("persisted_claim_resolution_delta_count") or 0
+                )
+                payload["claim_resolution_update"] = {
+                    key: value
+                    for key, value in claim_update.items()
+                    if key != "ledger"
+                }
+                self._targeted_exam_result_parses.append(payload)
+        if total_delta:
+            self._claim_state_version += 1
+            self._diagnostic_state_version += 1
+            self._mark_clinical_transition(
+                "historical_claim_state_transaction_committed",
+                "claim_resolution",
+                claim_match_event_count=total_events,
+                persisted_claim_resolution_delta_count=total_delta,
+                claim_state_version_after=int(self._claim_state_version or 0),
+                diagnostic_state_version_after=int(self._diagnostic_state_version or 0),
+            )
+
     def _authorization_details_for_exam_result(
         self,
         ordered_exam: str,
@@ -3229,8 +3713,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 return
             seen.add(key)
             payload = dict(detail)
-            payload["_result_binding_source"] = source
-            payload["_applicability_reason"] = reason
+            payload["_result_binding_source"] = str(
+                detail.get("_result_binding_source") or source
+            )
+            payload["_applicability_reason"] = str(
+                detail.get("_applicability_reason") or reason
+            )
             result.append(payload)
 
         if primary:
@@ -5766,6 +6254,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                 evidence,
                 pattern_recall_context=pattern_recall_context,
             )
+            self._last_diagnosis_decision_obj = decision
+            admitted_views = self._materialize_admitted_candidate_claim_states()
+            self._hydrate_claim_states_from_existing_exam_observations(
+                admitted_views,
+                stage="diagnosis_decision_claim_hydration",
+            )
             self._mark_clinical_transition(
                 "diagnosis_decision_completed",
                 "diagnosis",
@@ -5868,6 +6362,12 @@ class MyDoctorAgent(BaseDoctorAgent):
                     evidence,
                     pattern_recall_context=pattern_recall_context,
                 )
+                self._last_diagnosis_decision_obj = decision
+                admitted_views = self._materialize_admitted_candidate_claim_states()
+                self._hydrate_claim_states_from_existing_exam_observations(
+                    admitted_views,
+                    stage="post_result_decision_claim_hydration",
+                )
                 self._mark_clinical_transition(
                     "post_result_reevaluation_completed",
                     "diagnosis",
@@ -5961,6 +6461,14 @@ class MyDoctorAgent(BaseDoctorAgent):
                 "evidence_compiler": dict(self.evidence_compiler.last_audit),
                 "exam_result_intent_bindings": list(self._exam_result_intent_bindings),
                 "targeted_exam_result_parses": list(self._targeted_exam_result_parses),
+                "clinical_admission_audit": list(self._clinical_admission_audit),
+                "candidate_claim_contract_views": list(
+                    self._candidate_claim_contract_views
+                ),
+                "claim_state_materialization_audit": list(
+                    self._claim_state_materialization_audit
+                ),
+                "claim_state_invariant_audit": list(self._claim_state_invariant_audit),
                 "claim_resolution_ledger": normalize_ledger(self._claim_resolution_ledger),
                 "claim_match_events": list(self._claim_match_events),
                 "claim_resolution_update_audit": list(self._claim_resolution_update_audit),
@@ -6770,9 +7278,9 @@ class MyDoctorAgent(BaseDoctorAgent):
             # The generic Judge exams are still available as later fill-ins.
             strategy_judge_payload = judge_payload if not target_proposed else None
 
+        pulmonary_renal_priority: List[str] = []
         if (
-            not needs_discriminating
-            and self.exam_agent._needs_pulmonary_renal_workup(
+            self.exam_agent._needs_pulmonary_renal_workup(
                 collected_info,
                 list(dict.fromkeys(targets + differential_names)),
             )
@@ -6827,6 +7335,20 @@ class MyDoctorAgent(BaseDoctorAgent):
                 add_strong_verification=False,
             )
             route_audit_strategy = strategy
+        if needs_discriminating and target_proposed:
+            items = list(
+                dict.fromkeys(
+                    list(target_proposed)
+                    + list(items or [])
+                )
+            )[: self.diagnosis_critic.max_corrective_exam_items]
+        if pulmonary_renal_priority:
+            items = list(
+                dict.fromkeys(
+                    list(pulmonary_renal_priority)
+                    + list(items or [])
+                )
+            )[: self.diagnosis_critic.max_corrective_exam_items]
         if route_audit_strategy.get("exam_repeat_authorization_audit"):
             strategy["exam_repeat_authorization_audit"] = list(
                 route_audit_strategy.get("exam_repeat_authorization_audit") or []

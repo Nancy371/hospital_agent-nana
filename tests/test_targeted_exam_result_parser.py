@@ -73,7 +73,7 @@ class TargetedExamResultParserTests(unittest.TestCase):
         )
         self.assertEqual(
             claim_by_id["post_radiotherapy_time_window"]["claim_status"],
-            "NOT_ADDRESSED",
+            "NOT_APPLICABLE",
         )
         self.assertTrue(parsed.material_evidence_delta["material_evidence_changed"])
 
@@ -165,7 +165,7 @@ class TargetedExamResultParserTests(unittest.TestCase):
         findings = {item.finding for item in parsed.observations}
         self.assertIn("ground_glass_opacity", findings)
         self.assertIn("pulmonary_consolidation", findings)
-        self.assertEqual(parsed.claim_matches[0]["claim_status"], "NOT_ADDRESSED")
+        self.assertEqual(parsed.claim_matches[0]["claim_status"], "NOT_APPLICABLE")
         self.assertNotEqual(parsed.observations, [])
 
     def test_gap_aware_ct_negation_does_not_create_positive_ground_glass(self):
@@ -532,6 +532,182 @@ class AgentTargetedExamRecoveryTests(unittest.TestCase):
         self.assertLess(
             transition_names.index("observations_parsed"),
             transition_names.index("claim_matches_generated"),
+        )
+
+    def test_candidate_driven_claim_contract_updates_without_original_authorization(self):
+        agent = self.make_agent()
+        agent._last_diagnosis_decision_obj = SimpleNamespace(
+            judge_primary="肺结核",
+            bridge_protected_candidates=[],
+            judge_decision={},
+            candidates=[
+                SimpleNamespace(
+                    diagnosis="radiation pneumonitis",
+                    entity_id="D100058",
+                    eligibility_status="PrimaryEligible",
+                    eligibility_anchor_status="AnchorSatisfied",
+                    matched_evidence=["thoracic_radiotherapy"],
+                    required_gaps=[],
+                    evidence_gaps=[],
+                    actionable_gap_count=0,
+                )
+            ],
+        )
+        strategy = {
+            "exam_authorization_details": [
+                {
+                    "exam": "chest CT",
+                    "requested_exam": "chest CT",
+                    "resolved_exam": "CT",
+                    "exam_source": "judge_discriminating_exam",
+                    "target_gaps": ["G-D100037"],
+                    "entity_id": "D100037",
+                    "target_candidates": ["D100037"],
+                    "target_claims": ["tuberculosis_imaging_pattern"],
+                    "route_target_claims": ["tuberculosis_imaging_pattern"],
+                }
+            ]
+        }
+
+        agent._record_targeted_exam_result_recovery(
+            patient_id="Patient_03674",
+            stage="unit_test",
+            ordered_items=["chest CT"],
+            new_results={
+                "CT": {
+                    "status": "abnormal",
+                    "result": {
+                        "conclusion": (
+                            "Chest CT shows ground-glass opacity and consolidation, "
+                            "within prior radiation field."
+                        )
+                    },
+                }
+            },
+            strategy=strategy,
+        )
+
+        morph_key = claim_key(
+            entity_id="D100058",
+            claim_id="pulmonary_morphology",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        spatial_key = claim_key(
+            entity_id="D100058",
+            claim_id="radiation_field_lung_consistency",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        temporal_key = claim_key(
+            entity_id="D100058",
+            claim_id="post_radiotherapy_time_window",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        self.assertEqual(
+            agent._claim_resolution_ledger[morph_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            agent._claim_resolution_ledger[spatial_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            agent._claim_resolution_ledger[temporal_key]["resolution_status"],
+            "UNRESOLVED",
+        )
+        radiation_payloads = [
+            item
+            for item in agent._targeted_exam_result_parses
+            if item.get("entity_id") == "D100058"
+        ]
+        self.assertTrue(radiation_payloads)
+        self.assertEqual(
+            radiation_payloads[0].get("applicability_reason"),
+            "candidate_claim_contract_compatibility",
+        )
+        self.assertTrue(agent._candidate_claim_contract_views)
+        self.assertTrue(
+            any(
+                item.get("entity_id") == "D100058"
+                and item.get("clinical_admitted")
+                for item in agent._clinical_admission_audit
+            )
+        )
+
+    def test_late_admission_hydrates_existing_ct_observations(self):
+        agent = self.make_agent()
+        agent._targeted_exam_observations = [
+            Observation(
+                finding="ground_glass_opacity",
+                source="unit",
+                source_exam="CT",
+                information_value=0.9,
+            ),
+            Observation(
+                finding="pulmonary_consolidation",
+                source="unit",
+                source_exam="CT",
+                information_value=0.9,
+            ),
+            Observation(
+                finding="lesion_within_prior_radiation_field",
+                source="unit",
+                source_exam="CT",
+                information_value=0.95,
+            ),
+        ]
+        agent._last_diagnosis_decision_obj = SimpleNamespace(
+            judge_primary="肺结核",
+            bridge_protected_candidates=[],
+            judge_decision={},
+            candidates=[
+                SimpleNamespace(
+                    diagnosis="radiation pneumonitis",
+                    entity_id="D100058",
+                    eligibility_status="PrimaryEligible",
+                    eligibility_anchor_status="AnchorSatisfied",
+                    matched_evidence=["thoracic_radiotherapy"],
+                    required_gaps=[],
+                    evidence_gaps=[],
+                    actionable_gap_count=0,
+                )
+            ],
+        )
+
+        views = agent._materialize_admitted_candidate_claim_states()
+        agent._hydrate_claim_states_from_existing_exam_observations(
+            views,
+            stage="unit_late_hydration",
+        )
+
+        morph_key = claim_key(
+            entity_id="D100058",
+            claim_id="pulmonary_morphology",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        spatial_key = claim_key(
+            entity_id="D100058",
+            claim_id="radiation_field_lung_consistency",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        self.assertEqual(
+            agent._claim_resolution_ledger[morph_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            agent._claim_resolution_ledger[spatial_key]["resolution_status"],
+            "SUPPORTED",
+        )
+        self.assertEqual(agent._claim_state_version, 1)
+        self.assertTrue(
+            any(
+                item.get("binding_source") == "HISTORICAL_RESULT_APPLICABILITY"
+                for item in agent._targeted_exam_result_parses
+            )
         )
 
     def test_failed_train_row_persists_d100058_clinical_runtime_audit(self):

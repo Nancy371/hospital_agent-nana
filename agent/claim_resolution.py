@@ -12,9 +12,12 @@ SUPPORTED = "SUPPORTED"
 CONTRADICTED = "CONTRADICTED"
 INCONCLUSIVE = "INCONCLUSIVE"
 NOT_ADDRESSED = "NOT_ADDRESSED"
+NOT_APPLICABLE = "NOT_APPLICABLE"
 
 UNRESOLVED = "UNRESOLVED"
 CONFLICTED = "CONFLICTED"
+CLAIM_ACTIVE = "ACTIVE"
+CLAIM_INACTIVE = "INACTIVE"
 
 OPEN = "OPEN"
 PARTIALLY_CLOSED = "PARTIALLY_CLOSED"
@@ -69,6 +72,8 @@ class ClaimResolutionState:
     last_updated_evidence_version: int = 0
     update_count: int = 0
     event_ids: List[str] = field(default_factory=list)
+    lifecycle_status: str = CLAIM_ACTIVE
+    claim_revision: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -102,6 +107,8 @@ class ClaimResolutionState:
             ),
             update_count=_int(value.get("update_count"), 0),
             event_ids=_text_list(value.get("event_ids") or []),
+            lifecycle_status=str(value.get("lifecycle_status") or CLAIM_ACTIVE),
+            claim_revision=_int(value.get("claim_revision"), 0),
         )
 
 
@@ -218,7 +225,7 @@ class ClaimResolutionReducer:
                 merge_decision = "contradicted"
             changed = after.to_dict() != before.to_dict()
             resolution_delta = changed
-        elif status in {NOT_ADDRESSED, INCONCLUSIVE}:
+        elif status in {NOT_ADDRESSED, NOT_APPLICABLE, INCONCLUSIVE}:
             after.resolution_status = before.resolution_status
             merge_decision = "route_attempt_only"
             changed = after.to_dict() != before.to_dict()
@@ -232,6 +239,7 @@ class ClaimResolutionReducer:
                 after.first_resolved_evidence_version = int(event.evidence_version or 0)
         if changed:
             after.last_updated_evidence_version = int(event.evidence_version or 0)
+            after.claim_revision = int(after.claim_revision or 0) + 1
             normalized[key] = after.to_dict()
         audit = self._audit(
             event,
@@ -284,6 +292,146 @@ class ClaimResolutionReducer:
             "route_attempt_state_delta": int(route_attempt_delta),
             "reducer_version": CLAIM_REDUCER_VERSION,
         }
+
+
+def materialize_candidate_claim_states(
+    *,
+    ledger: Mapping[str, Any],
+    contract_views: Sequence[Mapping[str, Any]],
+    active_entity_ids: Optional[Iterable[str]] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Ensure admitted candidates with claim contracts have case-level states."""
+
+    normalized = normalize_ledger(ledger)
+    active_set = {
+        str(item or "").strip()
+        for item in (active_entity_ids or [])
+        if str(item or "").strip()
+    }
+    created: List[str] = []
+    reactivated: List[str] = []
+    inactivated: List[str] = []
+    missing_contracts: List[Dict[str, Any]] = []
+    view_audit: List[Dict[str, Any]] = []
+
+    for view in contract_views or []:
+        if not isinstance(view, Mapping):
+            continue
+        entity_id = str(view.get("entity_id") or "").strip()
+        if not entity_id:
+            continue
+        contract = dict(view.get("claim_anchor_contract") or view)
+        contract_id = str(
+            contract.get("contract_id")
+            or contract.get("anchor_contract_id")
+            or f"claim_anchor_contract:{entity_id}"
+        )
+        contract_version = str(
+            contract.get("contract_version")
+            or contract.get("claim_closure_plan_version")
+            or "1"
+        )
+        requirements = claim_requirements_from_contract(contract)
+        if not requirements:
+            missing_contracts.append(
+                {
+                    "entity_id": entity_id,
+                    "candidate": view.get("candidate") or view.get("diagnosis") or "",
+                    "reason": "NO_CLAIM_SCHEMA_AVAILABLE",
+                    "clinical_admission_reasons": list(
+                        view.get("clinical_admission_reasons") or []
+                    ),
+                }
+            )
+            continue
+        for requirement in requirements:
+            claim_id = str(requirement.get("claim_id") or "").strip()
+            if not claim_id:
+                continue
+            key = claim_key(
+                entity_id=entity_id,
+                claim_id=claim_id,
+                contract_id=contract_id,
+                contract_version=contract_version,
+            )
+            before = ClaimResolutionState.from_any(normalized.get(key))
+            if before is None:
+                state = ClaimResolutionState(
+                    entity_id=entity_id,
+                    claim_id=claim_id,
+                    contract_id=contract_id,
+                    contract_version=contract_version,
+                    lifecycle_status=CLAIM_ACTIVE,
+                )
+                normalized[key] = state.to_dict()
+                created.append(key)
+            elif before.lifecycle_status != CLAIM_ACTIVE:
+                before.lifecycle_status = CLAIM_ACTIVE
+                normalized[key] = before.to_dict()
+                reactivated.append(key)
+        view_audit.append(
+            {
+                "entity_id": entity_id,
+                "candidate": view.get("candidate") or view.get("diagnosis") or "",
+                "contract_id": contract_id,
+                "contract_version": contract_version,
+                "claim_ids": [
+                    str(item.get("claim_id") or "")
+                    for item in requirements
+                    if str(item.get("claim_id") or "")
+                ],
+                "clinical_admission_reasons": list(
+                    view.get("clinical_admission_reasons") or []
+                ),
+                "materialization_status": "materialized",
+            }
+        )
+
+    if active_set:
+        for key, raw in list(normalized.items()):
+            state = ClaimResolutionState.from_any(raw)
+            if not state or state.entity_id in active_set:
+                continue
+            if state.lifecycle_status == CLAIM_ACTIVE:
+                state.lifecycle_status = CLAIM_INACTIVE
+                normalized[key] = state.to_dict()
+                inactivated.append(key)
+
+    audit = {
+        "contract_view_count": len(view_audit),
+        "materialized_claim_state_count": len(created),
+        "reactivated_claim_state_count": len(reactivated),
+        "inactivated_claim_state_count": len(inactivated),
+        "created_claim_keys": created,
+        "reactivated_claim_keys": reactivated,
+        "inactivated_claim_keys": inactivated,
+        "missing_claim_contracts": missing_contracts,
+        "candidate_claim_contract_views": view_audit,
+        "claim_state_materialization_delta_count": (
+            len(created) + len(reactivated) + len(inactivated)
+        ),
+    }
+    return normalized, audit
+
+
+def claim_requirements_from_contract(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    requirements = [
+        dict(item)
+        for item in contract.get("claim_requirements", []) or []
+        if isinstance(item, Mapping) and str(item.get("claim_id") or "").strip()
+    ]
+    if requirements:
+        return requirements
+    result: List[Dict[str, Any]] = []
+    for claim_id in contract.get("required_claims", []) or []:
+        text = str(claim_id or "").strip()
+        if text:
+            result.append({"claim_id": text, "required_for_anchor": True})
+    for claim_id in contract.get("optional_claims", []) or []:
+        text = str(claim_id or "").strip()
+        if text:
+            result.append({"claim_id": text, "required_for_anchor": False})
+    return result
 
 
 class GapClosureEvaluator:

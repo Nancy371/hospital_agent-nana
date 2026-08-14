@@ -27,6 +27,21 @@ KEEP_CURRENT_AND_DEFER_CONTENDER = "KEEP_CURRENT_AND_DEFER_CONTENDER"
 REJECT_CONTENDER = "REJECT_CONTENDER"
 NO_MATERIAL_DIFFERENCE = "NO_MATERIAL_DIFFERENCE"
 
+ESTABLISHED = "ESTABLISHED"
+PROVISIONAL = "PROVISIONAL"
+NOT_ESTABLISHED = "NOT_ESTABLISHED"
+CONTRADICTED = "CONTRADICTED"
+STALE = "STALE"
+
+INCUMBENT_VALID = "VALID"
+INCUMBENT_CHALLENGED = "CHALLENGED"
+INCUMBENT_INVALIDATED = "INVALIDATED"
+
+MATERIAL_NONE = "NONE"
+MATERIAL_CONTENDER_GAIN = "CONTENDER_MATERIAL_GAIN"
+MATERIAL_INCUMBENT_FAILURE = "INCUMBENT_EXPLANATORY_FAILURE"
+MATERIAL_BOTH = "BOTH"
+
 _ANCHOR_RANK = {
     HARD_BLOCKED: -2,
     NO_VALID_ANCHOR: 0,
@@ -249,8 +264,6 @@ class ClinicalReasoningComparator:
                 reason_codes=["CONTENDER_HARD_BLOCKED"],
             )
 
-        primary_anchor_rank = _ANCHOR_RANK.get(primary_analysis.anchor_status, 0)
-        contender_anchor_rank = _ANCHOR_RANK.get(contender_analysis.anchor_status, 0)
         primary_explained = len(primary_analysis.explained_high_value_evidence)
         contender_explained = len(contender_analysis.explained_high_value_evidence)
         primary_residual = len(primary_analysis.unexplained_high_value_evidence)
@@ -259,18 +272,52 @@ class ClinicalReasoningComparator:
             primary_analysis,
             contender_analysis,
         )
-        contender_has_syndrome = bool(
-            contender_analysis.matched_bridge_patterns
-            or contender_analysis.matched_diagnostic_patterns
+        establishment = self.evaluate_contender_establishment(
+            contender_analysis,
+            contender,
+        )
+        incumbent_validity = self.evaluate_incumbent_validity(primary_analysis)
+        material_difference = self.evaluate_material_difference(
+            comparison,
+            incumbent_validity,
+        )
+        comparison.update(
+            {
+                "contender_establishment_status": establishment["status"],
+                "contender_clinically_established": bool(
+                    establishment["status"] == ESTABLISHED
+                ),
+                "contender_establishment_reasons": list(establishment["reasons"]),
+                "incumbent_validity_status": incumbent_validity["status"],
+                "incumbent_protection_status": primary_analysis.explanatory_profile.primary_protection_status,
+                "incumbent_validity_reasons": list(incumbent_validity["reasons"]),
+                "material_difference_status": material_difference["status"],
+                "material_difference_reasons": list(material_difference["reasons"]),
+                "establishment_gate_status": establishment["status"],
+                "eligibility_gate_status": contender_analysis.eligibility_status,
+            }
+        )
+        clinically_established = establishment["status"] == ESTABLISHED
+        provisional = establishment["status"] == PROVISIONAL
+        contender_primary_eligible = contender_analysis.eligibility_status == PRIMARY_ELIGIBLE
+        material_gain = comparison.get("contender_explanatory_gain") == "HIGH"
+        incumbent_invalid = incumbent_validity["status"] == INCUMBENT_INVALIDATED
+        incumbent_challenged = incumbent_validity["status"] == INCUMBENT_CHALLENGED
+        valid_incumbent_switch_allowed = self._valid_incumbent_switch_allowed(
+            comparison
         )
 
+        base_reasons = list(reason_codes)
+        base_reasons.extend(comparison.get("incumbent_challenge_reasons") or [])
+        base_reasons.extend(incumbent_validity["reasons"])
+        base_reasons.extend(material_difference["reasons"])
+        base_reasons.extend(establishment["reasons"])
+
         if primary_analysis.anchor_status == NO_VALID_ANCHOR:
-            reason_codes.append("CURRENT_PRIMARY_HAS_NO_VALID_ANCHOR")
+            base_reasons.append("CURRENT_PRIMARY_HAS_NO_VALID_ANCHOR")
             if contender_explained > primary_explained or contender_residual < primary_residual:
-                reason_codes.append("CONTENDER_EXPLAINS_HIGH_VALUE_EVIDENCE_BETTER")
-                if contender_has_syndrome:
-                    reason_codes.append("CONTENDER_HAS_VERIFIED_PATTERN_OR_BRIDGE")
-                if contender_analysis.anchor_status == ANCHOR_SATISFIED:
+                base_reasons.append("CONTENDER_EXPLAINS_HIGH_VALUE_EVIDENCE_BETTER")
+                if clinically_established and contender_primary_eligible:
                     return self._record(
                         current_primary,
                         contender,
@@ -278,7 +325,8 @@ class ClinicalReasoningComparator:
                         contender_analysis,
                         preferred=contender,
                         action=SWITCH_PRIMARY,
-                        reason_codes=reason_codes,
+                        reason_codes=base_reasons + ["SWITCH_PRIMARY_AUTHORIZED"],
+                        explanatory_comparison=comparison,
                     )
                 return self._record(
                     current_primary,
@@ -287,85 +335,16 @@ class ClinicalReasoningComparator:
                     contender_analysis,
                     preferred=contender,
                     action=UNLOCK_AND_DEFER,
-                    reason_codes=reason_codes
+                    reason_codes=base_reasons
                     + ["CONTENDER_REQUIRES_CONFIRMATORY_GAP"],
-                )
-
-        if primary_analysis.anchor_status == ANCHOR_SATISFIED:
-            reason_codes.append("INCUMBENT_ANCHOR_SATISFIED")
-            challenge_reasons = list(comparison.get("incumbent_challenge_reasons") or [])
-            protection_reason = self._primary_protection_decision_reason(
-                primary_analysis
-            )
-            if challenge_reasons:
-                reason_codes.extend(challenge_reasons)
-            if (
-                comparison.get("contender_explanatory_gain") == "HIGH"
-                and contender_has_syndrome
-                and contender_residual <= primary_residual
-            ):
-                reason_codes.extend(
-                    [
-                        "CONTENDER_EXPLANATORY_GAIN_HIGH",
-                        "CONTENDER_REDUCES_HIGH_VALUE_RESIDUAL",
-                        "SCORE_USED_AS_TIE_BREAKER_ONLY",
-                    ]
-                )
-                if contender_analysis.anchor_status == ANCHOR_SATISFIED:
-                    return self._record(
-                        current_primary,
-                        contender,
-                        primary_analysis,
-                        contender_analysis,
-                        preferred=contender,
-                        action=SWITCH_PRIMARY,
-                        reason_codes=reason_codes + ["SWITCH_PRIMARY_AUTHORIZED"],
-                        explanatory_comparison=comparison,
-                    )
-                if contender_analysis.anchor_status == PATTERN_SUPPORTED_BUT_UNCONFIRMED:
-                    return self._record(
-                        current_primary,
-                        contender,
-                        primary_analysis,
-                        contender_analysis,
-                        preferred=contender,
-                        action=UNLOCK_AND_DEFER,
-                        reason_codes=reason_codes
-                        + [
-                            "CONTENDER_STILL_UNCONFIRMED",
-                            protection_reason,
-                            "PRIMARY_UNLOCKED_CONTENDER_DEFERRED",
-                        ],
-                        explanatory_comparison=comparison,
-                    )
-                return self._record(
-                    current_primary,
-                    contender,
-                    primary_analysis,
-                    contender_analysis,
-                    preferred=current_primary,
-                    action=UNLOCK_AND_DEFER,
-                    reason_codes=reason_codes
-                    + [
-                        protection_reason,
-                        "NO_SAFE_PRIMARY_REPLACEMENT",
-                    ],
                     explanatory_comparison=comparison,
                 )
 
-        if (
-            contender_has_syndrome
-            and contender_explained >= primary_explained + 2
-            and contender_residual + 1 <= primary_residual
-            and contender_anchor_rank >= primary_anchor_rank
-        ):
-            reason_codes.extend(
-                [
-                    "CONTENDER_EXPLAINS_HIGH_VALUE_EVIDENCE_BETTER",
-                    "SCORE_DOWNGRADED_TO_TIE_BREAKER",
-                ]
-            )
-            if contender_analysis.anchor_status == ANCHOR_SATISFIED:
+        if primary_analysis.anchor_status == ANCHOR_SATISFIED:
+            base_reasons.append("INCUMBENT_ANCHOR_SATISFIED")
+
+        if incumbent_invalid:
+            if material_gain and clinically_established and contender_primary_eligible:
                 return self._record(
                     current_primary,
                     contender,
@@ -373,9 +352,34 @@ class ClinicalReasoningComparator:
                     contender_analysis,
                     preferred=contender,
                     action=SWITCH_PRIMARY,
-                    reason_codes=reason_codes,
+                    reason_codes=base_reasons
+                    + [
+                        "CONTENDER_CLINICALLY_ESTABLISHED",
+                        "CONTENDER_EXPLANATORY_GAIN_HIGH",
+                        "SWITCH_PRIMARY_AUTHORIZED",
+                    ],
                     explanatory_comparison=comparison,
                 )
+            if material_gain and provisional:
+                return self._record(
+                    current_primary,
+                    contender,
+                    primary_analysis,
+                    contender_analysis,
+                    preferred=contender,
+                    action=UNLOCK_AND_DEFER,
+                    reason_codes=base_reasons
+                    + [
+                        "MATERIAL_GAIN_BUT_CONTENDER_UNCONFIRMED",
+                        "PRIMARY_UNLOCKED_CONTENDER_DEFERRED",
+                    ],
+                    explanatory_comparison=comparison,
+                )
+            gate_reason = (
+                "CONTENDER_CLINICAL_ESTABLISHMENT_GATE_NOT_MET"
+                if material_gain
+                else "INCUMBENT_FAILED_BUT_NO_REPLACEMENT"
+            )
             return self._record(
                 current_primary,
                 contender,
@@ -383,11 +387,71 @@ class ClinicalReasoningComparator:
                 contender_analysis,
                 preferred=contender,
                 action=UNLOCK_AND_DEFER,
-                reason_codes=reason_codes + ["CONTENDER_REQUIRES_CONFIRMATORY_GAP"],
+                reason_codes=base_reasons
+                + [
+                    gate_reason,
+                    "INCUMBENT_FAILED_BUT_NO_REPLACEMENT",
+                ],
                 explanatory_comparison=comparison,
             )
 
-        if primary_analysis.anchor_status == ANCHOR_SATISFIED and contender_has_syndrome:
+        if material_gain:
+            if (
+                clinically_established
+                and contender_primary_eligible
+                and valid_incumbent_switch_allowed
+            ):
+                return self._record(
+                    current_primary,
+                    contender,
+                    primary_analysis,
+                    contender_analysis,
+                    preferred=contender,
+                    action=SWITCH_PRIMARY,
+                    reason_codes=base_reasons
+                    + [
+                        "CONTENDER_CLINICALLY_ESTABLISHED",
+                        "CONTENDER_EXPLANATORY_GAIN_HIGH",
+                        "SWITCH_PRIMARY_AUTHORIZED",
+                    ],
+                    explanatory_comparison=comparison,
+                )
+            if clinically_established and contender_primary_eligible:
+                return self._record(
+                    current_primary,
+                    contender,
+                    primary_analysis,
+                    contender_analysis,
+                    preferred=current_primary,
+                    action=KEEP_CURRENT_AND_DEFER_CONTENDER,
+                    reason_codes=base_reasons
+                    + [
+                        "CONTENDER_CLINICALLY_ESTABLISHED",
+                        "CONTENDER_EXPLANATORY_GAIN_HIGH",
+                        "VALID_INCUMBENT_SWITCH_GATE_NOT_MET",
+                    ],
+                    explanatory_comparison=comparison,
+                )
+            if provisional:
+                action = (
+                    UNLOCK_AND_DEFER
+                    if incumbent_challenged
+                    else KEEP_CURRENT_AND_DEFER_CONTENDER
+                )
+                return self._record(
+                    current_primary,
+                    contender,
+                    primary_analysis,
+                    contender_analysis,
+                    preferred=contender,
+                    action=action,
+                    reason_codes=base_reasons
+                    + [
+                        "MATERIAL_GAIN_BUT_CONTENDER_UNCONFIRMED",
+                        "CONTENDER_REQUIRES_CONFIRMATORY_GAP",
+                    ],
+                    explanatory_comparison=comparison,
+                )
             return self._record(
                 current_primary,
                 contender,
@@ -395,7 +459,20 @@ class ClinicalReasoningComparator:
                 contender_analysis,
                 preferred=current_primary,
                 action=KEEP_CURRENT_AND_DEFER_CONTENDER,
-                reason_codes=["CURRENT_PRIMARY_HAS_VALID_ANCHOR"],
+                reason_codes=base_reasons
+                + ["CONTENDER_CLINICAL_ESTABLISHMENT_GATE_NOT_MET"],
+                explanatory_comparison=comparison,
+            )
+
+        if provisional and primary_analysis.anchor_status == ANCHOR_SATISFIED:
+            return self._record(
+                current_primary,
+                contender,
+                primary_analysis,
+                contender_analysis,
+                preferred=current_primary,
+                action=KEEP_CURRENT_AND_DEFER_CONTENDER,
+                reason_codes=base_reasons + ["CURRENT_PRIMARY_HAS_VALID_ANCHOR"],
                 explanatory_comparison=comparison,
             )
 
@@ -406,7 +483,7 @@ class ClinicalReasoningComparator:
             contender_analysis,
             preferred=current_primary,
             action=NO_MATERIAL_DIFFERENCE,
-            reason_codes=["SCORE_ONLY_TIE_BREAKER_NOT_INVOKED"],
+            reason_codes=base_reasons + ["NO_MATERIAL_DIFFERENCE"],
             explanatory_comparison=comparison,
         )
 
@@ -498,6 +575,142 @@ class ClinicalReasoningComparator:
         high_value = self._high_value_universe(candidate, current_primary)
         return len(self._explained_findings(candidate) & high_value) >= 2
 
+    def evaluate_contender_establishment(
+        self,
+        analysis: CandidateClinicalAnalysis,
+        candidate: Any = None,
+    ) -> Dict[str, Any]:
+        reasons: List[str] = []
+        if analysis.anchor_status == HARD_BLOCKED or bool(
+            getattr(candidate, "hard_contradiction", False)
+        ):
+            return {
+                "status": CONTRADICTED,
+                "reasons": [
+                    "CONTENDER_ESTABLISHMENT_CONTRADICTED",
+                    "ANCHOR_CONTRADICTION_STATE_INCONSISTENCY",
+                ],
+            }
+        if self._establishment_state_stale(candidate):
+            return {
+                "status": STALE,
+                "reasons": ["CONTENDER_ESTABLISHMENT_STALE"],
+            }
+        if analysis.anchor_status == ANCHOR_SATISFIED:
+            reasons.append("CLINICALLY_ESTABLISHED_BY_CLAIM_ANCHOR")
+            return {
+                "status": ESTABLISHED,
+                "reasons": reasons + ["CLAIM_ANCHOR_ESTABLISHED"],
+            }
+        if analysis.matched_diagnostic_patterns:
+            reasons.append("PROVISIONAL_BY_DIAGNOSTIC_PATTERN")
+        if analysis.matched_bridge_patterns:
+            reasons.append("PROVISIONAL_BY_BRIDGE_PATTERN")
+        if analysis.anchor_status == PATTERN_SUPPORTED_BUT_UNCONFIRMED:
+            reasons.append("PROVISIONAL_BY_PATTERN_SUPPORTED_ANCHOR")
+        if reasons:
+            return {"status": PROVISIONAL, "reasons": reasons}
+        if analysis.eligibility_status == PRIMARY_ELIGIBLE:
+            reasons.append("ELIGIBILITY_WITHOUT_CLINICAL_ESTABLISHMENT")
+        return {
+            "status": NOT_ESTABLISHED,
+            "reasons": reasons + ["CONTENDER_NOT_CLINICALLY_ESTABLISHED"],
+        }
+
+    def evaluate_incumbent_validity(
+        self,
+        analysis: CandidateClinicalAnalysis,
+    ) -> Dict[str, Any]:
+        profile = analysis.explanatory_profile
+        reasons: List[str] = []
+        if analysis.anchor_status in {HARD_BLOCKED, NO_VALID_ANCHOR}:
+            reasons.append("CURRENT_PRIMARY_HAS_NO_VALID_ANCHOR")
+            return {"status": INCUMBENT_INVALIDATED, "reasons": reasons}
+        if str(profile.primary_protection_status or "").upper() == "LOST":
+            reasons.append("INCUMBENT_PRIMARY_PROTECTION_LOST")
+        if bool(profile.primary_explanatory_mismatch):
+            reasons.append("INCUMBENT_PRIMARY_EXPLANATORY_FAILURE")
+        if float(profile.core_case_coverage or 0.0) <= 0.05:
+            reasons.append("INCUMBENT_CORE_CASE_COVERAGE_FAILURE")
+        if str(profile.high_value_residual_burden_band or "") == "VERY_HIGH":
+            reasons.append("INCUMBENT_HIGH_VALUE_RESIDUAL_FAILURE")
+        if str(profile.chief_complaint_alignment or "") == "POOR":
+            reasons.append("INCUMBENT_CHIEF_COMPLAINT_MISMATCH")
+        if str(profile.material_objective_alignment or "") == "POOR":
+            reasons.append("INCUMBENT_MATERIAL_OBJECTIVE_MISMATCH")
+        if "INCUMBENT_PRIMARY_PROTECTION_LOST" in reasons:
+            return {
+                "status": INCUMBENT_INVALIDATED,
+                "reasons": list(dict.fromkeys(reasons)),
+            }
+        if str(profile.primary_protection_status or "").upper() == "CHALLENGED":
+            reasons.append("INCUMBENT_PRIMARY_PROTECTION_CHALLENGED")
+            return {
+                "status": INCUMBENT_CHALLENGED,
+                "reasons": list(dict.fromkeys(reasons)),
+            }
+        return {"status": INCUMBENT_VALID, "reasons": []}
+
+    def evaluate_material_difference(
+        self,
+        comparison: Dict[str, Any],
+        incumbent_validity: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        reasons: List[str] = []
+        contender_gain = comparison.get("contender_explanatory_gain") == "HIGH"
+        incumbent_failed = incumbent_validity.get("status") == INCUMBENT_INVALIDATED
+        if contender_gain:
+            reasons.extend(
+                [
+                    "MATERIAL_DIFFERENCE_EXISTS",
+                    "CONTENDER_EXPLANATORY_GAIN_HIGH",
+                ]
+            )
+            if float(comparison.get("residual_burden_delta") or 0.0) > 0:
+                reasons.append("CONTENDER_REDUCES_HIGH_VALUE_RESIDUAL")
+        if incumbent_failed:
+            reasons.extend(
+                [
+                    "MATERIAL_DIFFERENCE_EXISTS",
+                    "INCUMBENT_PRIMARY_EXPLANATORY_FAILURE",
+                ]
+            )
+        if contender_gain and incumbent_failed:
+            status = MATERIAL_BOTH
+        elif contender_gain:
+            status = MATERIAL_CONTENDER_GAIN
+        elif incumbent_failed:
+            status = MATERIAL_INCUMBENT_FAILURE
+        else:
+            status = MATERIAL_NONE
+        return {"status": status, "reasons": list(dict.fromkeys(reasons))}
+
+    @staticmethod
+    def _valid_incumbent_switch_allowed(comparison: Dict[str, Any]) -> bool:
+        incumbent_profile = dict(comparison.get("incumbent_profile") or {})
+        residual_delta = float(comparison.get("residual_burden_delta") or 0.0)
+        incumbent_burden_band = str(
+            incumbent_profile.get("high_value_residual_burden_band") or ""
+        ).upper()
+        return bool(residual_delta >= 1.2 or incumbent_burden_band in {"HIGH", "VERY_HIGH"})
+
+    @staticmethod
+    def _establishment_state_stale(candidate: Any) -> bool:
+        if not candidate:
+            return False
+        current = int(getattr(candidate, "diagnostic_state_version", 0) or 0)
+        if current <= 0:
+            return False
+        for attr in (
+            "anchor_state_version",
+            "eligibility_state_version",
+            "consumed_diagnostic_state_version",
+        ):
+            value = int(getattr(candidate, attr, 0) or 0)
+            if value > 0 and value != current:
+                return True
+        return False
+
     def _primary_eligible_contender(self, candidate: Any) -> bool:
         anchor = self.anchor_status(candidate)
         status = str(getattr(candidate, "eligibility_status", "") or "")
@@ -542,6 +755,39 @@ class ClinicalReasoningComparator:
             "recommended_action": action,
             "decision_reason_codes": list(dict.fromkeys(reason_codes)),
             "clinical_explanatory_comparison": dict(explanatory_comparison or {}),
+            "contender_establishment_status": str(
+                (explanatory_comparison or {}).get("contender_establishment_status") or ""
+            ),
+            "contender_clinically_established": bool(
+                (explanatory_comparison or {}).get("contender_clinically_established")
+            ),
+            "contender_establishment_reasons": list(
+                (explanatory_comparison or {}).get("contender_establishment_reasons")
+                or []
+            ),
+            "incumbent_validity_status": str(
+                (explanatory_comparison or {}).get("incumbent_validity_status") or ""
+            ),
+            "incumbent_protection_status": str(
+                (explanatory_comparison or {}).get("incumbent_protection_status") or ""
+            ),
+            "incumbent_challenge_reasons": list(
+                (explanatory_comparison or {}).get("incumbent_challenge_reasons")
+                or []
+            ),
+            "material_difference_status": str(
+                (explanatory_comparison or {}).get("material_difference_status") or ""
+            ),
+            "material_difference_reasons": list(
+                (explanatory_comparison or {}).get("material_difference_reasons")
+                or []
+            ),
+            "establishment_gate_status": str(
+                (explanatory_comparison or {}).get("establishment_gate_status") or ""
+            ),
+            "eligibility_gate_status": str(
+                (explanatory_comparison or {}).get("eligibility_gate_status") or ""
+            ),
         }
 
     def _explanatory_comparison(

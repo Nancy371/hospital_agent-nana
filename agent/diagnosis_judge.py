@@ -2403,6 +2403,7 @@ class DiagnosisJudge:
         selected_action = KEEP_CURRENT_PRIMARY
         selected_reason_codes: List[str] = []
         defer_reason = ""
+        switch_candidate_count = 0
 
         for contender in contenders:
             high_value = self.clinical_comparator.pair_high_value_evidence(
@@ -2449,6 +2450,7 @@ class DiagnosisJudge:
             )
             action = str(record.get("recommended_action") or "")
             if action == SWITCH_PRIMARY:
+                switch_candidate_count += 1
                 if selected_action != SWITCH_PRIMARY:
                     selected = contender
                     selected_action = action
@@ -2529,6 +2531,13 @@ class DiagnosisJudge:
                 "selected_candidate": primary,
                 "pairwise_discriminating_gaps": [],
             }
+        if selected_action == SWITCH_PRIMARY and switch_candidate_count > 1:
+            selected_reason_codes = list(
+                dict.fromkeys(
+                    selected_reason_codes
+                    + ["PRIMARY_SWITCH_WINNER_SELECTION_REASON"]
+                )
+            )
         return {
             "comparisons": records,
             "candidates": candidate_audits,

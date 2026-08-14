@@ -6,13 +6,14 @@ from agent.claim_resolution import (
     CONFLICTED,
     CONTRADICTED,
     FULLY_CLOSED,
-    NOT_ADDRESSED,
+    NOT_APPLICABLE,
     PARTIALLY_CLOSED,
     PATTERN_SUPPORTED_BUT_UNCONFIRMED,
     SUPPORTED,
     AnchorEvaluator,
     ClaimResolutionUpdater,
     claim_key,
+    materialize_candidate_claim_states,
     hydrate_gap_with_claim_state,
 )
 from agent.diagnosis_eligibility import DEFERRED, PRIMARY_ELIGIBLE, DiagnosisEligibilityGate
@@ -80,6 +81,60 @@ def radiation_binding():
 
 
 class ClaimResolutionTests(unittest.TestCase):
+    def test_candidate_claim_state_materialization_deactivates_and_reactivates(self):
+        contract = {
+            "contract_id": "claim_anchor_contract:D100058",
+            "contract_version": "claim_closure_plan_v1",
+            "required_claims": [
+                "pulmonary_morphology",
+                "radiation_field_lung_consistency",
+            ],
+        }
+        ledger, audit = materialize_candidate_claim_states(
+            ledger={},
+            contract_views=[
+                {
+                    "entity_id": "D100058",
+                    "candidate": "radiation pneumonitis",
+                    "claim_anchor_contract": contract,
+                    "clinical_admission_reasons": ["PRIMARY_ELIGIBLE"],
+                }
+            ],
+            active_entity_ids=["D100058"],
+        )
+        self.assertEqual(audit["materialized_claim_state_count"], 2)
+        morph_key = claim_key(
+            entity_id="D100058",
+            claim_id="pulmonary_morphology",
+            contract_id="claim_anchor_contract:D100058",
+            contract_version="claim_closure_plan_v1",
+        )
+        self.assertEqual(ledger[morph_key]["lifecycle_status"], "ACTIVE")
+
+        ledger, audit = materialize_candidate_claim_states(
+            ledger=ledger,
+            contract_views=[],
+            active_entity_ids=["D100037"],
+        )
+        self.assertEqual(audit["inactivated_claim_state_count"], 2)
+        self.assertEqual(ledger[morph_key]["lifecycle_status"], "INACTIVE")
+
+        ledger, audit = materialize_candidate_claim_states(
+            ledger=ledger,
+            contract_views=[
+                {
+                    "entity_id": "D100058",
+                    "candidate": "radiation pneumonitis",
+                    "claim_anchor_contract": contract,
+                    "clinical_admission_reasons": ["ARBITRATION_MEMBER"],
+                }
+            ],
+            active_entity_ids=["D100058"],
+        )
+        self.assertEqual(audit["reactivated_claim_state_count"], 2)
+        self.assertEqual(audit["materialized_claim_state_count"], 0)
+        self.assertEqual(ledger[morph_key]["lifecycle_status"], "ACTIVE")
+
     def test_ct_claim_matches_persist_to_ledger_and_hydrate_rebuilt_gap(self):
         parsed = TargetedExamResultParser().parse(
             {
@@ -123,7 +178,7 @@ class ClaimResolutionTests(unittest.TestCase):
         self.assertEqual(ledger[morph_key]["resolution_status"], SUPPORTED)
         self.assertEqual(ledger[spatial_key]["resolution_status"], SUPPORTED)
         self.assertEqual(ledger[temporal_key]["resolution_status"], "UNRESOLVED")
-        self.assertEqual(ledger[temporal_key]["last_attempt_status"], NOT_ADDRESSED)
+        self.assertEqual(ledger[temporal_key]["last_attempt_status"], NOT_APPLICABLE)
         self.assertEqual(
             updated["gap_closure_evaluation"]["gap_closure_level"],
             PARTIALLY_CLOSED,
